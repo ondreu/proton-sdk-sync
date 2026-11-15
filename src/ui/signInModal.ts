@@ -29,8 +29,8 @@ export class SignInModal extends Modal {
         contentEl.empty();
         contentEl.createEl('h2', { text: 'Sign in to Proton' });
 
-        const row = contentEl.createDiv({ cls: 'proton-drive-sync-waiting' });
-        const spinner = row.createSpan({ cls: 'proton-drive-sync-icon proton-drive-sync-spin' });
+        const row = contentEl.createDiv({ cls: 'proton-sdk-sync-waiting' });
+        const spinner = row.createSpan({ cls: 'proton-sdk-sync-icon proton-sdk-sync-spin' });
         setIcon(spinner, 'refresh-cw');
         const status = row.createSpan({ text: 'Opening Proton in your browser…' });
 

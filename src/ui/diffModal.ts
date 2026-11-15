@@ -50,7 +50,7 @@ export class DiffModal extends Modal {
 
     override onOpen(): void {
         this.setTitle(this.options.title);
-        this.modalEl.addClass('proton-drive-sync-diff-modal');
+        this.modalEl.addClass('proton-sdk-sync-diff-modal');
         void showDiff(this.contentEl, this.options, () => this.close());
     }
 
@@ -66,7 +66,7 @@ export class DiffModal extends Modal {
  */
 export async function showDiff(container: HTMLElement, options: DiffOptions, done: () => void): Promise<void> {
     container.empty();
-    container.createEl('p', { text: 'Comparing…', cls: 'proton-drive-sync-muted' });
+    container.createEl('p', { text: 'Comparing…', cls: 'proton-sdk-sync-muted' });
     let texts: { oldText: string; newText: string };
     try {
         texts = await options.load();
@@ -96,12 +96,12 @@ function renderDiff(container: HTMLElement, oldText: string, newText: string, op
     }
 
     if (options.warning) {
-        container.createEl('p', { cls: 'proton-drive-sync-pin-warning', text: options.warning });
+        container.createEl('p', { cls: 'proton-sdk-sync-pin-warning', text: options.warning });
     }
-    const header = container.createDiv({ cls: 'proton-drive-sync-diff-header' });
-    header.createSpan({ cls: 'proton-drive-sync-diff-legend mod-removed', text: `− ${options.oldLabel}` });
-    header.createSpan({ cls: 'proton-drive-sync-diff-legend mod-added', text: `+ ${options.newLabel}` });
-    const stats = header.createSpan({ cls: 'proton-drive-sync-diff-stats' });
+    const header = container.createDiv({ cls: 'proton-sdk-sync-diff-header' });
+    header.createSpan({ cls: 'proton-sdk-sync-diff-legend mod-removed', text: `− ${options.oldLabel}` });
+    header.createSpan({ cls: 'proton-sdk-sync-diff-legend mod-added', text: `+ ${options.newLabel}` });
+    const stats = header.createSpan({ cls: 'proton-sdk-sync-diff-stats' });
     stats.createSpan({ cls: 'mod-added', text: `+${result.added}` });
     stats.appendText(' ');
     stats.createSpan({ cls: 'mod-removed', text: `−${result.removed}` });
@@ -112,16 +112,16 @@ function renderDiff(container: HTMLElement, oldText: string, newText: string, op
         return;
     }
 
-    const body = container.createDiv({ cls: 'proton-drive-sync-diff' });
+    const body = container.createDiv({ cls: 'proton-sdk-sync-diff' });
     for (const segment of toSegments(result.lines)) {
         if (segment.kind === 'hunk') {
-            body.createDiv({ cls: 'proton-drive-sync-diff-hunk', text: segment.header });
+            body.createDiv({ cls: 'proton-sdk-sync-diff-hunk', text: segment.header });
             renderLines(body, segment.lines);
             continue;
         }
         const count = segment.lines.length;
         const fold = body.createEl('button', {
-            cls: 'proton-drive-sync-diff-fold',
+            cls: 'proton-sdk-sync-diff-fold',
             text: `Show ${count} unchanged line${count === 1 ? '' : 's'}`,
         });
         fold.addEventListener('click', () => {
@@ -140,7 +140,7 @@ function renderActions(container: HTMLElement, options: DiffOptions, done: () =>
     if (actions.length === 0) {
         return;
     }
-    const hint = container.createEl('p', { cls: 'proton-drive-sync-diff-hint' });
+    const hint = container.createEl('p', { cls: 'proton-sdk-sync-diff-hint' });
     hint.appendText('Choose the version to keep: ');
     hint.createSpan({ cls: 'mod-removed', text: `red (−) keeps ${options.oldLabel}` });
     hint.appendText(', ');
@@ -148,13 +148,13 @@ function renderActions(container: HTMLElement, options: DiffOptions, done: () =>
     hint.appendText('.');
 
     const setting = new Setting(container);
-    setting.settingEl.addClass('proton-drive-sync-diff-actions');
+    setting.settingEl.addClass('proton-sdk-sync-diff-actions');
     for (const action of actions) {
         setting.addButton((button) => {
             const sign = action.keeps === 'removed' ? '− ' : action.keeps === 'added' ? '+ ' : '';
             button.setButtonText(`${sign}${action.label}`);
             if (action.keeps) {
-                button.buttonEl.addClass('proton-drive-sync-diff-action', `mod-${action.keeps}`);
+                button.buttonEl.addClass('proton-sdk-sync-diff-action', `mod-${action.keeps}`);
             }
             button.onClick(async () => {
                 button.setDisabled(true);
@@ -198,14 +198,14 @@ function renderLines(container: HTMLElement, lines: DiffLine[]): void {
     }
 
     lines.forEach((line, index) => {
-        const row = container.createDiv({ cls: `proton-drive-sync-diff-line mod-${line.type}` });
-        row.createSpan({ cls: 'proton-drive-sync-diff-no', text: line.type === 'added' ? '' : String(line.oldNo) });
-        row.createSpan({ cls: 'proton-drive-sync-diff-no', text: line.type === 'removed' ? '' : String(line.newNo) });
+        const row = container.createDiv({ cls: `proton-sdk-sync-diff-line mod-${line.type}` });
+        row.createSpan({ cls: 'proton-sdk-sync-diff-no', text: line.type === 'added' ? '' : String(line.oldNo) });
+        row.createSpan({ cls: 'proton-sdk-sync-diff-no', text: line.type === 'removed' ? '' : String(line.newNo) });
         row.createSpan({
-            cls: 'proton-drive-sync-diff-sign',
+            cls: 'proton-sdk-sync-diff-sign',
             text: line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' ',
         });
-        const text = row.createSpan({ cls: 'proton-drive-sync-diff-text' });
+        const text = row.createSpan({ cls: 'proton-sdk-sync-diff-text' });
 
         const other = partner.get(index);
         if (other === undefined || line.type === 'context') {
@@ -217,7 +217,7 @@ function renderLines(container: HTMLElement, lines: DiffLine[]): void {
         const [start, end] = line.type === 'removed' ? range.old : range.new;
         text.appendText(line.text.slice(0, start));
         if (end > start) {
-            text.createSpan({ cls: 'proton-drive-sync-diff-change', text: line.text.slice(start, end) });
+            text.createSpan({ cls: 'proton-sdk-sync-diff-change', text: line.text.slice(start, end) });
         }
         text.appendText(line.text.slice(end));
     });

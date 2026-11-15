@@ -169,7 +169,7 @@ export class FolderPickerModal extends Modal {
         }
 
         contentEl.createEl('p', {
-            cls: 'proton-drive-sync-breadcrumb',
+            cls: 'proton-sdk-sync-breadcrumb',
             text: this.currentPath,
         });
 

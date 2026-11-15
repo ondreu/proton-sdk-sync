@@ -309,7 +309,7 @@ export class ProtonSession {
         }
         try {
             this.entitiesCache = await EncryptedEntitiesCache.open(
-                new IndexedDbCacheStore(`proton-drive-sync-cache-${this.clientUid}`),
+                new IndexedDbCacheStore(`proton-sdk-sync-cache-${this.clientUid}`),
                 cacheKeyBytes(key),
                 this.cacheMarker,
                 this.logger.getLogger('cache'),

@@ -57,7 +57,7 @@ export class VersionsModal extends Modal {
     private showList(): void {
         this.comparing = null;
         this.shown = '';
-        this.modalEl.removeClass('proton-drive-sync-diff-modal');
+        this.modalEl.removeClass('proton-sdk-sync-diff-modal');
         this.setTitle(`Versions of ${basename(this.path)}`);
         this.renderList();
     }
@@ -80,9 +80,9 @@ export class VersionsModal extends Modal {
 
         const { contentEl } = this;
         contentEl.empty();
-        const header = contentEl.createDiv({ cls: 'proton-drive-sync-list-header' });
+        const header = contentEl.createDiv({ cls: 'proton-sdk-sync-list-header' });
         header.createSpan({
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text: 'Newest first. Choose one to compare it with the note as it is now.',
         });
         new ExtraButtonComponent(header)
@@ -90,7 +90,7 @@ export class VersionsModal extends Modal {
             .setTooltip('List the versions again')
             .onClick(() => this.host.reload());
 
-        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-drive-sync-muted', text });
+        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-sdk-sync-muted', text });
         if (error) {
             say(`Could not list the versions: ${error.message}`);
         }
@@ -111,19 +111,19 @@ export class VersionsModal extends Modal {
 
         const shown = pageOf(items, this.page);
         this.page = shown.page;
-        const list = contentEl.createDiv({ cls: 'proton-drive-sync-list' });
+        const list = contentEl.createDiv({ cls: 'proton-sdk-sync-list' });
         for (const version of shown.items) {
-            const item = list.createEl('button', { cls: 'proton-drive-sync-version' });
-            const top = item.createDiv({ cls: 'proton-drive-sync-version-date' });
+            const item = list.createEl('button', { cls: 'proton-sdk-sync-version' });
+            const top = item.createDiv({ cls: 'proton-sdk-sync-version-date' });
             top.setText(new Date(version.created).toLocaleString());
             if (version.active) {
-                top.createSpan({ cls: 'proton-drive-sync-badge', text: 'Current' });
+                top.createSpan({ cls: 'proton-sdk-sync-badge', text: 'Current' });
             }
             const details = [timeAgo(version.created)];
             if (version.size !== undefined) {
                 details.push(formatBytes(version.size));
             }
-            item.createDiv({ cls: 'proton-drive-sync-muted', text: details.join(' · ') });
+            item.createDiv({ cls: 'proton-sdk-sync-muted', text: details.join(' · ') });
             item.addEventListener('click', () => this.showVersion(version));
         }
         renderPager(contentEl, shown.page, shown.pages, (page) => {
@@ -142,18 +142,18 @@ export class VersionsModal extends Modal {
         contentEl.empty();
         labelButton(new ButtonComponent(contentEl), 'arrow-left', 'All versions')
             .onClick(() => this.showList())
-            .buttonEl.addClass('proton-drive-sync-back');
+            .buttonEl.addClass('proton-sdk-sync-back');
         // A diff loading after "All versions" lands here, out of sight.
         const body = contentEl.createDiv();
 
         if (comparison.kind === 'diff') {
-            this.modalEl.addClass('proton-drive-sync-diff-modal');
+            this.modalEl.addClass('proton-sdk-sync-diff-modal');
             void showDiff(body, comparison.diff, () => this.close());
             return;
         }
         body.createEl('p', { text: comparison.text });
         if (comparison.warning) {
-            body.createEl('p', { cls: 'proton-drive-sync-pin-warning', text: comparison.warning });
+            body.createEl('p', { cls: 'proton-sdk-sync-pin-warning', text: comparison.warning });
         }
         new Setting(body)
             .addButton((button) => button.setButtonText('Cancel').onClick(() => this.showList()))

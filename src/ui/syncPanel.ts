@@ -10,7 +10,7 @@ import { ListingSchedule } from './listingSchedule';
 import { lastSynced, pendingText, statusDescription, statusDetails, statusIcon, statusLabel, statusSpins } from './syncStatus';
 import { VersionsModal } from './versionsModal';
 
-export const SYNC_PANEL_VIEW = 'proton-drive-sync-panel';
+export const SYNC_PANEL_VIEW = 'proton-sdk-sync-panel';
 
 /** Entries of the "Not synced yet" list shown before the rest are counted. */
 const MAX_PENDING_SHOWN = 30;
@@ -127,7 +127,7 @@ export class SyncPanelView extends ItemView {
     }
 
     override getDisplayText(): string {
-        return 'Proton Drive Sync';
+        return 'Proton-SDK-Sync';
     }
 
     override getIcon(): string {
@@ -137,25 +137,25 @@ export class SyncPanelView extends ItemView {
     override async onOpen(): Promise<void> {
         const root = this.contentEl;
         root.empty();
-        root.addClass('proton-drive-sync-panel');
+        root.addClass('proton-sdk-sync-panel');
 
-        const header = root.createDiv({ cls: 'proton-drive-sync-panel-header' });
-        this.iconEl = header.createSpan({ cls: 'proton-drive-sync-icon' });
-        this.labelEl = header.createSpan({ cls: 'proton-drive-sync-panel-label' });
-        this.descriptionEl = root.createDiv({ cls: 'proton-drive-sync-muted' });
+        const header = root.createDiv({ cls: 'proton-sdk-sync-panel-header' });
+        this.iconEl = header.createSpan({ cls: 'proton-sdk-sync-icon' });
+        this.labelEl = header.createSpan({ cls: 'proton-sdk-sync-panel-label' });
+        this.descriptionEl = root.createDiv({ cls: 'proton-sdk-sync-muted' });
 
-        this.progressEl = root.createDiv({ cls: 'proton-drive-sync-panel-progress' });
-        this.progressFillEl = this.progressEl.createDiv({ cls: 'proton-drive-sync-panel-progress-fill' });
+        this.progressEl = root.createDiv({ cls: 'proton-sdk-sync-panel-progress' });
+        this.progressFillEl = this.progressEl.createDiv({ cls: 'proton-sdk-sync-panel-progress-fill' });
 
-        this.lastSyncedEl = root.createDiv({ cls: 'proton-drive-sync-last-synced' });
-        this.lastSyncedIconEl = this.lastSyncedEl.createSpan({ cls: 'proton-drive-sync-last-synced-icon' });
-        this.lastSyncedTextEl = this.lastSyncedEl.createSpan({ cls: 'proton-drive-sync-last-synced-text' });
+        this.lastSyncedEl = root.createDiv({ cls: 'proton-sdk-sync-last-synced' });
+        this.lastSyncedIconEl = this.lastSyncedEl.createSpan({ cls: 'proton-sdk-sync-last-synced-icon' });
+        this.lastSyncedTextEl = this.lastSyncedEl.createSpan({ cls: 'proton-sdk-sync-last-synced-text' });
 
-        this.detailsEl = root.createEl('ul', { cls: 'proton-drive-sync-panel-details' });
+        this.detailsEl = root.createEl('ul', { cls: 'proton-sdk-sync-panel-details' });
 
         // One to a row, in the order they are reached for; the settings,
         // needed least, at the bottom.
-        const actions = root.createDiv({ cls: 'proton-drive-sync-panel-actions' });
+        const actions = root.createDiv({ cls: 'proton-sdk-sync-panel-actions' });
         this.syncButton = new ButtonComponent(actions).setCta().onClick(() => this.host.syncNow());
         this.pauseButton = new ButtonComponent(actions).onClick(() => this.host.togglePause());
         this.shareButton = labelButton(new ButtonComponent(actions), 'link', 'Share link').onClick(() => {
@@ -170,8 +170,8 @@ export class SyncPanelView extends ItemView {
         );
         labelButton(new ButtonComponent(actions), 'settings', 'Settings').onClick(() => this.host.openSettings());
 
-        this.pendingHeadingEl = root.createEl('h6', { cls: 'proton-drive-sync-panel-heading' });
-        this.pendingEl = root.createDiv({ cls: 'proton-drive-sync-panel-pending' });
+        this.pendingHeadingEl = root.createEl('h6', { cls: 'proton-sdk-sync-panel-heading' });
+        this.pendingEl = root.createDiv({ cls: 'proton-sdk-sync-panel-pending' });
 
         this.opened = true;
         // The buttons are new: label them whatever was listed before.
@@ -191,7 +191,7 @@ export class SyncPanelView extends ItemView {
         }
 
         setIcon(this.iconEl, statusIcon(summary));
-        this.iconEl.toggleClass('proton-drive-sync-spin', statusSpins(summary));
+        this.iconEl.toggleClass('proton-sdk-sync-spin', statusSpins(summary));
         this.labelEl.setText(statusLabel(summary));
         this.descriptionEl.setText(statusDescription(summary));
 
@@ -336,7 +336,7 @@ export class SyncPanelView extends ItemView {
         this.pendingEl.empty();
         if (changes.length === 0) {
             this.pendingEl.createDiv({
-                cls: 'proton-drive-sync-muted',
+                cls: 'proton-sdk-sync-muted',
                 text:
                     summary.status === 'paused'
                         ? 'Syncing is paused. Changes made meanwhile are found and synced when you resume.'
@@ -344,7 +344,7 @@ export class SyncPanelView extends ItemView {
             });
             return;
         }
-        const list = this.pendingEl.createEl('ul', { cls: 'proton-drive-sync-panel-details' });
+        const list = this.pendingEl.createEl('ul', { cls: 'proton-sdk-sync-panel-details' });
         for (const change of changes.slice(0, MAX_PENDING_SHOWN)) {
             const item = list.createEl('li');
             const link = item.createEl('a', { text: change.path, href: '#' });
@@ -352,7 +352,7 @@ export class SyncPanelView extends ItemView {
                 event.preventDefault();
                 this.host.openFile(change.path);
             });
-            item.createDiv({ cls: 'proton-drive-sync-muted', text: pendingText(change) });
+            item.createDiv({ cls: 'proton-sdk-sync-muted', text: pendingText(change) });
         }
         if (changes.length > MAX_PENDING_SHOWN) {
             list.createEl('li', { text: `…and ${changes.length - MAX_PENDING_SHOWN} more.` });

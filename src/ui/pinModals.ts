@@ -39,13 +39,13 @@ export class UnlockModal extends Modal {
 
     override onOpen(): void {
         const { contentEl } = this;
-        this.setTitle('Unlock Proton Drive Sync');
+        this.setTitle('Unlock Proton-SDK-Sync');
         contentEl.createEl('p', {
             text: 'Your Proton sign-in on this device is protected with a PIN. Enter it to start syncing.',
         });
 
         let input!: TextComponent;
-        const error = contentEl.createEl('p', { cls: 'proton-drive-sync-pin-error' });
+        const error = contentEl.createEl('p', { cls: 'proton-sdk-sync-pin-error' });
         let unlockButton!: HTMLButtonElement;
 
         const submit = async () => {
@@ -115,7 +115,7 @@ export class UnlockModal extends Modal {
                 'you then sign in again and can choose a new PIN. Your notes, here and on Drive, are not touched.',
         });
         contentEl.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text:
                 'The old session cannot be ended from here, because ending it needs the PIN. To end it now, go to ' +
                 'account.proton.me → Security → Sessions and revoke "external-drive-obsidian_sync"; otherwise ' +
@@ -206,12 +206,12 @@ export class PinFormModal extends Modal {
         }
         if (mode === 'set' || mode === 'change') {
             contentEl.createEl('p', {
-                cls: 'proton-drive-sync-muted',
+                cls: 'proton-sdk-sync-muted',
                 text:
                     `At least ${MIN_PIN_LENGTH} characters. Letters and numbers both work, and longer is ` +
                     'stronger: a short all-digit PIN can be guessed by someone who copies the encrypted sign-in.',
             });
-            contentEl.createEl('p', { cls: 'proton-drive-sync-pin-warning', text: LOST_PIN_WARNING });
+            contentEl.createEl('p', { cls: 'proton-sdk-sync-pin-warning', text: LOST_PIN_WARNING });
         }
 
         const needsCurrent = mode !== 'set';
@@ -219,7 +219,7 @@ export class PinFormModal extends Modal {
         const current = needsCurrent ? this.passwordField(needsNew ? 'Current PIN' : 'PIN', 'current-password') : null;
         const fresh = needsNew ? this.passwordField('New PIN', 'new-password') : null;
         const repeat = needsNew ? this.passwordField('Repeat new PIN', 'new-password') : null;
-        const error = contentEl.createEl('p', { cls: 'proton-drive-sync-pin-error' });
+        const error = contentEl.createEl('p', { cls: 'proton-sdk-sync-pin-error' });
 
         const submit = async (button: HTMLButtonElement) => {
             error.setText('');

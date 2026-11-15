@@ -1,9 +1,10 @@
 {
-    "id": "proton-drive-sync",
-    "name": "Proton Drive Sync",
-    "version": "0.11.5",
+    "id": "proton-sdk-sync",
+    "name": "Proton-SDK-Sync",
+    "version": "1.0.0",
     "minAppVersion": "1.13.7",
-    "description": "End-to-end encrypted bidirectional sync of your vault with Proton Drive, with three-way conflict remediation for offline edits.",
-    "author": "MarckFp",
+    "description": "Two-way, end-to-end encrypted sync between your vault and Proton Drive, built on Proton's official Drive SDK.",
+    "author": "ondreu",
+    "authorUrl": "https://github.com/ondreu",
     "isDesktopOnly": false
 }

@@ -69,13 +69,13 @@ export class StatusBar {
         const summary = this.summary!;
         this.element.empty();
 
-        const icon = this.element.createSpan({ cls: 'proton-drive-sync-icon' });
+        const icon = this.element.createSpan({ cls: 'proton-sdk-sync-icon' });
         setIcon(icon, statusIcon(summary));
         if (statusSpins(summary)) {
-            icon.addClass('proton-drive-sync-spin');
+            icon.addClass('proton-sdk-sync-spin');
         }
         if (this.note) {
-            this.element.createSpan({ cls: `proton-drive-sync-note-dot mod-${this.note.state}` });
+            this.element.createSpan({ cls: `proton-sdk-sync-note-dot mod-${this.note.state}` });
         }
 
         this.element.createSpan({ text: ` ${statusLabel(summary)}` });
@@ -83,7 +83,7 @@ export class StatusBar {
         setTooltip(
             this.element,
             [
-                `Proton Drive Sync: ${statusDescription(summary)}`,
+                `Proton-SDK-Sync: ${statusDescription(summary)}`,
                 ...(this.note ? [this.note.text] : []),
                 ...statusDetails(summary),
                 ...(synced ? [synced.text] : []),

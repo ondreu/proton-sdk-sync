@@ -4,11 +4,6 @@
 import './polyfills';
 
 import { getRuntime } from './runtime';
-import { watchPlugins } from './security/pluginWatch';
-import { installTripwires, type TripwireHit } from './security/tripwire';
-import { requireUi, uiProof } from './security/capability';
-import { checkPermissions } from './security/permissions';
-import { checkSelf } from './security/selfIntegrity';
 import {
     apiVersion,
     type App,
@@ -69,15 +64,15 @@ const SESSION_SECRET_FILE = 'session.bin';
 const UNLOCK_SECRET_FILE = 'unlock.bin';
 const CONFLICT_HISTORY_FILE = 'conflict-history.json';
 /** Local-storage key for the installation id; see {@link ProtonDriveSyncPlugin.installationId}. */
-const CLIENT_UID_KEY = 'proton-drive-sync-client-uid';
+const CLIENT_UID_KEY = 'proton-sdk-sync-client-uid';
 /**
  * Local-storage key for the last request from the device list this device
  * acted on; see {@link DeviceList}. Kept with the installation id rather than
  * in the settings, which another sync tool might copy to a different device.
  */
-const HANDLED_REQUEST_KEY = 'proton-drive-sync-device-request-handled';
+const HANDLED_REQUEST_KEY = 'proton-sdk-sync-device-request-handled';
 /** Where the device list's folder was found, so a start need not search the synced folder for it. */
-const DEVICES_FOLDER_KEY = 'proton-drive-sync-devices-folder';
+const DEVICES_FOLDER_KEY = 'proton-sdk-sync-devices-folder';
 
 /** Conflicts found within this long of each other share one notice. */
 const CONFLICT_NOTICE_DELAY_MS = 1500;
@@ -147,8 +142,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     /** What the status bar, ribbon icon and panel currently show. */
     private summary!: SyncSummary;
     private conflictNoticeTimer: number | null = null;
-    /** Tripwire hits already announced, so a repeating caller is not a stream of notices. */
-    private tripwireNotices: Set<string> | null = null;
 
     override async onload(): Promise<void> {
         await this.loadSettings();
@@ -157,32 +150,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // After the workspace is ready, so the first start of the day does not
         // delay anything the user is waiting for.
         setLogShowsNames(this.settings.logShowsNames ?? false);
-        // Nothing can stop a plugin in this process, but the moment one reaches
-        // for the sign-in it can be named. See security/tripwire.ts.
-        runtime.tripwire = installTripwires({
-            app: this.app,
-            selfId: this.manifest.id,
-            instance: this,
-            logger: runtime.logger.getLogger('security'),
-            onHit: (hit) => {
-                const announced = this.tripwireNotices ?? (this.tripwireNotices = new Set<string>());
-                const key = `${hit.by ?? 'unknown'}:${hit.wire}`;
-                if (announced.has(key)) {
-                    return;
-                }
-                announced.add(key);
-                runtime.logger.warn(`Tripwire: ${hit.by ?? 'something'} reached ${hit.wire}`);
-                void this.rememberTripwireHit(hit);
-                new Notice(
-                    `Proton Drive Sync: ${hit.by ?? 'something'} reached for the Proton sign-in (${hit.wire}). ` +
-                        'Settings → Proton Drive Sync → Security lists it.',
-                    15000,
-                );
-            },
-        });
-        // Undone on unload, so a reload installs its own wiring instead of
-        // leaving the wrappers pointing at the instance that went away.
-        this.register(() => runtime.tripwire?.uninstall());
         this.statusBar = new StatusBar(this.addStatusBarItem(), {
             syncNow: () => void this.syncNowOrSetUp(),
             togglePause: () => void this.setPaused(!this.settings.paused),
@@ -201,7 +168,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     versionsKey: (path) => runtime.engine.versionsKey(path),
                     noteVersions: (path) => runtime.engine.noteVersions(path),
                     compareVersion: (path, version) => versionComparison(this, path, version),
-                    shareNote: (path) => this.shareNote(path, uiProof()),
+                    shareNote: (path) => this.shareNote(path),
                     recentlyDeleted: () => runtime.engine.recentlyDeleted(),
                     restoreDeleted: async (item) => {
                         await runtime.engine.restoreDeleted(item);
@@ -219,7 +186,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // Obsidian's mobile app has no status bar, so there the ribbon, which
         // it shows in the sidebar and the ribbon menu, carries the status.
         if (Platform.isMobile) {
-            this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Proton Drive Sync', () => void this.openPanel());
+            this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Proton-SDK-Sync', () => void this.openPanel());
         }
         this.registerInterval(window.setInterval(() => this.refreshStatus(), STATUS_REFRESH_MS));
         this.registerInterval(
@@ -238,6 +205,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // other plugin can read; Obsidian's secret storage stays the home on
         // mobile, where there is no keystore and no Node. See SECURITY.md.
         const safeStorage = encryptedStorage(protonLogger);
+        const secretSession = new ObsidianSecretSlot(
+            this.app.secretStorage,
+            `proton-sdk-sync-session-${clientUid}`,
+        );
+        const secretUnlock = new ObsidianSecretSlot(this.app.secretStorage, `proton-sdk-sync-unlock-${clientUid}`);
+        // The previous plugin kept these under its own id; adopt them once so
+        // switching over does not sign anyone out.
         const legacySession = new ObsidianSecretSlot(
             this.app.secretStorage,
             `proton-drive-sync-session-${clientUid}`,
@@ -245,16 +219,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         const legacyUnlock = new ObsidianSecretSlot(this.app.secretStorage, `proton-drive-sync-unlock-${clientUid}`);
         const sessionInner: SecretSlot = safeStorage
             ? new SafeStorageFileSlot(this.app.vault.adapter, this.pluginFile(SESSION_SECRET_FILE), safeStorage)
-            : legacySession;
+            : secretSession;
         const unlockInner: SecretSlot = safeStorage
             ? new SafeStorageFileSlot(this.app.vault.adapter, this.pluginFile(UNLOCK_SECRET_FILE), safeStorage)
-            : legacyUnlock;
-        if (safeStorage) {
-            // Upgrading: move what an older version left in secret storage, so
-            // nobody is signed out and the old, readable copy goes away.
-            await migrateSecret(legacySession, sessionInner);
-            await migrateSecret(legacyUnlock, unlockInner);
-        }
+            : secretUnlock;
+        // Upgrading: move what an older version left in secret storage, so
+        // nobody is signed out and the old, readable copy goes away.
+        await migrateSecret(legacySession, sessionInner);
+        await migrateSecret(legacyUnlock, unlockInner);
+        await migrateSecret(legacySession, secretSession);
+        await migrateSecret(legacyUnlock, secretUnlock);
         runtime.sessionSlot = new PinProtectedSlot(sessionInner);
         this.rememberedUnlock = new RememberedUnlock(unlockInner);
         const credentials = new Credentials(
@@ -325,14 +299,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.summary = { ...runtime.engine.getSummary(), status: 'connecting' };
         this.settingsTab = new ProtonDriveSyncSettingsTab(this.app, this);
         this.addSettingTab(this.settingsTab);
-        // Deferred, and cleared on unload: a plugin disabled in the first ten
-        // seconds should not run either check afterwards.
-        const scanTimer = window.setTimeout(() => void this.scanOtherPlugins(), 4000);
-        const securityTimer = window.setTimeout(() => void this.checkOwnSecurity(), 5000);
-        this.register(() => {
-            window.clearTimeout(scanTimer);
-            window.clearTimeout(securityTimer);
-        });
         this.registerCommands();
         this.registerVaultEvents();
         this.registerLifecycleEvents();
@@ -592,8 +558,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /** Sign out, with the PIN first when there is one; see {@link endSession}. */
-    async signOut(proof?: string): Promise<void> {
-        requireUi(proof, 'signing out');
+    async signOut(): Promise<void> {
         if (!(await this.confirmPin('sign out'))) {
             return;
         }
@@ -635,138 +600,9 @@ export default class ProtonDriveSyncPlugin extends Plugin {
 
     /** Everything this device logged recently, with enough context to go in a bug report. */
 
-    /**
-     * Compare the plugins installed in this vault with the set seen last time.
-     *
-     * Every plugin in a vault can read the vault and this plugin's sign-in, so a
-     * new or updated one is a security event. This cannot stop the code — it is
-     * the same process — but it makes the change visible instead of silent.
-     */
-
-
-    /** Where the tripwire record lives: beside the state, never synced. */
-    private tripwireLogPath(): string {
-        return this.pluginFile('tripwire-log.json');
-    }
-
-    /**
-     * Keep hits on disk as well as in memory.
-     *
-     * A plugin that reads the sign-in during startup does it before anyone is
-     * looking at a notice, and Obsidian is often closed again straight after.
-     * The file is what makes "it happened while I was not watching" visible on
-     * the next start; it holds plugin ids and wire names, no note names.
-     */
-    private async rememberTripwireHit(hit: TripwireHit): Promise<void> {
-        try {
-            const path = this.tripwireLogPath();
-            let log: { seenAt: number; hits: TripwireHit[] } = { seenAt: 0, hits: [] };
-            if (await this.app.vault.adapter.exists(path)) {
-                log = JSON.parse(await this.app.vault.adapter.read(path)) as typeof log;
-            }
-            log.hits = [...(log.hits ?? []), hit].slice(-200);
-            await this.app.vault.adapter.write(path, JSON.stringify(log, null, 1));
-        } catch (error) {
-            runtime.logger.warn('Could not write the tripwire record', error);
-        }
-    }
-
-    /** On start: say whether anything reached for the sign-in since the last one. */
-    async reportEarlierTripwireHits(): Promise<void> {
-        try {
-            const path = this.tripwireLogPath();
-            if (!(await this.app.vault.adapter.exists(path))) {
-                return;
-            }
-            const log = JSON.parse(await this.app.vault.adapter.read(path)) as { seenAt: number; hits: TripwireHit[] };
-            const fresh = (log.hits ?? []).filter((hit) => hit.at > (log.seenAt ?? 0));
-            log.seenAt = Date.now();
-            await this.app.vault.adapter.write(path, JSON.stringify(log, null, 1));
-            if (fresh.length === 0) {
-                return;
-            }
-            const who = [...new Set(fresh.map((hit) => hit.by ?? 'something'))].slice(0, 3).join(', ');
-            new Notice(
-                `Proton Drive Sync: ${fresh.length} attempt(s) to reach the Proton sign-in since the last start ` +
-                    `(${who}). Settings → Proton Drive Sync → Security lists them.`,
-                20000,
-            );
-        } catch (error) {
-            runtime.logger.warn('Could not read the tripwire record', error);
-        }
-    }
-
-    /**
-     * Three things that decide whether the hardening holds at all: who else can
-     * write to this plugin's code and to the stored sign-in, whether that code
-     * is still what was installed, and whether anything has already reached for
-     * the sign-in since the last start.
-     */
-    async checkOwnSecurity(): Promise<void> {
-        if (this.settings.warnOnInsecurePermissions) {
-            try {
-                const findings = checkPermissions(this.app, this.pluginDir());
-                runtime.securityFindings = findings;
-                if (findings.length > 0) {
-                    const first = findings[0].problem;
-                    const more = findings.length > 1 ? ` (+${findings.length - 1} more)` : '';
-                    new Notice(
-                        `Proton Drive Sync: ${first}${more}. Anyone who can write this plugin's code runs it ` +
-                            'with your keyring; see Settings → Proton Drive Sync → Security.',
-                        15000,
-                    );
-                    if (this.settings.refuseOnInsecurePermissions) {
-                        await this.setPaused(true);
-                        runtime.logger.warn('Syncing paused: the vault is writable by other users');
-                    }
-                }
-            } catch (error) {
-                runtime.logger.warn('Could not check the permissions of this vault', error);
-            }
-        }
-
-        try {
-            runtime.selfIntegrity = await checkSelf(this.app, this.pluginDir(), this.manifest.version, runtime.logger);
-            if (runtime.selfIntegrity === 'changed-without-update') {
-                new Notice(
-                    'Proton Drive Sync: this plugin\'s own code changed without a new version. If you did not ' +
-                        'replace it, sign out of Proton and reinstall.',
-                    20000,
-                );
-            }
-        } catch (error) {
-            runtime.logger.warn('Could not check this plugin\'s own code', error);
-        }
-
-        await this.reportEarlierTripwireHits();
-    }
-
-    async scanOtherPlugins(): Promise<void> {
-        if (!this.settings.watchOtherPlugins) {
-            return;
-        }
-        try {
-            const report = await watchPlugins(this.app, this.manifest.id, this.pluginDir());
-            runtime.pluginWatch = report;
-            // Only what Obsidian's own update notice would not say; an update
-            // announced by Obsidian is not worth repeating. See PluginAlert.
-            if (report.alerts.length === 0) {
-                return;
-            }
-            const listed = report.alerts
-                .slice(0, 3)
-                .map((alert) => `${alert.name}: ${alert.why}`)
-                .join('; ');
-            const more = report.alerts.length > 3 ? ` and ${report.alerts.length - 3} more` : '';
-            new Notice(`Proton Drive Sync: ${listed}${more}. See Settings → Proton Drive Sync → Security.`, 15000);
-        } catch (error) {
-            runtime.logger.warn('Could not scan the other plugins in this vault', error);
-        }
-    }
-
     async copyLog(): Promise<void> {
         const header = [
-            `Proton Drive Sync ${this.manifest.version}`,
+            `Proton-SDK-Sync ${this.manifest.version}`,
             `Obsidian ${apiVersion}, ${Platform.isMobileApp ? 'mobile' : 'desktop'}`,
             `Status: ${runtime.engine.getSummary().status}`,
             '',
@@ -776,7 +612,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     notify(message: string): void {
-        new Notice(`Proton Drive Sync: ${message}`);
+        new Notice(`Proton-SDK-Sync: ${message}`);
     }
 
     /**
@@ -1264,7 +1100,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     return false;
                 }
                 if (!checking) {
-                    this.shareNote(file.path, uiProof());
+                    this.shareNote(file.path);
                 }
                 return true;
             },
@@ -1301,10 +1137,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /** The note's public link on Drive, with Copy and Stop sharing, or a form to make one. */
-    shareNote(path: string, proof?: string): void {
-        // A public link is exfiltration with the user's own keys: only this
-        // plugin's UI may ask for one. See security/capability.ts.
-        requireUi(proof, 'a share link');
+    shareNote(path: string): void {
         new ShareModal(this.app, path, {
             load: () => runtime.engine.noteShareLink(path),
             create: (options) => runtime.engine.createNoteShareLink(path, options),
@@ -1360,8 +1193,8 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.refreshSettingsTab();
         if (this.ribbonIcon) {
             setIcon(this.ribbonIcon, statusIcon(summary));
-            this.ribbonIcon.toggleClass('proton-drive-sync-spin', statusSpins(summary));
-            setTooltip(this.ribbonIcon, `Proton Drive Sync: ${statusLabel(summary)}`);
+            this.ribbonIcon.toggleClass('proton-sdk-sync-spin', statusSpins(summary));
+            setTooltip(this.ribbonIcon, `Proton-SDK-Sync: ${statusLabel(summary)}`);
         }
         for (const leaf of this.app.workspace.getLeavesOfType(SYNC_PANEL_VIEW)) {
             if (leaf.view instanceof SyncPanelView) {
@@ -1442,7 +1275,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }
             if (!action) {
                 action = view.addAction('circle', 'Sync status', () => void this.openPanel());
-                action.addClass('proton-drive-sync-note-action');
+                action.addClass('proton-sdk-sync-note-action');
                 this.noteActions.set(view, action);
             }
             action.show();
@@ -1499,8 +1332,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * applies. Through the editor when the note is open, so the cursor stays
      * and nothing typed meanwhile is written over; else through the vault.
      */
-    async restoreVersion(path: string, data: ArrayBuffer, proof?: string): Promise<void> {
-        requireUi(proof, 'restoring an old version');
+    async restoreVersion(path: string, data: ArrayBuffer): Promise<void> {
         const file = this.app.vault.getFileByPath(path);
         if (!file) {
             throw new Error('the note no longer exists');
@@ -1642,7 +1474,17 @@ export default class ProtonDriveSyncPlugin extends Plugin {
 
     private storedInstallationId(): string | null {
         const stored = this.app.loadLocalStorage(CLIENT_UID_KEY) as unknown;
-        return typeof stored === 'string' && stored ? stored : null;
+        if (typeof stored === 'string' && stored) {
+            return stored;
+        }
+        // The previous plugin stored this under its own id. Adopting it keeps
+        // this device's entry in the shared device list instead of adding a twin.
+        const legacy = this.app.loadLocalStorage('proton-drive-sync-client-uid') as unknown;
+        if (typeof legacy === 'string' && legacy) {
+            this.app.saveLocalStorage(CLIENT_UID_KEY, legacy);
+            return legacy;
+        }
+        return null;
     }
 
     private pluginDir(): string {
@@ -1696,11 +1538,11 @@ function requestNotice(request: DeviceRequest): string {
 /** The mobile header button: a spinning sync icon while the note transfers, else the dot. */
 function renderNoteAction(action: HTMLElement, note: NoteIndicator): void {
     action.empty();
-    action.toggleClass('proton-drive-sync-spin', note.transferring);
+    action.toggleClass('proton-sdk-sync-spin', note.transferring);
     if (note.transferring) {
         setIcon(action, 'refresh-cw');
     } else {
-        action.createSpan({ cls: `proton-drive-sync-note-dot mod-${note.state}` });
+        action.createSpan({ cls: `proton-sdk-sync-note-dot mod-${note.state}` });
     }
     setTooltip(action, note.text);
     action.setAttr('aria-label', note.text);

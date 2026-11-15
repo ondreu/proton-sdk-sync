@@ -29,14 +29,14 @@ export function showConflictNotice(app: App, events: ConflictEvent[], actions: C
 
     const fragment = createFragment((root) => {
         root.createDiv({
-            cls: 'proton-drive-sync-notice-title',
+            cls: 'proton-sdk-sync-notice-title',
             text:
                 events.length === 1
-                    ? 'Proton Drive Sync: a file changed in two places'
-                    : `Proton Drive Sync: ${events.length} files changed in two places`,
+                    ? 'Proton-SDK-Sync: a file changed in two places'
+                    : `Proton-SDK-Sync: ${events.length} files changed in two places`,
         });
 
-        const list = root.createEl('ul', { cls: 'proton-drive-sync-notice-list' });
+        const list = root.createEl('ul', { cls: 'proton-sdk-sync-notice-list' });
         for (const event of events.slice(0, MAX_LISTED)) {
             const item = list.createEl('li');
             // Only notes the vault indexes can be opened; config files cannot.

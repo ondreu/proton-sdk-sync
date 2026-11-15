@@ -1,15 +1,15 @@
 /* Status bar */
 
-.proton-drive-sync-icon {
+.proton-sdk-sync-icon {
     display: inline-flex;
     vertical-align: middle;
 }
 
-.proton-drive-sync-icon.proton-drive-sync-spin svg {
-    animation: proton-drive-sync-rotate 1.4s linear infinite;
+.proton-sdk-sync-icon.proton-sdk-sync-spin svg {
+    animation: proton-sdk-sync-rotate 1.4s linear infinite;
 }
 
-@keyframes proton-drive-sync-rotate {
+@keyframes proton-sdk-sync-rotate {
     to {
         transform: rotate(360deg);
     }
@@ -18,14 +18,14 @@
 /* Respect the reduced-motion preference: the spinner is decorative, and the
    status bar text already says the sync is running. */
 @media (prefers-reduced-motion: reduce) {
-    .proton-drive-sync-icon.proton-drive-sync-spin svg {
+    .proton-sdk-sync-icon.proton-sdk-sync-spin svg {
         animation: none;
     }
 }
 
 /* Folder picker */
 
-.proton-drive-sync-breadcrumb {
+.proton-sdk-sync-breadcrumb {
     color: var(--text-muted);
     font-size: var(--font-ui-small);
     margin-top: 0;
@@ -33,7 +33,7 @@
 
 /* Settings: recent activity */
 
-.proton-drive-sync-log {
+.proton-sdk-sync-log {
     max-height: 16em;
     overflow: auto;
     padding: var(--size-4-2);
@@ -49,48 +49,48 @@
     overflow-wrap: anywhere;
 }
 
-.proton-drive-sync-log-setting {
+.proton-sdk-sync-log-setting {
     flex-wrap: wrap;
 }
 
-.proton-drive-sync-log-setting > .proton-drive-sync-log {
+.proton-sdk-sync-log-setting > .proton-sdk-sync-log {
     flex: 1 1 100%;
     margin: var(--size-4-2) 0 0;
 }
 
 /* Conflict notice */
 
-.proton-drive-sync-notice-title {
+.proton-sdk-sync-notice-title {
     font-weight: var(--font-semibold);
 }
 
-.proton-drive-sync-notice-list {
+.proton-sdk-sync-notice-list {
     margin: var(--size-4-1) 0;
     padding-inline-start: var(--size-4-4);
 }
 
-.proton-drive-sync-notice-list a {
+.proton-sdk-sync-notice-list a {
     word-break: break-all;
 }
 
 /* Shared */
 
-.proton-drive-sync-muted {
+.proton-sdk-sync-muted {
     color: var(--text-muted);
     font-size: var(--font-ui-small);
 }
 
 /* First-sync preview */
 
-.proton-drive-sync-plan {
+.proton-sdk-sync-plan {
     padding-inline-start: var(--size-4-4);
 }
 
-.proton-drive-sync-plan summary {
+.proton-sdk-sync-plan summary {
     cursor: pointer;
 }
 
-.proton-drive-sync-plan-files {
+.proton-sdk-sync-plan-files {
     max-height: 12em;
     overflow: auto;
     color: var(--text-muted);
@@ -99,11 +99,11 @@
 
 /* Diff */
 
-.proton-drive-sync-diff-modal {
+.proton-sdk-sync-diff-modal {
     width: min(90vw, 960px);
 }
 
-.proton-drive-sync-diff-header {
+.proton-sdk-sync-diff-header {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -112,22 +112,22 @@
     font-size: var(--font-ui-small);
 }
 
-.proton-drive-sync-diff-stats {
+.proton-sdk-sync-diff-stats {
     margin-inline-start: auto;
     font-family: var(--font-monospace);
 }
 
-.proton-drive-sync-diff-header .mod-added,
-.proton-drive-sync-diff-legend.mod-added {
+.proton-sdk-sync-diff-header .mod-added,
+.proton-sdk-sync-diff-legend.mod-added {
     color: var(--color-green);
 }
 
-.proton-drive-sync-diff-header .mod-removed,
-.proton-drive-sync-diff-legend.mod-removed {
+.proton-sdk-sync-diff-header .mod-removed,
+.proton-sdk-sync-diff-legend.mod-removed {
     color: var(--color-red);
 }
 
-.proton-drive-sync-diff {
+.proton-sdk-sync-diff {
     max-height: 60vh;
     overflow: auto;
     border: 1px solid var(--background-modifier-border);
@@ -137,61 +137,61 @@
     line-height: 1.5;
 }
 
-.proton-drive-sync-diff-line {
+.proton-sdk-sync-diff-line {
     display: grid;
     grid-template-columns: 3.5em 3.5em 1.5em 1fr;
 }
 
-.proton-drive-sync-diff-line.mod-added {
+.proton-sdk-sync-diff-line.mod-added {
     background-color: rgba(var(--color-green-rgb), 0.12);
 }
 
-.proton-drive-sync-diff-line.mod-removed {
+.proton-sdk-sync-diff-line.mod-removed {
     background-color: rgba(var(--color-red-rgb), 0.12);
 }
 
-.proton-drive-sync-diff-no {
+.proton-sdk-sync-diff-no {
     padding-inline-end: var(--size-4-2);
     color: var(--text-faint);
     text-align: end;
     user-select: none;
 }
 
-.proton-drive-sync-diff-sign {
+.proton-sdk-sync-diff-sign {
     user-select: none;
 }
 
-.proton-drive-sync-diff-line.mod-added .proton-drive-sync-diff-sign {
+.proton-sdk-sync-diff-line.mod-added .proton-sdk-sync-diff-sign {
     color: var(--color-green);
 }
 
-.proton-drive-sync-diff-line.mod-removed .proton-drive-sync-diff-sign {
+.proton-sdk-sync-diff-line.mod-removed .proton-sdk-sync-diff-sign {
     color: var(--color-red);
 }
 
-.proton-drive-sync-diff-text {
+.proton-sdk-sync-diff-text {
     white-space: pre-wrap;
     word-break: break-word;
     padding-inline-end: var(--size-4-2);
 }
 
-.proton-drive-sync-diff-line.mod-added .proton-drive-sync-diff-change {
+.proton-sdk-sync-diff-line.mod-added .proton-sdk-sync-diff-change {
     background-color: rgba(var(--color-green-rgb), 0.35);
     border-radius: 2px;
 }
 
-.proton-drive-sync-diff-line.mod-removed .proton-drive-sync-diff-change {
+.proton-sdk-sync-diff-line.mod-removed .proton-sdk-sync-diff-change {
     background-color: rgba(var(--color-red-rgb), 0.35);
     border-radius: 2px;
 }
 
-.proton-drive-sync-diff-hunk {
+.proton-sdk-sync-diff-hunk {
     padding: 0 var(--size-4-2);
     background-color: var(--background-secondary);
     color: var(--text-muted);
 }
 
-.proton-drive-sync-diff-fold {
+.proton-sdk-sync-diff-fold {
     display: block;
     width: 100%;
     border-radius: 0;
@@ -203,17 +203,17 @@
 
 /* Sync panel (the status bar's stand-in on mobile) */
 
-.proton-drive-sync-spin svg {
-    animation: proton-drive-sync-rotate 1.4s linear infinite;
+.proton-sdk-sync-spin svg {
+    animation: proton-sdk-sync-rotate 1.4s linear infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .proton-drive-sync-spin svg {
+    .proton-sdk-sync-spin svg {
         animation: none;
     }
 }
 
-.proton-drive-sync-panel-header {
+.proton-sdk-sync-panel-header {
     display: flex;
     align-items: center;
     gap: var(--size-4-2);
@@ -222,7 +222,7 @@
     font-weight: var(--font-semibold);
 }
 
-.proton-drive-sync-panel-progress {
+.proton-sdk-sync-panel-progress {
     height: 6px;
     margin: var(--size-4-3) 0;
     border-radius: var(--radius-s);
@@ -230,13 +230,13 @@
     overflow: hidden;
 }
 
-.proton-drive-sync-panel-progress-fill {
+.proton-sdk-sync-panel-progress-fill {
     height: 100%;
     background-color: var(--interactive-accent);
     transition: width 0.25s ease-out;
 }
 
-.proton-drive-sync-panel-details {
+.proton-sdk-sync-panel-details {
     padding-inline-start: var(--size-4-4);
     color: var(--text-muted);
     font-size: var(--font-ui-small);
@@ -244,7 +244,7 @@
 
 /* When the vault last synced: green while syncs keep coming, red once the last
    one is over an hour old. */
-.proton-drive-sync-last-synced {
+.proton-sdk-sync-last-synced {
     display: flex;
     align-items: center;
     gap: var(--size-4-2);
@@ -256,28 +256,28 @@
     font-size: var(--font-ui-small);
 }
 
-.proton-drive-sync-last-synced.mod-overdue {
+.proton-sdk-sync-last-synced.mod-overdue {
     border-color: rgba(var(--color-red-rgb), 0.5);
     background-color: rgba(var(--color-red-rgb), 0.12);
 }
 
-.proton-drive-sync-last-synced-icon {
+.proton-sdk-sync-last-synced-icon {
     display: inline-flex;
     flex-shrink: 0;
     color: var(--color-green);
 }
 
-.proton-drive-sync-last-synced.mod-overdue .proton-drive-sync-last-synced-icon {
+.proton-sdk-sync-last-synced.mod-overdue .proton-sdk-sync-last-synced-icon {
     color: var(--color-red);
 }
 
-.proton-drive-sync-last-synced-text {
+.proton-sdk-sync-last-synced-text {
     min-width: 0;
     overflow-wrap: anywhere;
 }
 
 /* The panel's actions, one to a row. */
-.proton-drive-sync-panel-actions {
+.proton-sdk-sync-panel-actions {
     display: flex;
     flex-direction: column;
     gap: var(--size-4-2);
@@ -286,7 +286,7 @@
 
 /* The full width of the panel and all the same height, a little taller than
    Obsidian's usual button, so each is an easy target for a mouse or a finger. */
-.proton-drive-sync-panel-actions > button {
+.proton-sdk-sync-panel-actions > button {
     display: flex;
     width: 100%;
     height: calc(var(--input-height) + var(--size-4-1));
@@ -294,7 +294,7 @@
 }
 
 /* A button with an icon beside its label; see `labelButton`. */
-button.proton-drive-sync-labelled {
+button.proton-sdk-sync-labelled {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -302,98 +302,98 @@ button.proton-drive-sync-labelled {
 }
 
 /* The button itself takes every click, however its content is redrawn. */
-.proton-drive-sync-button-icon,
-.proton-drive-sync-button-text {
+.proton-sdk-sync-button-icon,
+.proton-sdk-sync-button-text {
     pointer-events: none;
 }
 
-.proton-drive-sync-button-icon {
+.proton-sdk-sync-button-icon {
     display: inline-flex;
     flex-shrink: 0;
 }
 
 /* One line, cut short with an ellipsis, so a long note name cannot make its
    button taller than the rest. */
-.proton-drive-sync-button-text {
+.proton-sdk-sync-button-text {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.proton-drive-sync-panel-heading {
+.proton-sdk-sync-panel-heading {
     margin-top: var(--size-4-4);
     color: var(--text-muted);
 }
 
 /* Diff actions: each button in the colour and sign of the version it keeps */
 
-.proton-drive-sync-diff-hint {
+.proton-sdk-sync-diff-hint {
     margin-bottom: 0;
     color: var(--text-muted);
     font-size: var(--font-ui-small);
 }
 
-.proton-drive-sync-diff-hint .mod-removed {
+.proton-sdk-sync-diff-hint .mod-removed {
     color: var(--color-red);
 }
 
-.proton-drive-sync-diff-hint .mod-added {
+.proton-sdk-sync-diff-hint .mod-added {
     color: var(--color-green);
 }
 
-.proton-drive-sync-diff-actions .setting-item-control {
+.proton-sdk-sync-diff-actions .setting-item-control {
     flex-wrap: wrap;
 }
 
-button.proton-drive-sync-diff-action {
+button.proton-sdk-sync-diff-action {
     color: var(--text-normal);
     font-weight: var(--font-semibold);
 }
 
-button.proton-drive-sync-diff-action.mod-removed {
+button.proton-sdk-sync-diff-action.mod-removed {
     background-color: rgba(var(--color-red-rgb), 0.15);
     box-shadow: inset 0 0 0 1px rgba(var(--color-red-rgb), 0.6);
 }
 
-button.proton-drive-sync-diff-action.mod-removed:hover {
+button.proton-sdk-sync-diff-action.mod-removed:hover {
     background-color: rgba(var(--color-red-rgb), 0.28);
 }
 
-button.proton-drive-sync-diff-action.mod-added {
+button.proton-sdk-sync-diff-action.mod-added {
     background-color: rgba(var(--color-green-rgb), 0.15);
     box-shadow: inset 0 0 0 1px rgba(var(--color-green-rgb), 0.6);
 }
 
-button.proton-drive-sync-diff-action.mod-added:hover {
+button.proton-sdk-sync-diff-action.mod-added:hover {
     background-color: rgba(var(--color-green-rgb), 0.28);
 }
 
 /* Sign-in: a spinner beside what it is waiting for, which can run to a few
    lines, so the spinner stays level with the first. */
 
-.proton-drive-sync-waiting {
+.proton-sdk-sync-waiting {
     display: flex;
     align-items: flex-start;
     gap: var(--size-4-2);
     margin-block: var(--size-4-3);
 }
 
-.proton-drive-sync-waiting .proton-drive-sync-icon {
+.proton-sdk-sync-waiting .proton-sdk-sync-icon {
     flex: none;
     margin-top: 0.15em;
 }
 
 /* PIN prompts */
 
-.proton-drive-sync-pin-error {
+.proton-sdk-sync-pin-error {
     min-height: 1.5em;
     margin: 0;
     color: var(--text-error);
     font-size: var(--font-ui-small);
 }
 
-.proton-drive-sync-pin-warning {
+.proton-sdk-sync-pin-warning {
     padding: var(--size-4-2) var(--size-4-3);
     border-inline-start: 3px solid var(--color-orange);
     border-radius: var(--radius-s);
@@ -403,7 +403,7 @@ button.proton-drive-sync-diff-action.mod-added:hover {
 
 /* Current-note indicator: beside the status-bar icon, and in note headers on mobile */
 
-.proton-drive-sync-note-dot {
+.proton-sdk-sync-note-dot {
     display: inline-block;
     width: 8px;
     height: 8px;
@@ -412,27 +412,27 @@ button.proton-drive-sync-diff-action.mod-added:hover {
     vertical-align: middle;
 }
 
-.proton-drive-sync-note-action .proton-drive-sync-note-dot {
+.proton-sdk-sync-note-action .proton-sdk-sync-note-dot {
     width: 10px;
     height: 10px;
     margin: 0;
 }
 
-.proton-drive-sync-note-dot.mod-synced {
+.proton-sdk-sync-note-dot.mod-synced {
     background-color: var(--color-green);
-    animation: proton-drive-sync-pulse 2.4s ease-in-out infinite;
+    animation: proton-sdk-sync-pulse 2.4s ease-in-out infinite;
 }
 
-.proton-drive-sync-note-dot.mod-pending {
+.proton-sdk-sync-note-dot.mod-pending {
     background-color: var(--color-red);
-    animation: proton-drive-sync-pulse 1.2s ease-in-out infinite;
+    animation: proton-sdk-sync-pulse 1.2s ease-in-out infinite;
 }
 
-.proton-drive-sync-note-dot.mod-excluded {
+.proton-sdk-sync-note-dot.mod-excluded {
     background-color: var(--text-faint);
 }
 
-@keyframes proton-drive-sync-pulse {
+@keyframes proton-sdk-sync-pulse {
     0%,
     100% {
         opacity: 1;
@@ -445,8 +445,8 @@ button.proton-drive-sync-diff-action.mod-added:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .proton-drive-sync-note-dot.mod-synced,
-    .proton-drive-sync-note-dot.mod-pending {
+    .proton-sdk-sync-note-dot.mod-synced,
+    .proton-sdk-sync-note-dot.mod-pending {
         animation: none;
     }
 }
@@ -454,21 +454,21 @@ button.proton-drive-sync-diff-action.mod-added:hover {
 /* Versions and recently deleted dialogs: a line on what is listed, with a
    refresh button, then ten rows to a page. */
 
-.proton-drive-sync-list-header {
+.proton-sdk-sync-list-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: var(--size-4-2);
 }
 
-.proton-drive-sync-list {
+.proton-sdk-sync-list {
     display: flex;
     flex-direction: column;
     gap: var(--size-4-1);
     margin-top: var(--size-4-2);
 }
 
-button.proton-drive-sync-version {
+button.proton-sdk-sync-version {
     display: block;
     width: 100%;
     height: auto;
@@ -479,16 +479,16 @@ button.proton-drive-sync-version {
     background-color: var(--background-secondary);
 }
 
-button.proton-drive-sync-version:hover {
+button.proton-sdk-sync-version:hover {
     background-color: var(--background-modifier-hover);
 }
 
-.proton-drive-sync-version-date {
+.proton-sdk-sync-version-date {
     font-size: var(--font-ui-small);
     color: var(--text-normal);
 }
 
-.proton-drive-sync-badge {
+.proton-sdk-sync-badge {
     margin-inline-start: var(--size-4-2);
     padding: 0 var(--size-4-1);
     border-radius: var(--radius-s);
@@ -498,7 +498,7 @@ button.proton-drive-sync-version:hover {
 }
 
 /* Wraps on a narrow phone screen rather than squeezing "Page 2 of 5". */
-.proton-drive-sync-pager {
+.proton-sdk-sync-pager {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -508,18 +508,18 @@ button.proton-drive-sync-version:hover {
 }
 
 /* Back from comparing a version to the list of them. */
-.proton-drive-sync-back {
+.proton-sdk-sync-back {
     margin-bottom: var(--size-4-3);
 }
 
 /* Before a pass has a total to measure against, the bar only says work is under way. */
-.proton-drive-sync-panel-progress.mod-indeterminate .proton-drive-sync-panel-progress-fill {
+.proton-sdk-sync-panel-progress.mod-indeterminate .proton-sdk-sync-panel-progress-fill {
     width: 30%;
     transition: none;
-    animation: proton-drive-sync-indeterminate 1.4s ease-in-out infinite;
+    animation: proton-sdk-sync-indeterminate 1.4s ease-in-out infinite;
 }
 
-@keyframes proton-drive-sync-indeterminate {
+@keyframes proton-sdk-sync-indeterminate {
     0% {
         transform: translateX(-100%);
     }
@@ -529,7 +529,7 @@ button.proton-drive-sync-version:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .proton-drive-sync-panel-progress.mod-indeterminate .proton-drive-sync-panel-progress-fill {
+    .proton-sdk-sync-panel-progress.mod-indeterminate .proton-sdk-sync-panel-progress-fill {
         width: 100%;
         opacity: 0.4;
         animation: none;
@@ -538,7 +538,7 @@ button.proton-drive-sync-version:hover {
 
 /* "Recently deleted": the file and when, with its Restore button beside it,
    or under it, kept to the end of the row, on a narrow phone screen. */
-.proton-drive-sync-deleted {
+.proton-sdk-sync-deleted {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -548,21 +548,21 @@ button.proton-drive-sync-version:hover {
     background-color: var(--background-secondary);
 }
 
-.proton-drive-sync-deleted-text {
+.proton-sdk-sync-deleted-text {
     flex: 1 1 12em;
     min-width: 0;
     font-size: var(--font-ui-small);
     overflow-wrap: anywhere;
 }
 
-.proton-drive-sync-deleted > button {
+.proton-sdk-sync-deleted > button {
     margin-inline-start: auto;
 }
 
 /* The device list: each device, how it stands and when it last synced, with
    its buttons beside it, or under it, kept to the end of the row, on a narrow
    phone screen. */
-.proton-drive-sync-device {
+.proton-sdk-sync-device {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -572,31 +572,31 @@ button.proton-drive-sync-version:hover {
     background-color: var(--background-secondary);
 }
 
-.proton-drive-sync-device-text {
+.proton-sdk-sync-device-text {
     flex: 1 1 14em;
     min-width: 0;
     font-size: var(--font-ui-small);
     overflow-wrap: anywhere;
 }
 
-.proton-drive-sync-device-name {
+.proton-sdk-sync-device-name {
     font-weight: var(--font-semibold);
 }
 
-.proton-drive-sync-device-actions {
+.proton-sdk-sync-device-actions {
     display: flex;
     flex-wrap: wrap;
     gap: var(--size-4-1);
     margin-inline-start: auto;
 }
 
-.proton-drive-sync-device .proton-drive-sync-last-synced {
+.proton-sdk-sync-device .proton-sdk-sync-last-synced {
     margin: var(--size-4-1) 0 0;
     padding: var(--size-4-1) var(--size-4-2);
 }
 
 /* The share link, selectable in full. */
-.proton-drive-sync-share-url {
+.proton-sdk-sync-share-url {
     width: 100%;
     font-family: var(--font-monospace);
     font-size: var(--font-ui-small);
@@ -604,28 +604,28 @@ button.proton-drive-sync-version:hover {
 
 /* Status blocks inside a setting's description: full width of the text column,
    small type, and no stray margins between the lines. */
-.proton-drive-sync-status {
+.proton-sdk-sync-status {
     margin: 0.35em 0 0;
     font-size: var(--font-ui-smaller);
     color: var(--text-muted);
     line-height: 1.45;
 }
 
-.proton-drive-sync-status p {
+.proton-sdk-sync-status p {
     margin: 0.15em 0;
     white-space: normal;
     overflow-wrap: anywhere;
 }
 
-.proton-drive-sync-status details {
+.proton-sdk-sync-status details {
     margin-top: 0.3em;
 }
 
-.proton-drive-sync-status summary {
+.proton-sdk-sync-status summary {
     cursor: pointer;
     color: var(--text-faint);
 }
 
-.proton-drive-sync-status details p {
+.proton-sdk-sync-status details p {
     padding-left: 1em;
 }

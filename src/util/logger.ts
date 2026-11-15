@@ -140,7 +140,7 @@ export class Logger {
 
     constructor(
         private minLevel: LogLevel = 'info',
-        private readonly scope = 'proton-drive-sync',
+        private readonly scope = 'proton-sdk-sync',
         private readonly root?: Logger,
     ) {}
 

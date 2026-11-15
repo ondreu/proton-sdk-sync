@@ -15,12 +15,12 @@ export function renderPager(container: HTMLElement, page: number, pages: number,
     if (pages <= 1) {
         return;
     }
-    const pager = container.createDiv({ cls: 'proton-drive-sync-pager' });
+    const pager = container.createDiv({ cls: 'proton-sdk-sync-pager' });
     new ButtonComponent(pager)
         .setButtonText('Newer')
         .setDisabled(page === 0)
         .onClick(() => go(page - 1));
-    pager.createSpan({ cls: 'proton-drive-sync-muted', text: `Page ${page + 1} of ${pages}` });
+    pager.createSpan({ cls: 'proton-sdk-sync-muted', text: `Page ${page + 1} of ${pages}` });
     new ButtonComponent(pager)
         .setButtonText('Older')
         .setDisabled(page >= pages - 1)

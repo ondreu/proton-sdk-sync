@@ -14,8 +14,8 @@ export function labelButton(button: ButtonComponent, icon: string, text: string)
     el.dataset.icon = icon;
     el.dataset.label = text;
     el.empty();
-    el.addClass('proton-drive-sync-labelled');
-    setIcon(el.createSpan({ cls: 'proton-drive-sync-button-icon' }), icon);
-    el.createSpan({ cls: 'proton-drive-sync-button-text', text });
+    el.addClass('proton-sdk-sync-labelled');
+    setIcon(el.createSpan({ cls: 'proton-sdk-sync-button-icon' }), icon);
+    el.createSpan({ cls: 'proton-sdk-sync-button-text', text });
     return button;
 }

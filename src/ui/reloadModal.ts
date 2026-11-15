@@ -37,7 +37,7 @@ export class ReloadModal extends Modal {
         }
 
         contentEl.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text:
                 'Your notes keep syncing in the meantime, and reloading now is safe: the sync picks up where it ' +
                 'left off. It is also quicker now than once every note has arrived. Until you reload, settings ' +

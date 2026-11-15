@@ -9,7 +9,6 @@ import { ConflictsModal } from './conflictsModal';
 import { FolderPickerModal } from './folderPickerModal';
 import { SignInModal } from './signInModal';
 import { getRuntime } from '../runtime';
-import { uiProof } from '../security/capability';
 
 export const CONFLICT_POLICIES: Record<ConflictPolicy, string> = {
     'keep-both': 'Keep both versions (recommended)',
@@ -79,7 +78,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             this.mobileGroup(),
             this.advancedGroup(),
             this.logGroup(),
-            this.securityGroup(),
+            this.maintenanceGroup(),
         ];
     }
 
@@ -173,7 +172,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                             }
                             if (signedIn) {
                                 button.setButtonText('Sign out').onClick(async () => {
-                                    await this.plugin.signOut(uiProof());
+                                    await this.plugin.signOut();
                                     this.update();
                                 });
                                 return;
@@ -342,11 +341,11 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                         setting.addButton((button) =>
                             button.setButtonText('Sync now').onClick(async () => {
                                 if (!this.plugin.isConfigured()) {
-                                    new Notice('Proton Drive Sync: sign in and choose a Drive folder first.');
+                                    new Notice('Proton-SDK-Sync: sign in and choose a Drive folder first.');
                                     return;
                                 }
                                 await getRuntime().engine.syncNow();
-                                new Notice('Proton Drive Sync: finished.');
+                                new Notice('Proton-SDK-Sync: finished.');
                             }),
                         );
                     },
@@ -539,7 +538,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                                 .setDestructive()
                                 .onClick(async () => {
                                     await this.plugin.rebuildState();
-                                    new Notice('Proton Drive Sync: sync state rebuilt.');
+                                    new Notice('Proton-SDK-Sync: sync state rebuilt.');
                                 }),
                         );
                     },
@@ -549,76 +548,19 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     }
 
 
-    /**
-     * What is installed beside this plugin.
-     *
-     * Every plugin in a vault can read the vault and this plugin's sign-in, so
-     * the set of plugins is part of the security model. This shows what was
-     * seen at the last start and what changed since the one before; the scan
-     * compares a hash of each `main.js`, not only the version a plugin claims.
-     */
-    private securityGroup(): SettingDefinitionItem {
+    /** Housekeeping: the one cache the plugin keeps between starts. */
+    private maintenanceGroup(): SettingDefinitionItem {
         return {
             type: 'group',
-            heading: 'Security',
+            heading: 'Maintenance',
             items: [
-                {
-                    name: 'Watch the other plugins in this vault',
-                    desc:
-                        'At each start, compare the installed plugins with the set seen last time and say when one ' +
-                        'is added, updated or removed. A change to code that can read this vault is worth knowing about.',
-                    render: (setting) =>
-                        setting.addToggle((toggle) =>
-                            toggle.setValue(this.plugin.settings.watchOtherPlugins).onChange(async (value) => {
-                                this.plugin.settings.watchOtherPlugins = value;
-                                await this.plugin.saveSettings();
-                                if (value) {
-                                    void this.plugin.scanOtherPlugins();
-                                }
-                                this.update();
-                            }),
-                        ),
-                },
-                {
-                    name: 'This plugin’s own code, and who can write it',
-                    desc:
-                        'Whoever can replace main.js runs code with your keyring, so the code is checked against what ' +
-                        'was installed, and the vault permissions are reported.',
-                    render: (setting) => {
-                        const box = this.statusBox(setting);
-                        const integrity = getRuntime().selfIntegrity;
-                        const words: Record<string, string> = {
-                            'first-run': 'Recorded on this start.',
-                            unchanged: 'Unchanged since it was installed.',
-                            updated: 'Updated with a new version.',
-                            'changed-without-update': 'Changed without a new version — treat the sign-in as exposed.',
-                        };
-                        box.createEl('p', { text: `${integrity ? words[integrity] : 'Not checked yet.'}` });
-                        const findings = getRuntime().securityFindings;
-                        if (findings.length === 0) {
-                            box.createEl('p', { text: 'No permission problems found.' });
-                        }
-                        for (const finding of findings) {
-                            box.createEl('p', { text: `• ${finding.problem}` });
-                        }
-                        setting.addToggle((toggle) =>
-                            toggle
-                                .setTooltip('Pause syncing while the vault is writable by other users')
-                                .setValue(this.plugin.settings.refuseOnInsecurePermissions)
-                                .onChange(async (value) => {
-                                    this.plugin.settings.refuseOnInsecurePermissions = value;
-                                    await this.plugin.saveSettings();
-                                }),
-                        );
-                    },
-                },
                 {
                     name: 'Clear cached Drive metadata',
                     desc:
                         'The plugin keeps the names and sizes of synced files between starts, encrypted with the ' +
                         'session, so a start does not ask Drive for them again. Clearing it costs one full walk of ' +
                         'the folder on the next sync.',
-                    render: (setting) =>
+                    render: (setting) => {
                         setting.addButton((button) =>
                             button.setButtonText('Clear').onClick(async () => {
                                 await getRuntime().session.clearCache();
@@ -628,70 +570,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                                 );
                                 this.update();
                             }),
-                        ),
-                },
-                {
-                    name: 'Attempts to reach the sign-in',
-                    desc:
-                        'Every call another plugin makes to the Proton secret storage, and every look for a credentials ' +
-                        'field on this plugin, is recorded here with the plugin it came from.',
-                    render: (setting) => {
-                        const hits = getRuntime().tripwire?.hits ?? [];
-                        const box = this.statusBox(setting);
-                        if (hits.length === 0) {
-                            box.setText('Nothing has reached for the sign-in since this start.');
-                            return;
-                        }
-                        box.createEl('p', { text: `${hits.length} attempt(s) since this start:` });
-                        for (const hit of hits.slice(-10).reverse()) {
-                            const what = hit.ids && hit.ids[0] !== '*' ? ` (${hit.ids[0]})` : '';
-                            box.createEl('p', {
-                                text: `• ${new Date(hit.at).toLocaleTimeString()} ${hit.by ?? 'outside a plugin'} → ${hit.wire}${what}`,
-                            });
-                        }
-                    },
-                },
-                {
-                    name: 'Changes Obsidian would not announce',
-                    desc:
-                        'An update is announced by Obsidian, so it is not repeated here. Two things are: the same ' +
-                        'version with different code, and an update whose new code starts reaching for credential ' +
-                        'APIs (secretStorage, other plugins’ internals) that it did not mention before.',
-                    render: (setting) => {
-                        setting.addButton((button) =>
-                            button.setButtonText('Rescan').onClick(() => void this.plugin.scanOtherPlugins()),
                         );
-                        const report = getRuntime().pluginWatch;
-                        const box = this.statusBox(setting);
-                        if (!report) {
-                            box.setText('Nothing scanned yet.');
-                            return;
-                        }
-                        if (report.plugins.length === 0) {
-                            box.setText('No other plugins are installed in this vault.');
-                            return;
-                        }
-                        if (report.alerts.length === 0) {
-                            box.setText(`${report.plugins.length} other plugin(s); nothing since the last start that Obsidian would not already tell you.`);
-                        }
-                        for (const alert of report.alerts) {
-                            box.createEl('p', { text: `• ${alert.name} — ${alert.why}` });
-                        }
-                        if (report.changes.length > 0) {
-                            const updates = box.createEl('details');
-                            updates.createEl('summary', { text: `Updates since the last start (${report.changes.length})` });
-                            for (const change of report.changes) {
-                                const line =
-                                    change.kind === 'added' ? 'new' : change.kind === 'removed' ? 'removed' : 'changed';
-                                updates.createEl('p', { text: `• ${change.name} — ${line} (${change.detail})` });
-                            }
-                        }
-                        const all = box.createEl('details');
-                        all.createEl('summary', { text: `All ${report.plugins.length} plugin(s)` });
-                        for (const plugin of report.plugins) {
-                            const tag = plugin.digest ? plugin.digest.slice(0, 8) : 'unreadable';
-                            all.createEl('p', { text: `• ${plugin.name} ${plugin.version} — ${tag}` });
-                        }
                     },
                 },
             ],
@@ -707,8 +586,8 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
      * removed first.
      */
     private statusBox(setting: Setting): HTMLElement {
-        setting.descEl.querySelectorAll(':scope > .proton-drive-sync-status').forEach((el) => el.remove());
-        return setting.descEl.createDiv({ cls: 'proton-drive-sync-status' });
+        setting.descEl.querySelectorAll(':scope > .proton-sdk-sync-status').forEach((el) => el.remove());
+        return setting.descEl.createDiv({ cls: 'proton-sdk-sync-status' });
     }
 
     private logGroup(): SettingDefinitionItem {
@@ -728,8 +607,8 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                         );
                         // Stacked, with the log under the name and button, so it
                         // has the card's full width on a narrow screen.
-                        setting.settingEl.addClass('proton-drive-sync-log-setting');
-                        const log = setting.settingEl.createEl('pre', { cls: 'proton-drive-sync-log' });
+                        setting.settingEl.addClass('proton-sdk-sync-log-setting');
+                        const log = setting.settingEl.createEl('pre', { cls: 'proton-sdk-sync-log' });
                         const entries = getRuntime().logger.getEntries().slice(-50);
                         log.setText(
                             entries.length === 0

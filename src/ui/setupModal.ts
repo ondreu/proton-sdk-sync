@@ -32,7 +32,7 @@ export class SetupModal extends Modal {
     }
 
     override onOpen(): void {
-        this.setTitle('Set up Proton Drive Sync');
+        this.setTitle('Set up Proton-SDK-Sync');
         this.render();
     }
 

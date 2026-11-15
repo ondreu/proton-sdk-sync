@@ -45,7 +45,7 @@ export class ShareModal extends Modal {
 
     override onOpen(): void {
         this.setTitle(`Share ${basename(this.path)}`);
-        this.contentEl.createEl('p', { cls: 'proton-drive-sync-muted', text: 'Looking for a link…' });
+        this.contentEl.createEl('p', { cls: 'proton-sdk-sync-muted', text: 'Looking for a link…' });
         void this.refresh();
     }
 
@@ -74,7 +74,7 @@ export class ShareModal extends Modal {
         const { contentEl } = this;
         contentEl.createEl('p', { text: 'Anyone with this link can open the note as it is on Proton Drive.' });
         contentEl.createEl('input', {
-            cls: 'proton-drive-sync-share-url',
+            cls: 'proton-sdk-sync-share-url',
             attr: { type: 'text', readonly: 'true', value: link.url },
         });
         const facts = [
@@ -82,7 +82,7 @@ export class ShareModal extends Modal {
             link.expiration ? `expires ${link.expiration.toLocaleString()}` : 'does not expire',
             `opened ${link.downloads} time${link.downloads === 1 ? '' : 's'}`,
         ];
-        contentEl.createEl('p', { cls: 'proton-drive-sync-muted', text: facts.join(' · ') });
+        contentEl.createEl('p', { cls: 'proton-sdk-sync-muted', text: facts.join(' · ') });
 
         new Setting(contentEl)
             .addButton((button) =>

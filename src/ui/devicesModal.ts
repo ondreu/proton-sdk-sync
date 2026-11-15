@@ -89,9 +89,9 @@ export class DevicesModal extends Modal {
     private render(): void {
         const { contentEl } = this;
         contentEl.empty();
-        const header = contentEl.createDiv({ cls: 'proton-drive-sync-list-header' });
+        const header = contentEl.createDiv({ cls: 'proton-sdk-sync-list-header' });
         header.createSpan({
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text:
                 'Devices list themselves here when they sync. Older versions of this plugin, and Proton’s own ' +
                 'apps, do not, and ignore what is asked here.',
@@ -101,7 +101,7 @@ export class DevicesModal extends Modal {
             .setTooltip('List the devices again')
             .onClick(() => void this.load());
 
-        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-drive-sync-muted', text });
+        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-sdk-sync-muted', text });
         if (this.entries === 'loading') {
             say('Listing devices…');
             return;
@@ -114,7 +114,7 @@ export class DevicesModal extends Modal {
             say('No device has listed itself yet. Each one does shortly after it syncs.');
             return;
         }
-        const list = contentEl.createDiv({ cls: 'proton-drive-sync-list' });
+        const list = contentEl.createDiv({ cls: 'proton-sdk-sync-list' });
         const self = this.host.selfId;
         const sorted = [...this.entries].sort(
             (a, b) => Number(b.id === self) - Number(a.id === self) || (b.record?.seen ?? 0) - (a.record?.seen ?? 0),
@@ -123,7 +123,7 @@ export class DevicesModal extends Modal {
             this.renderEntry(list, entry);
         }
         contentEl.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text:
                 'This asks devices to cooperate; it cannot make them. To cut a device off for good, change your ' +
                 'Proton password, or revoke its session in Proton’s account settings under Security.',
@@ -133,12 +133,12 @@ export class DevicesModal extends Modal {
     private renderEntry(list: HTMLElement, entry: DeviceEntry): void {
         const { record } = entry;
         const isSelf = entry.id === this.host.selfId;
-        const row = list.createDiv({ cls: 'proton-drive-sync-device' });
-        const text = row.createDiv({ cls: 'proton-drive-sync-device-text' });
+        const row = list.createDiv({ cls: 'proton-sdk-sync-device' });
+        const text = row.createDiv({ cls: 'proton-sdk-sync-device-text' });
 
-        const name = text.createDiv({ cls: 'proton-drive-sync-device-name', text: record?.name || 'Unknown device' });
+        const name = text.createDiv({ cls: 'proton-sdk-sync-device-name', text: record?.name || 'Unknown device' });
         if (isSelf) {
-            name.createSpan({ cls: 'proton-drive-sync-badge', text: 'This device' });
+            name.createSpan({ cls: 'proton-sdk-sync-badge', text: 'This device' });
         }
         const facts = [
             record?.platform,
@@ -146,7 +146,7 @@ export class DevicesModal extends Modal {
             record?.account ?? undefined,
         ].filter((fact): fact is string => Boolean(fact));
         if (facts.length > 0) {
-            text.createDiv({ cls: 'proton-drive-sync-muted', text: facts.join(' · ') });
+            text.createDiv({ cls: 'proton-sdk-sync-muted', text: facts.join(' · ') });
         }
 
         const standing = standingOf(entry);
@@ -157,22 +157,22 @@ export class DevicesModal extends Modal {
                   ? (RECORDED[standing.status] ?? standing.status)
                   : 'Has not listed itself yet.';
         text.createDiv({
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text: record?.seen ? `${status} · checked in ${timeAgo(record.seen)}` : status,
         });
 
         if (record?.lastSyncedAt) {
             const overdue = Date.now() - record.lastSyncedAt > OVERDUE_AFTER_MS;
-            const box = text.createDiv({ cls: `proton-drive-sync-last-synced${overdue ? ' mod-overdue' : ''}` });
-            setIcon(box.createSpan({ cls: 'proton-drive-sync-last-synced-icon' }), overdue ? 'alert-triangle' : 'check-circle');
+            const box = text.createDiv({ cls: `proton-sdk-sync-last-synced${overdue ? ' mod-overdue' : ''}` });
+            setIcon(box.createSpan({ cls: 'proton-sdk-sync-last-synced-icon' }), overdue ? 'alert-triangle' : 'check-circle');
             box.createSpan({
-                cls: 'proton-drive-sync-last-synced-text',
+                cls: 'proton-sdk-sync-last-synced-text',
                 text: `Last synced ${timeAgo(record.lastSyncedAt)}`,
             });
         }
 
         if (!isSelf) {
-            this.renderActions(row.createDiv({ cls: 'proton-drive-sync-device-actions' }), entry);
+            this.renderActions(row.createDiv({ cls: 'proton-sdk-sync-device-actions' }), entry);
         }
     }
 

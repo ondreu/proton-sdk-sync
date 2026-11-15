@@ -79,7 +79,7 @@ export class DeletedModal extends Modal {
 
         const { contentEl } = this;
         contentEl.empty();
-        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-drive-sync-muted', text });
+        const say = (text: string) => contentEl.createEl('p', { cls: 'proton-sdk-sync-muted', text });
         if (!canList) {
             say('Sign in, choose a Drive folder and unlock to see deleted notes.');
             return;
@@ -89,9 +89,9 @@ export class DeletedModal extends Modal {
             return;
         }
 
-        const header = contentEl.createDiv({ cls: 'proton-drive-sync-list-header' });
+        const header = contentEl.createDiv({ cls: 'proton-sdk-sync-list-header' });
         header.createSpan({
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text: 'Files from this vault in Drive’s trash, most recently deleted first.',
         });
         new ExtraButtonComponent(header)
@@ -115,10 +115,10 @@ export class DeletedModal extends Modal {
 
         const shown = pageOf(items, this.page);
         this.page = shown.page;
-        const list = contentEl.createDiv({ cls: 'proton-drive-sync-list' });
+        const list = contentEl.createDiv({ cls: 'proton-sdk-sync-list' });
         for (const item of shown.items) {
-            const row = list.createDiv({ cls: 'proton-drive-sync-deleted' });
-            const text = row.createDiv({ cls: 'proton-drive-sync-deleted-text' });
+            const row = list.createDiv({ cls: 'proton-sdk-sync-deleted' });
+            const text = row.createDiv({ cls: 'proton-sdk-sync-deleted-text' });
             text.createDiv({ text: item.isFolder ? `${item.path}/ (folder)` : item.path });
             const details = [`deleted ${timeAgo(item.deleted)}`];
             if (item.size !== undefined) {
@@ -127,7 +127,7 @@ export class DeletedModal extends Modal {
             if (item.withFolder) {
                 details.push(`comes back with ${item.withFolder}`);
             }
-            text.createDiv({ cls: 'proton-drive-sync-muted', text: details.join(' · ') });
+            text.createDiv({ cls: 'proton-sdk-sync-muted', text: details.join(' · ') });
             new ButtonComponent(row).setButtonText('Restore').onClick(() => this.confirmRestore(item));
         }
         renderPager(contentEl, shown.page, shown.pages, (page) => {

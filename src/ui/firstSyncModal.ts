@@ -36,7 +36,7 @@ export class FirstSyncModal extends Modal {
 
         if (this.stateLost) {
             contentEl.createEl('p', {
-                cls: 'proton-drive-sync-pin-warning',
+                cls: 'proton-sdk-sync-pin-warning',
                 text:
                     'This device’s record of the last sync is damaged, for example by Obsidian closing while it ' +
                     'was being saved, and could not be recovered. Without it, the plugin cannot tell an edit from ' +
@@ -52,7 +52,7 @@ export class FirstSyncModal extends Modal {
                 'on either side by this sync.',
         });
 
-        const list = contentEl.createEl('ul', { cls: 'proton-drive-sync-plan' });
+        const list = contentEl.createEl('ul', { cls: 'proton-sdk-sync-plan' });
         this.group(list, plan.downloads, 'downloaded from Drive into this vault');
         this.group(list, plan.uploads, 'uploaded from this vault to Drive');
         this.group(
@@ -86,7 +86,7 @@ export class FirstSyncModal extends Modal {
                     }),
             );
         contentEl.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text: 'Holding off pauses syncing. Resume it from the status bar or the command palette when ready.',
         });
     }
@@ -112,7 +112,7 @@ export class FirstSyncModal extends Modal {
         const item = list.createEl('li');
         const details = item.createEl('details');
         details.createEl('summary', { text: `${paths.length} file${plural(paths.length)} ${description}` });
-        const files = details.createEl('ul', { cls: 'proton-drive-sync-plan-files' });
+        const files = details.createEl('ul', { cls: 'proton-sdk-sync-plan-files' });
         for (const path of paths.slice(0, MAX_LISTED)) {
             files.createEl('li', { text: path });
         }

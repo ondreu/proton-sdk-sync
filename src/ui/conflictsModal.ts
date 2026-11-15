@@ -59,7 +59,7 @@ export class ConflictsModal extends Modal {
         }
         new Setting(container).setName('Waiting on you').setHeading();
         container.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text:
                 'These files changed in two places at once. Nothing has been overwritten — ' +
                 'choose which version to keep, or keep both.',
@@ -124,7 +124,7 @@ export class ConflictsModal extends Modal {
 
         if (records.length === 0) {
             container.createEl('p', {
-                cls: 'proton-drive-sync-muted',
+                cls: 'proton-sdk-sync-muted',
                 text:
                     getRuntime().state.conflicts().length === 0
                         ? 'No conflicts yet. Any that happen are listed here, however they were settled.'
@@ -134,7 +134,7 @@ export class ConflictsModal extends Modal {
         }
 
         container.createEl('p', {
-            cls: 'proton-drive-sync-muted',
+            cls: 'proton-sdk-sync-muted',
             text: 'Conflicts this device has seen, newest first. Only the most recent 200 are kept.',
         });
         for (const record of records) {
@@ -152,7 +152,7 @@ export class ConflictsModal extends Modal {
         }
 
         const setting = new Setting(container).setName(record.path).setDesc(description);
-        setting.settingEl.addClass('proton-drive-sync-history-entry');
+        setting.settingEl.addClass('proton-sdk-sync-history-entry');
 
         if (vault.getFileByPath(record.path)) {
             setting.addButton((button) =>
