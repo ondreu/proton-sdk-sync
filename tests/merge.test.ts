@@ -96,6 +96,65 @@ describe('mergeThreeWay — refusals', () => {
     });
 });
 
+describe('mergeThreeWay — an insertion at the edge of a change', () => {
+    // The projection used to count an insertion sitting on a span boundary on
+    // both sides, so the merged note carried the inserted line twice.
+    it('keeps an insertion that extends the other side’s rewrite, once', () => {
+        const base = lines('a', 'b', 'c', 'd');
+        const local = lines('a', 'B', 'C', 'd');
+        const remote = lines('a', 'B', 'C', 'Y', 'd');
+        assert.equal(mergedText(base, local, remote), lines('a', 'B', 'C', 'Y', 'd'));
+    });
+
+    it('gives the same answer with the sides swapped', () => {
+        const base = lines('a', 'b', 'c', 'd');
+        const local = lines('a', 'B', 'C', 'Y', 'd');
+        const remote = lines('a', 'B', 'C', 'd');
+        assert.equal(mergedText(base, local, remote), lines('a', 'B', 'C', 'Y', 'd'));
+    });
+
+    it('keeps an insertion beside a line the other side rewrote', () => {
+        const base = lines('a', 'b', 'c', 'd');
+        const local = lines('a', 'B', 'c', 'd');
+        const remote = lines('a', 'B', 'X', 'c', 'd');
+        assert.equal(mergedText(base, local, remote), lines('a', 'B', 'X', 'c', 'd'));
+    });
+
+    it('keeps two adjacent insertions either side of an untouched line', () => {
+        const base = lines('a', 'b', 'c');
+        const local = lines('a', 'X', 'b', 'c');
+        const remote = lines('a', 'b', 'Y', 'c');
+        assert.equal(mergedText(base, local, remote), lines('a', 'X', 'b', 'Y', 'c'));
+    });
+
+    it('honours a deletion while keeping an insertion beside the deleted line', () => {
+        const base = lines('a', 'b', 'c');
+        const local = lines('a', 'c');
+        const remote = lines('a', 'X', 'b', 'c');
+        assert.equal(mergedText(base, local, remote), lines('a', 'X', 'c'));
+    });
+});
+
+describe('mergeThreeWay — large notes', () => {
+    // The LCS table cost 100 MB and a visible stall by 5000 lines; above the
+    // table's cap the diff has to walk Myers instead, not refuse.
+    it('merges a 20 000-line note with edits scattered through it, quickly', () => {
+        const base = Array.from({ length: 20000 }, (_, i) => `line ${i}`);
+        const local = base.map((line, i) => (i % 500 === 0 ? `${line}, edited on the laptop` : line));
+        const remote = base.map((line, i) => (i % 700 === 350 ? `${line}, edited on the phone` : line));
+        const expected = base
+            .map((line, i) => (i % 500 === 0 ? local[i] : i % 700 === 350 ? remote[i] : line))
+            .join('\n');
+
+        const started = performance.now();
+        const merged = mergedText(base.join('\n'), local.join('\n'), remote.join('\n'));
+        const elapsed = performance.now() - started;
+
+        assert.equal(merged, expected);
+        assert.ok(elapsed < 1000, `took ${Math.round(elapsed)} ms`);
+    });
+});
+
 describe('mergeThreeWay — line endings', () => {
     it('preserves CRLF when the local copy uses it', () => {
         const base = 'a\r\nb';

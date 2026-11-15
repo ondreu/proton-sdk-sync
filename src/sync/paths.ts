@@ -72,8 +72,8 @@ export function staysInVault(path: string, windows: boolean): boolean {
 }
 
 /**
- * A path as a case-insensitive filesystem, and Windows, would take it: letter
- * case folded, and each segment's trailing dots and spaces dropped, as Windows
+ * A path as a case-insensitive filesystem, and Windows, would take it: letters
+ * folded, and each segment's trailing dots and spaces dropped, as Windows
  * drops them. There `.Obsidian/plugins./x` is the same folder as
  * `.obsidian/plugins/x`, so an exclusion that keeps code out must catch both;
  * see {@link PathFilter}.
@@ -81,8 +81,36 @@ export function staysInVault(path: string, windows: boolean): boolean {
 export function aliasKey(path: string): string {
     return path
         .split('/')
-        .map((segment) => segment.replace(/[. ]+$/, '').toLowerCase())
+        .map((segment) => foldCase(segment.replace(/[. ]+$/, '')))
         .join('/');
+}
+
+/** Characters a case-insensitive filesystem folds to a plain letter, but `toUpperCase().toLowerCase()` leaves alone. */
+const CASE_FOLD_EXTRA: Record<string, string> = {
+    '\u0130': 'i', // İ, capital I with a dot above
+    '\u0131': 'i', // ı, dotless i
+    '\u017F': 's', // ſ, long s
+    '\u00DF': 'ss', // ß, sharp s
+    '\u1E9E': 'ss', // ẞ, its capital
+};
+
+/**
+ * Text as the platforms compare names: NFKC first, so a full-width or
+ * compatibility spelling lands on the plain letter, and then full case
+ * folding.
+ *
+ * `toUpperCase` then `toLowerCase` is the closest JavaScript has to full case
+ * folding — it turns `ß` into `ss` and `ſ` into `s` — but it leaves the dotted
+ * and dotless i alone, and those are the letters that make `.obsıdian` a
+ * second spelling of `.obsidian` on a Mac. The table above covers the rest of
+ * that family, so an exclusion written for one spelling catches them all.
+ */
+function foldCase(value: string): string {
+    return value
+        .normalize('NFKC')
+        .replace(/[\u0130\u0131\u017F\u00DF\u1E9E]/g, (char) => CASE_FOLD_EXTRA[char])
+        .toUpperCase()
+        .toLowerCase();
 }
 
 /** True when `path` is `folder` itself or anything below it. */
@@ -131,6 +159,12 @@ function windowsForbids(char: string): boolean {
  * `n` when that is taken, so every device then syncs it under a name all of
  * them can store. Forbidden characters become `-`, trailing dots and spaces
  * go, and the suffix says why the name changed.
+ *
+ * The suffix goes on the part that is actually wrong. A reserved device name
+ * is the part before the first dot, so `aux.tar.gz` becomes
+ * `aux (renamed for Windows).tar.gz`; putting the suffix before the last dot
+ * instead leaves `aux` at the front, where Windows still reads a device, and
+ * the same file is renamed again on every pass.
  */
 export function windowsName(name: string, n = 1): string | null {
     const reserved = WINDOWS_RESERVED.test(name.split('.')[0].trimEnd());
@@ -141,8 +175,15 @@ export function windowsName(name: string, n = 1): string | null {
         .map((char) => (windowsForbids(char) ? '-' : char))
         .join('')
         .replace(/[. ]+$/, '');
+    const suffix = ` (renamed for Windows${n === 1 ? '' : ` ${n}`})`;
+    if (reserved) {
+        const firstDot = cleaned.indexOf('.');
+        const head = firstDot === -1 ? cleaned : cleaned.slice(0, firstDot);
+        const tail = firstDot === -1 ? '' : cleaned.slice(firstDot);
+        return `${head || 'unnamed'}${suffix}${tail}`;
+    }
     const { stem, extension } = splitExtension(cleaned);
-    return `${stem || 'unnamed'} (renamed for Windows${n === 1 ? '' : ` ${n}`})${extension}`;
+    return `${stem || 'unnamed'}${suffix}${extension}`;
 }
 
 /** Whether Windows cannot store a vault path as it is: some name in it would need {@link windowsName}. */
@@ -160,6 +201,17 @@ export function splitExtension(path: string): { stem: string; extension: string 
 }
 
 /**
+ * A name shaped like a Windows 8.3 short name: `OBSIDI~1`, `PROGRA~1.TXT`.
+ *
+ * Every file on an NTFS volume also gets a name of that shape, and Windows
+ * resolves it: `OBSIDI~1` beside `.obsidian` opens `.obsidian` itself. Proton's
+ * servers cannot see these names, because the folder's contents are encrypted,
+ * so a collaborator can push one; a path that could be another path's short
+ * name is therefore not a path the sync can tell apart, and it stays out.
+ */
+const WINDOWS_SHORT_NAME = /~\d+(?:\.[^.]*)?$/;
+
+/**
  * Decides which vault paths take part in the sync.
  *
  * Built once per settings change rather than per path, because the exclusion
@@ -173,7 +225,7 @@ export class PathFilter {
      * out of a shared vault.
      */
     private readonly builtIn: RegExp[];
-    /** The user's own patterns, matched as written. */
+    /** The user's own patterns, matched as written apart from letter case, which the platforms that ignore it drop too. */
     private readonly user: RegExp[];
 
     constructor(
@@ -183,6 +235,14 @@ export class PathFilter {
         pluginDir: string | null = null,
         /** The vault is shared with others: never sync config that runs code; see {@link codeExclusions}. */
         sharedWithOthers = false,
+        /**
+         * The filesystem ignores letter case — Windows, macOS and iOS — so the
+         * user's patterns have to as well: `Private/` otherwise lets through a
+         * folder Drive spells `private`, which lands on `Private` once synced.
+         * Passed in rather than read from a global, so that the caller says
+         * which filesystem it is on.
+         */
+        caseInsensitive = false,
     ) {
         const patterns = [...ALWAYS_EXCLUDED, ...configExclusions(configDir, pluginDir)];
         if (!syncObsidianConfig) {
@@ -195,7 +255,7 @@ export class PathFilter {
         this.user = userPatterns
             .map((p) => p.trim())
             .filter(Boolean)
-            .map(globToRegExp);
+            .map((pattern) => globToRegExp(pattern, caseInsensitive ? 'i' : ''));
     }
 
     /** Whether the path lives in the vault's config folder. */
@@ -205,6 +265,12 @@ export class PathFilter {
 
     isExcluded(path: string): boolean {
         const alias = aliasKey(path);
+        // A segment that reads as an 8.3 short name may be another path's
+        // alias on Windows, so nothing about it can be trusted; see
+        // WINDOWS_SHORT_NAME.
+        if (alias.split('/').some((segment) => WINDOWS_SHORT_NAME.test(segment))) {
+            return true;
+        }
         return this.builtIn.some((matcher) => matcher.test(alias)) || this.user.some((matcher) => matcher.test(path));
     }
 
@@ -222,9 +288,10 @@ export class PathFilter {
  *
  * Supports the subset users reach for in an ignore list: `*` within a segment,
  * `**` across segments, `?` for one character, and a trailing `/` to mean "this
- * folder and everything under it".
+ * folder and everything under it". `flags` carries `i` where the filesystem
+ * ignores letter case.
  */
-function globToRegExp(pattern: string): RegExp {
+function globToRegExp(pattern: string, flags = ''): RegExp {
     const normalized = pattern.endsWith('/') ? `${pattern}**` : pattern;
     let source = '';
 
@@ -255,7 +322,7 @@ function globToRegExp(pattern: string): RegExp {
         source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
     }
 
-    return new RegExp(`^${source}$`);
+    return new RegExp(`^${source}$`, flags);
 }
 
 /**

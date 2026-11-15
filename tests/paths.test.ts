@@ -39,8 +39,24 @@ describe('windowsName', () => {
     it('renames reserved device names, with or without an extension', () => {
         assert.equal(windowsName('aux.md'), 'aux (renamed for Windows).md');
         assert.equal(windowsName('CON'), 'CON (renamed for Windows)');
-        assert.equal(windowsName('com1.tar.gz'), 'com1.tar (renamed for Windows).gz');
         assert.equal(windowsName('LPT9 .txt'), 'LPT9  (renamed for Windows).txt');
+    });
+
+    it('rewrites the segment it checked, so the name is not renamed again next pass', () => {
+        // The device name is the part before the *first* dot; suffixing before
+        // the last dot left `aux` at the front, which Windows still reserves.
+        assert.equal(windowsName('aux.tar.gz'), 'aux (renamed for Windows).tar.gz');
+        assert.equal(windowsName('con.txt'), 'con (renamed for Windows).txt');
+        assert.equal(windowsName('nul.tar.gz.bak'), 'nul (renamed for Windows).tar.gz.bak');
+        assert.equal(windowsName('com1.tar.gz'), 'com1 (renamed for Windows).tar.gz');
+    });
+
+    it('leaves a name it has already renamed alone', () => {
+        for (const name of ['aux.tar.gz', 'con.txt', 'nul.tar.gz.bak', 'Meeting 10:30.md', 'note.', 'a?b*.md']) {
+            const renamed = windowsName(name);
+            assert.ok(renamed !== null, name);
+            assert.equal(windowsName(renamed), null, `${name} → ${renamed}`);
+        }
     });
 
     it('replaces characters Windows refuses, and drops trailing dots and spaces', () => {
@@ -83,6 +99,16 @@ describe('names and paths that could lead out of the vault', () => {
     it('spells a path as a system that ignores case and trailing dots would', () => {
         assert.equal(aliasKey('.Obsidian/Plugins./evil /main.js'), '.obsidian/plugins/evil/main.js');
     });
+
+    it('folds the letters those systems fold, not just ASCII case', () => {
+        // ſ (U+017F), ı (U+0131) and İ (U+0130) are each a letter a
+        // case-insensitive filesystem reads as s or i.
+        assert.equal(aliasKey('.obſidian/plugins'), '.obsidian/plugins');
+        assert.equal(aliasKey('.obsıdian/plugins'), '.obsidian/plugins');
+        assert.equal(aliasKey('.obsİdian/plugins'), '.obsidian/plugins');
+        assert.equal(aliasKey('Straße.md'), aliasKey('STRASSE.md'));
+        assert.equal(aliasKey('．ｏｂｓｉｄｉａｎ/app.json'), '.obsidian/app.json');
+    });
 });
 
 describe('PathFilter — other spellings of an excluded path', () => {
@@ -101,10 +127,45 @@ describe('PathFilter — other spellings of an excluded path', () => {
         assert.equal(shared.isExcluded('.obsidian/app.json'), false);
     });
 
+    it('catches lookalike letters that resolve to the config folder on macOS and Windows', () => {
+        for (const path of [
+            '.obſidian/plugins/evil/main.js',
+            '.obsıdian/plugins/evil/main.js',
+            '.obsİdian/plugins/evil/main.js',
+            'OBSIDI~1/plugins/evil/main.js',
+            'obsidi~1./plugins/evil/main.js',
+        ]) {
+            assert.equal(shared.isExcludedWithAncestors(path), true, path);
+        }
+    });
+
+    it('still syncs a folder whose name merely starts with the config folder’s', () => {
+        assert.equal(shared.isExcluded('.obsidianian/app.json'), false);
+        assert.equal(shared.isExcludedWithAncestors('.obsidianian/plugins/evil/main.js'), false);
+    });
+
     it('matches the user’s own patterns exactly as written', () => {
         const filter = new PathFilter(['Private/'], true, '.obsidian');
         assert.equal(filter.isExcluded('Private/a.md'), true);
         assert.equal(filter.isExcluded('private/a.md'), false);
+    });
+});
+
+describe('PathFilter — letter case on the platforms that ignore it', () => {
+    it('matches the user’s patterns whatever the case when the filesystem does', () => {
+        const filter = new PathFilter(['Private/', '**/*.PDF'], true, '.obsidian', null, false, true);
+        assert.equal(filter.isExcluded('private/a.md'), true);
+        assert.equal(filter.isExcluded('PRIVATE/deep/a.md'), true);
+        assert.equal(filter.isExcluded('notes/manual.pdf'), true);
+        assert.equal(filter.isExcluded('notes/manual.pdfx'), false);
+        assert.equal(filter.isExcluded('Public/a.md'), false);
+    });
+
+    it('leaves matching case-sensitive when the filesystem is', () => {
+        const filter = new PathFilter(['Private/', '**/*.PDF'], true, '.obsidian', null, false, false);
+        assert.equal(filter.isExcluded('private/a.md'), false);
+        assert.equal(filter.isExcluded('notes/manual.pdf'), false);
+        assert.equal(filter.isExcluded('notes/manual.PDF'), true);
     });
 });
 

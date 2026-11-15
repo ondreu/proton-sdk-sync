@@ -14,13 +14,24 @@ const encode = (text: string) => new TextEncoder().encode(text).buffer as ArrayB
 /**
  * Stands in for Drive. `revisions` maps a revision uid to its content and
  * `files` maps a node uid to its current content, which is all the resolver
- * ever asks for.
+ * ever asks for. `rawRevisions` serves bytes that are not text at all, such as
+ * a file saved in a legacy encoding.
  */
-function stubDrive(options: { revisions?: Record<string, string>; files?: Record<string, string> } = {}) {
+function stubDrive(
+    options: {
+        revisions?: Record<string, string>;
+        files?: Record<string, string>;
+        rawRevisions?: Record<string, Uint8Array>;
+    } = {},
+) {
     const calls: string[] = [];
     const drive = {
         async downloadRevision(revisionUid: string) {
             calls.push(`revision:${revisionUid}`);
+            const raw = options.rawRevisions?.[revisionUid];
+            if (raw !== undefined) {
+                return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+            }
             const content = options.revisions?.[revisionUid];
             if (content === undefined) {
                 throw new Error('revision not found');
@@ -231,6 +242,40 @@ describe('ConflictResolver — merge', () => {
 
         const result = await resolver('merge', drive).resolve(context());
         assert.equal(result.action, 'keep-both');
+    });
+
+    // `Příliš` in cp1252: 0x50 0xf8 0xed 0x6c 0x69 0xb9. Decoded as UTF-8 with
+    // the errors replaced, it becomes `P�íli�` and a merge would write that
+    // back over the note.
+    const cp1252Ancestor = new Uint8Array([0x50, 0xf8, 0xed, 0x6c, 0x69, 0xb9, 0x0a]);
+    const cp1252Remote = new Uint8Array([0x50, 0xf8, 0xed, 0x6c, 0x69, 0xb9, 0x21, 0x0a]);
+
+    it('keeps both when a revision is not UTF-8 text', async () => {
+        const { drive } = stubDrive({ rawRevisions: { 'rev-1': cp1252Ancestor, 'rev-2': cp1252Remote } });
+
+        const result = await resolver('merge', drive).resolve(context({ readLocalText: async () => 'Příliš' }));
+
+        assert.equal(result.action, 'keep-both');
+    });
+
+    it('keeps both when only the Drive side is not UTF-8', async () => {
+        const { drive } = stubDrive({ revisions: { 'rev-1': 'line one' }, rawRevisions: { 'rev-2': cp1252Remote } });
+
+        const result = await resolver('merge', drive).resolve(context({ readLocalText: async () => 'line one' }));
+
+        assert.equal(result.action, 'keep-both');
+    });
+
+    it('does not mistake valid UTF-8 with a BOM for binary', async () => {
+        const rev1 = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(ancestor)]);
+        const rev2 = new Uint8Array(new TextEncoder().encode('line one\nline two\nLINE THREE'));
+        const { drive } = stubDrive({ rawRevisions: { 'rev-1': rev1, 'rev-2': rev2 } });
+
+        const result = await resolver('merge', drive).resolve(
+            context({ readLocalText: async () => 'LINE ONE\nline two\nline three' }),
+        );
+
+        assert.equal(result.action, 'take-merged');
     });
 
     it('does not download anything to merge a binary attachment', async () => {
