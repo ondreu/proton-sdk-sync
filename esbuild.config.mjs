@@ -64,7 +64,7 @@ const licenseBanner = {
                 packages.set(match[2], `${pkg.name}@${pkg.version} (${pkg.license ?? 'see package'})`);
             }
             const lines = [
-                `Proton Drive Sync for Obsidian v${version}`,
+                `Proton-SDK-Sync for Obsidian v${version}`,
                 `Copyright (C) 2026 ${author}. Licensed under ${license}; see LICENSE at:`,
                 homepage ?? '',
                 '',

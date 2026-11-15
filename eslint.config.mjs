@@ -26,7 +26,7 @@ export default defineConfig([
             'no-undef': 'off',
             'obsidianmd/ui/sentence-case': [
                 'warn',
-                { brands: ['Obsidian', 'PIN', 'Proton', 'Proton Drive', 'Proton Drive Sync', 'Drive', 'Wi-Fi', 'Android', 'iOS'] },
+                { brands: ['Obsidian', 'PIN', 'Proton', 'Proton Drive', 'Proton-SDK-Sync', 'Drive', 'Wi-Fi', 'Android', 'iOS'] },
             ],
         },
     },
