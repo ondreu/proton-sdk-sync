@@ -12,6 +12,7 @@ import {
 import type { Logger } from '../util/logger';
 import { isSafeName, joinPath } from './paths';
 import type { RemoteState } from './types';
+import { defaultSizeLimit, FileTooLargeError } from './vault';
 
 /** A snapshot of the Drive subtree the vault maps onto. */
 export type RemoteTree = {
@@ -142,6 +143,17 @@ export class DriveIO {
     constructor(
         private readonly client: ProtonDriveClient,
         private readonly logger: Logger,
+        /**
+         * The largest file this device will hold in memory, in bytes; Infinity
+         * for none.
+         *
+         * The engine supplies the user's setting (see `SyncEngine.sizeLimitBytes`);
+         * left unsaid it is the platform's own default, see
+         * {@link defaultSizeLimit}. Streaming a download to the disk is not
+         * limited by it: that is what the limit is there to push a large file
+         * onto.
+         */
+        private readonly sizeLimit: () => number = defaultSizeLimit,
     ) {}
 
     async getNode(nodeUid: string): Promise<NodeEntity> {
@@ -379,9 +391,9 @@ export class DriveIO {
         }
     }
 
-    /** Download the active revision into memory. Meant for files of modest size. */
+    /** Download the active revision into memory, up to the size limit; see {@link DriveIO.sizeLimit}. */
     async downloadFile(nodeUid: string, signal?: AbortSignal, onProgress?: (bytes: number) => void): Promise<ArrayBuffer> {
-        return collect((sink) => this.downloadTo(nodeUid, sink, signal, onProgress));
+        return collect(nodeUid, this.sizeLimit(), (sink) => this.downloadTo(nodeUid, sink, signal, onProgress));
     }
 
     /** Stream the active revision into `sink`, so large files never sit in memory whole. */
@@ -408,7 +420,7 @@ export class DriveIO {
         signal?: AbortSignal,
         onProgress?: (bytes: number) => void,
     ): Promise<ArrayBuffer> {
-        return collect((sink) => this.downloadRevisionTo(revisionUid, sink, signal, onProgress));
+        return collect(revisionUid, this.sizeLimit(), (sink) => this.downloadRevisionTo(revisionUid, sink, signal, onProgress));
     }
 
     async downloadRevisionTo(
@@ -722,12 +734,28 @@ async function completeDownload(
     }
 }
 
-/** Run a download into memory. */
-async function collect(download: (sink: WritableStream<Uint8Array>) => Promise<void>): Promise<ArrayBuffer> {
+/**
+ * Run a download into memory, refusing to hold more than `limit` bytes.
+ *
+ * A file of a gigabyte would otherwise be held twice over — the chunks as they
+ * arrive, then the single buffer they are joined into — which on a phone is
+ * enough for the app to be killed. Past the limit nothing more is taken, and
+ * the caller gets a {@link FileTooLargeError} to report instead of retry.
+ */
+async function collect(
+    name: string,
+    limit: number,
+    download: (sink: WritableStream<Uint8Array>) => Promise<void>,
+): Promise<ArrayBuffer> {
     const chunks: Uint8Array[] = [];
+    let size = 0;
     await download(
         new WritableStream<Uint8Array>({
             write(chunk) {
+                size += chunk.byteLength;
+                if (size > limit) {
+                    throw new FileTooLargeError(name, size, limit);
+                }
                 chunks.push(chunk);
             },
         }),

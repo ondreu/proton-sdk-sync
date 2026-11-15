@@ -1,5 +1,6 @@
 import { Platform, TFile, type App, type DataAdapter, type TAbstractFile } from 'obsidian';
 
+import { DEFAULT_MOBILE_MAX_FILE_MB } from '../settings';
 import { sha1Hex } from '../util/hash';
 import type { Logger } from '../util/logger';
 import type { UploadSource } from './drive';
@@ -16,14 +17,103 @@ import type { LocalState, SyncBase } from './types';
  */
 export const LARGE_FILE_BYTES = 32 * 1024 * 1024;
 
+/**
+ * The size at which a phone or tablet refuses to read a file at all, in bytes.
+ *
+ * Kept equal to the value `mobileMaxFileSizeMb` starts with: the engine passes
+ * its own limit in (see {@link defaultSizeLimit}), and this is what anything
+ * that does not say gets, so a device cannot be made to read a whole video into
+ * memory by a missing setting.
+ */
+export const DEFAULT_MOBILE_MAX_FILE_BYTES = DEFAULT_MOBILE_MAX_FILE_MB * 1024 * 1024;
+
+/** The limit a caller that says nothing gets: the mobile default on a phone, none on the desktop. */
+export function defaultSizeLimit(): number {
+    return Platform.isMobile ? DEFAULT_MOBILE_MAX_FILE_BYTES : Infinity;
+}
+
+/**
+ * Thrown before a file over the size limit is read or downloaded.
+ *
+ * The caller is expected to leave the path alone and say why, not to retry:
+ * the file is not going to get smaller, and reading it is what the limit is
+ * there to prevent. Nothing has been read when this is thrown.
+ */
+export class FileTooLargeError extends Error {
+    constructor(
+        readonly path: string,
+        /** The file's size, in bytes. */
+        readonly size: number,
+        /** The limit it is over, in bytes. */
+        readonly limit: number,
+    ) {
+        super(`"${path}" is ${megabytes(size)} MB, over this device's limit of ${megabytes(limit)} MB`);
+        this.name = 'FileTooLargeError';
+    }
+}
+
 /** Read size when streaming. Matches Drive's block size, so each read feeds one block. */
 const CHUNK_BYTES = 4 * 1024 * 1024;
 
-/** How long a path stays marked as ours after we touch it; see {@link VaultIO.selfWrites}. */
+/** How long a path stays held as ours when nothing can say what the file looks like; see {@link VaultIO.claims}. */
 const SELF_WRITE_HOLD_MS = 2000;
+
+/**
+ * What tells one version of a file from the next: its size and modification
+ * time, and the change time and inode where the platform reports them.
+ */
+export type FileStamp = {
+    size: number;
+    mtime: number;
+    /**
+     * When the inode last changed, from the filesystem itself. Not Obsidian's
+     * `Stat.ctime`, which is when the file was created.
+     */
+    ctime?: number;
+    ino?: number;
+};
+
+/**
+ * Whether two looks at a file found the same version of it.
+ *
+ * Size and mtime alone miss an edit on FAT and exFAT, where mtime moves in
+ * two-second steps: two saves inside one step leave both unchanged. A change
+ * time or an inode that moved says the file was written again. A field the
+ * platform does not report is no opinion either way, so nothing is lost where
+ * neither is available.
+ */
+export function sameVersion(a: FileStamp, b: FileStamp): boolean {
+    if (a.size !== b.size || a.mtime !== b.mtime) {
+        return false;
+    }
+    if (a.ctime !== undefined && b.ctime !== undefined && a.ctime !== b.ctime) {
+        return false;
+    }
+    return !(a.ino !== undefined && b.ino !== undefined && a.ino !== b.ino);
+}
+
+/** A size for a log line or an error message, in whole megabytes. */
+function megabytes(bytes: number): number {
+    return Math.max(1, Math.round(bytes / (1024 * 1024)));
+}
+
+/** What we left at a path, so the vault event for it can be told from a user's edit; see {@link VaultIO.claims}. */
+type Claim =
+    /** The file we wrote, as it looked when we finished. */
+    | { kind: 'version'; stamp: FileStamp }
+    /** We moved or removed it, so nothing of ours is at that path any more. */
+    | { kind: 'gone' }
+    /** Nothing could say what the path looks like, so it is held for a moment instead. */
+    | { kind: 'until'; until: number };
 
 type DesktopModules = {
     fs: typeof import('fs').promises;
+    /**
+     * The same module unsynchronised, for the one question that has to be
+     * answered without awaiting: whether the file a vault event names is still
+     * the one this plugin wrote.
+     */
+    sync: typeof import('fs');
     createHash: typeof import('crypto').createHash;
 };
 
@@ -43,6 +133,7 @@ function nodeModules(): DesktopModules | null {
             try {
                 desktopModules = {
                     fs: (window.require('fs') as typeof import('fs')).promises,
+                    sync: window.require('fs') as typeof import('fs'),
                     createHash: (window.require('crypto') as typeof import('crypto')).createHash,
                 };
             } catch {
@@ -77,7 +168,7 @@ export class VaultIO {
     private readonly adapter: DataAdapter;
 
     /**
-     * Paths this plugin is currently writing.
+     * Paths this plugin is writing right now.
      *
      * Obsidian reports our own writes back through the same vault events a user
      * edit produces. Without this, every download would immediately look like a
@@ -87,18 +178,48 @@ export class VaultIO {
      * Counted rather than a plain set, so that two overlapping operations on
      * the same path cannot release each other's hold early.
      */
-    private readonly selfWrites = new Map<string, number>();
+    private readonly writing = new Map<string, number>();
+
+    /**
+     * Paths we have finished writing, moving or removing, and what we left
+     * there.
+     *
+     * The event for one of our own operations arrives after it, so the hold
+     * above is already gone by then; this is what tells the event apart from a
+     * real edit. A timer cannot: it drops both alike, and a user who types into
+     * a note in the seconds after it was downloaded loses that edit. So the
+     * claim is settled by looking at the path when the event names it — the
+     * same version we wrote is our echo, anything else is the user's.
+     */
+    private readonly claims = new Map<string, Claim>();
+
+    /**
+     * What {@link getState} last saw of each path in this session, so that a
+     * file written again with its size and mtime put back is still noticed;
+     * see {@link sameVersion}.
+     */
+    private readonly lastSeen = new Map<string, FileStamp>();
 
     constructor(
         private readonly app: App,
         private readonly logger: Logger,
         /**
-         * Where large downloads are written until complete: inside the
-         * plugin's own folder, which never syncs, so a download cut short by a
-         * crash leaves nothing in the vault and is swept at the next start;
-         * see {@link sweepDownloads}. Null puts them beside their target.
+         * Where a download, or any file being replaced, is written until
+         * complete: inside the plugin's own folder, which never syncs, so a
+         * write cut short by a crash leaves nothing in the vault and is swept at
+         * the next start; see {@link sweepDownloads}. Null puts them beside
+         * their target.
          */
         private readonly downloadsDir: string | null = null,
+        /**
+         * The largest file this device will read, in bytes; Infinity for none.
+         *
+         * The engine supplies the user's setting (see `SyncEngine.sizeLimitBytes`).
+         * Left unsaid, it is the platform's own default — see
+         * {@link defaultSizeLimit} — so a phone is never asked to read a whole
+         * video because a setting went missing.
+         */
+        private readonly sizeLimit: () => number = defaultSizeLimit,
     ) {
         this.adapter = app.vault.adapter;
     }
@@ -158,7 +279,49 @@ export class VaultIO {
 
     /** True for a path we are writing, or one inside a folder we are moving. */
     isSelfWrite(path: string): boolean {
-        return this.selfWrites.has(path) || ancestorPaths(path).some((ancestor) => this.selfWrites.has(ancestor));
+        return this.isOurs(path) || ancestorPaths(path).some((ancestor) => this.isOurs(ancestor));
+    }
+
+    /**
+     * Whether an event at this path is the echo of something this plugin did.
+     *
+     * Answered without awaiting, from the file itself where the platform can be
+     * asked and from Obsidian's index of it where it cannot, so the answer is
+     * about the file as the event finds it rather than about how long ago we
+     * last touched the path.
+     */
+    private isOurs(path: string): boolean {
+        if (this.writing.has(path)) {
+            return true;
+        }
+        const claim = this.claims.get(path);
+        if (claim === undefined) {
+            return false;
+        }
+        switch (claim.kind) {
+            case 'until':
+                if (Date.now() < claim.until) {
+                    return true;
+                }
+                break;
+            case 'gone':
+                // We moved or removed it. Anything reported at the path now is
+                // the echo of that, unless something is there again.
+                if (!this.existsNow(path)) {
+                    return true;
+                }
+                break;
+            case 'version': {
+                const now = this.stampNow(path);
+                if (now !== undefined && sameVersion(claim.stamp, now)) {
+                    return true;
+                }
+                break;
+            }
+        }
+        // Written again since we finished: the user's edit, not our echo.
+        this.claims.delete(path);
+        return false;
     }
 
     /**
@@ -261,6 +424,10 @@ export class VaultIO {
      * match what the last sync recorded, the file cannot have changed in a way
      * that matters and the digest is reused instead of re-reading the bytes.
      * A full vault scan on a large vault is otherwise dominated by hashing.
+     *
+     * On a filesystem whose mtime moves in two-second steps, a save can land
+     * without moving either number; the change time this session saw last is
+     * what catches it.
      */
     async getState(
         path: string,
@@ -268,10 +435,20 @@ export class VaultIO {
     ): Promise<LocalState | undefined> {
         const stat = await this.adapter.stat(this.checked(path));
         if (!stat || stat.type !== 'file') {
+            this.lastSeen.delete(path);
             return undefined;
         }
+        this.checkSize(path, stat.size);
 
-        if (knownBase && knownBase.size === stat.size && knownBase.localMtime === stat.mtime) {
+        const stamp: FileStamp = { size: stat.size, mtime: stat.mtime, ...(await this.nodeStamp(path)) };
+        const seen = this.lastSeen.get(path);
+        this.lastSeen.set(path, stamp);
+
+        if (
+            knownBase &&
+            sameVersion({ size: knownBase.size, mtime: knownBase.localMtime }, stamp) &&
+            (seen === undefined || sameVersion(seen, stamp))
+        ) {
             return { hash: knownBase.hash, size: stat.size, mtime: stat.mtime };
         }
 
@@ -281,6 +458,80 @@ export class VaultIO {
         }
         const data = await this.adapter.readBinary(path);
         return { hash: await sha1Hex(data), size: stat.size, mtime: stat.mtime };
+    }
+
+    /**
+     * Refuse a file over the size limit, before anything of it is read.
+     *
+     * Checked against the size the filesystem reports, so it costs one stat and
+     * no memory; see {@link FileTooLargeError} for what the caller is expected
+     * to do about it.
+     */
+    private checkSize(path: string, size: number): void {
+        const limit = this.sizeLimit();
+        if (size > limit) {
+            throw new FileTooLargeError(path, size, limit);
+        }
+    }
+
+    /**
+     * The change time and inode number of a file, which the adapter's stat does
+     * not carry. Undefined off the desktop, where there is nothing to ask.
+     */
+    private async nodeStamp(path: string): Promise<Pick<FileStamp, 'ctime' | 'ino'> | undefined> {
+        const fullPath = this.fullPath(path);
+        const modules = nodeModules();
+        if (fullPath === null || modules === null) {
+            return undefined;
+        }
+        try {
+            const stat = await modules.fs.stat(fullPath);
+            return { ctime: Math.round(stat.ctimeMs), ino: stat.ino };
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * What the path looks like right now, without awaiting: the filesystem
+     * where the desktop can reach it, else Obsidian's own stat of the file,
+     * which the event being judged has just updated.
+     */
+    private stampNow(path: string): FileStamp | undefined {
+        const fullPath = this.fullPath(path);
+        const modules = nodeModules();
+        if (fullPath !== null && modules !== null) {
+            try {
+                const stat = modules.sync.statSync(fullPath);
+                return stat.isFile()
+                    ? { size: stat.size, mtime: Math.round(stat.mtimeMs), ctime: Math.round(stat.ctimeMs), ino: stat.ino }
+                    : undefined;
+            } catch {
+                return undefined;
+            }
+        }
+        const file = this.indexed(path);
+        const stat = file instanceof TFile ? file.stat : undefined;
+        return stat === undefined ? undefined : { size: stat.size, mtime: stat.mtime };
+    }
+
+    /** Whether anything is at this path now, asked as cheaply as the platform allows. */
+    private existsNow(path: string): boolean {
+        if (this.indexed(path) !== null) {
+            return true;
+        }
+        const fullPath = this.fullPath(path);
+        const modules = nodeModules();
+        if (fullPath === null || modules === null) {
+            // No index entry and no filesystem to ask: on a phone, a path
+            // Obsidian does not track, with nothing to compare against.
+            return false;
+        }
+        try {
+            return modules.sync.existsSync(fullPath);
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -298,6 +549,7 @@ export class VaultIO {
         if (!stat || stat.type !== 'file') {
             throw new Error(`"${path}" no longer exists`);
         }
+        this.checkSize(path, stat.size);
         const mediaType = mediaTypeOf(path);
         const fullPath = this.fullPath(path);
 
@@ -342,21 +594,20 @@ export class VaultIO {
     /**
      * A destination for a streamed download.
      *
-     * Bytes go to a hidden file beside the target and are renamed into place
-     * only once the download has completed and verified, so an interrupted
-     * transfer never leaves a truncated video where the real one was. The dot
-     * prefix keeps Obsidian from indexing the partial file, and the `.tmp`
-     * suffix keeps the sync from picking it up.
+     * Bytes go to a temporary file of our own — inside the plugin folder where
+     * there is one — and are renamed into place only once the download has
+     * completed and verified, so an interrupted transfer never leaves a
+     * truncated video where the real one was. The dot prefix keeps Obsidian from
+     * indexing a partial file that sits beside its target, and the `.tmp` suffix
+     * keeps the sync from picking it up; the plugin folder is never synced at
+     * all.
      *
      * Returns null on mobile, or when the vault is not on a local filesystem,
      * in which case the caller downloads into memory instead.
      */
     async openDownload(path: string): Promise<FileSink | null> {
         const target = this.fullPath(this.checked(path));
-        const tempPath =
-            this.downloadsDir === null
-                ? joinPath(parentPath(path), `.${basename(path)}.proton-sync.tmp`)
-                : joinPath(this.downloadsDir, `${crypto.randomUUID()}.tmp`);
+        const tempPath = this.tempPathFor(path);
         const temp = this.fullPath(tempPath);
         if (!target || !temp) {
             return null;
@@ -391,6 +642,10 @@ export class VaultIO {
         return {
             sink,
             commit: async (mtime?: number) => {
+                // Flushed to the disk before it takes the target's name: a
+                // rename that outlived the bytes behind it would leave a
+                // plausible-looking empty file where a video was.
+                await handle.sync().catch((error: unknown) => this.logger.debug('Could not flush the download to the disk', error));
                 await close();
                 this.holdSelfWrite(path);
                 try {
@@ -440,7 +695,7 @@ export class VaultIO {
                 await this.adapter.rename(fromPath, toPath);
             }
         } finally {
-            this.releaseSelfWrite(fromPath);
+            this.releaseSelfWrite(fromPath, 'gone');
             this.releaseSelfWrite(toPath);
         }
     }
@@ -462,7 +717,7 @@ export class VaultIO {
         this.holdSelfWrite(path);
         try {
             await this.ensureFolder(parentPath(path));
-            await this.writeThroughVault(path, data, mtime !== undefined ? { mtime } : undefined);
+            await this.writeFile(path, data, mtime);
 
             const stat = await this.adapter.stat(path);
             return {
@@ -476,19 +731,20 @@ export class VaultIO {
     }
 
     /**
-     * Write through the Vault API where Obsidian indexes the path, which
-     * serialises it with Obsidian's own file operations; through the adapter
-     * for paths it does not index. A file on disk that the index has not caught
-     * up with yet, which `createBinary` would refuse, also goes through the
-     * adapter.
+     * Put the bytes at a path without ever leaving a half-written file there.
+     *
+     * A path Obsidian does not have yet is created through the Vault API, which
+     * is what keeps its cache in step, and where a crash can only leave a file
+     * that was not there before. Everything else — a note being replaced, a
+     * config file, a path the index has not caught up with — is written to a
+     * file of our own and renamed over the target, so a write cut short leaves
+     * the previous version whole instead of a truncated note that the next pass
+     * uploads or merges into.
      */
-    private async writeThroughVault(path: string, data: ArrayBuffer, options?: { mtime: number }): Promise<void> {
+    private async writeFile(path: string, data: ArrayBuffer, mtime?: number): Promise<void> {
+        const options = mtime !== undefined ? { mtime } : undefined;
         const file = this.indexed(path);
-        if (file instanceof TFile) {
-            await this.app.vault.modifyBinary(file, data, options);
-            return;
-        }
-        if (!isHidden(path) && !file && !(await this.adapter.exists(path))) {
+        if (!(file instanceof TFile) && !isHidden(path) && !(await this.adapter.exists(path))) {
             try {
                 await this.app.vault.createBinary(path, data, options);
                 return;
@@ -496,7 +752,57 @@ export class VaultIO {
                 this.logger.debug(`Could not create "${path}" through the vault; writing it directly`, error);
             }
         }
-        await this.adapter.writeBinary(path, data, options);
+        await this.replaceFile(path, data, options);
+    }
+
+    /**
+     * Write to a file of our own, flush it to the disk where the platform
+     * allows it, and only then give it the target's name in one rename.
+     *
+     * On the desktop the temporary file and the rename go through Node, which
+     * can fsync: a crash or a flat battery leaves the old file untouched. On a
+     * phone there is no Node, and the adapter does the two steps; where even its
+     * rename is refused, the bytes are written in place, which is what every
+     * write did before and no worse than that.
+     */
+    private async replaceFile(path: string, data: ArrayBuffer, options?: { mtime?: number }): Promise<void> {
+        const tempPath = this.tempPathFor(path);
+        await this.ensureFolder(parentPath(tempPath));
+        const temp = this.fullPath(tempPath);
+        const target = this.fullPath(path);
+        if (temp && target) {
+            const { fs } = nodeModules()!;
+            await writeAndFlush(fs, temp, data);
+            if (options?.mtime !== undefined) {
+                await fs.utimes(temp, new Date(), new Date(options.mtime));
+            }
+            await this.ensureFolder(parentPath(path));
+            await moveFile(fs, temp, target);
+            return;
+        }
+        await this.adapter.writeBinary(tempPath, data, options);
+        await this.ensureFolder(parentPath(path));
+        try {
+            await this.adapter.rename(tempPath, path);
+        } catch (error) {
+            // Renaming onto a file that is already there is not something every
+            // platform's adapter allows.
+            this.logger.debug(`Could not move "${tempPath}" into place; writing "${path}" in place`, error);
+            await this.adapter.remove(tempPath).catch(() => undefined);
+            await this.adapter.writeBinary(path, data, options);
+        }
+    }
+
+    /**
+     * Where a file of ours lands before it takes its place in the vault: inside
+     * the plugin's own folder, which never syncs, so a write cut short leaves
+     * nothing to upload and is swept at the next start; see
+     * {@link sweepDownloads}. Beside the target when there is no such folder.
+     */
+    private tempPathFor(path: string): string {
+        return this.downloadsDir === null
+            ? joinPath(parentPath(path), `.${basename(path)}.proton-sync.tmp`)
+            : joinPath(this.downloadsDir, `${crypto.randomUUID()}.tmp`);
     }
 
     async ensureFolder(path: string): Promise<void> {
@@ -546,27 +852,41 @@ export class VaultIO {
             this.logger.warn(`Could not trash "${path}", removing it instead`, error);
             await this.adapter.remove(path);
         } finally {
-            this.releaseSelfWrite(path);
+            this.releaseSelfWrite(path, 'gone');
         }
     }
 
     private holdSelfWrite(path: string): void {
-        this.selfWrites.set(path, (this.selfWrites.get(path) ?? 0) + 1);
+        this.writing.set(path, (this.writing.get(path) ?? 0) + 1);
     }
 
     /**
-     * Held a little past the end of the operation, so the vault event for it,
-     * which Obsidian dispatches asynchronously, is still recognised as ours.
+     * End the hold, leaving behind what the path looks like now so that the
+     * vault event the operation produces can be told from an edit of the user's
+     * own; see {@link claims}.
      */
-    private releaseSelfWrite(path: string): void {
-        window.setTimeout(() => {
-            const count = (this.selfWrites.get(path) ?? 1) - 1;
-            if (count <= 0) {
-                this.selfWrites.delete(path);
-            } else {
-                this.selfWrites.set(path, count);
-            }
-        }, SELF_WRITE_HOLD_MS);
+    private releaseSelfWrite(path: string, outcome: 'written' | 'gone' = 'written'): void {
+        const count = (this.writing.get(path) ?? 1) - 1;
+        if (count > 0) {
+            this.writing.set(path, count);
+            return;
+        }
+        this.writing.delete(path);
+        this.claims.set(path, this.claimFor(path, outcome));
+    }
+
+    private claimFor(path: string, outcome: 'written' | 'gone'): Claim {
+        if (outcome === 'gone') {
+            return { kind: 'gone' };
+        }
+        const stamp = this.stampNow(path);
+        if (stamp !== undefined) {
+            return { kind: 'version', stamp };
+        }
+        // Nothing here can say what the file looks like — on a phone, a path
+        // Obsidian does not index — so the event for the write, which arrives
+        // within a second of it, is caught by a short hold instead.
+        return { kind: 'until', until: Date.now() + SELF_WRITE_HOLD_MS };
     }
 
     /** Absolute path on disk, when the vault lives on a local filesystem that Node can reach. */
@@ -637,6 +957,28 @@ function streamOf(data: ArrayBuffer): ReadableStream<Uint8Array> {
 /** Whether Obsidian leaves a path out of its index: anything inside a folder, or named, with a leading dot. */
 function isHidden(path: string): boolean {
     return path.split('/').some((segment) => segment.startsWith('.'));
+}
+
+/**
+ * Write a buffer to a file and flush it to the disk, where the platform has
+ * fsync.
+ *
+ * Flushing is what makes the rename that follows worth anything: without it the
+ * directory entry can be on the disk while the bytes it points at are not.
+ */
+async function writeAndFlush(fs: DesktopModules['fs'], fullPath: string, data: ArrayBuffer): Promise<void> {
+    const handle = await fs.open(fullPath, 'w');
+    try {
+        const bytes = new Uint8Array(data);
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+            const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset);
+            offset += bytesWritten;
+        }
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
 }
 
 /**

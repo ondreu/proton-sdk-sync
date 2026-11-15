@@ -45,7 +45,13 @@ export type PluginSettings = {
     maxFileSizeMb: number;
     /**
      * On phones and tablets only: files larger than this are left where they
-     * are, to be synced by a desktop device. 0 disables the limit.
+     * are, to be synced by a desktop device. 0 disables the limit, as on the
+     * desktop.
+     *
+     * It starts at {@link DEFAULT_MOBILE_MAX_FILE_MB} rather than off: a file
+     * of a gigabyte or two is read into memory twice over on a phone — the
+     * chunks as they arrive, then the file they are joined into — which is
+     * enough for the app to be killed, on every retry.
      */
     mobileMaxFileSizeMb: number;
     /**
@@ -150,6 +156,14 @@ export function codeExclusions(configDir: string): string[] {
     return [`${configDir}/plugins/**`, `${configDir}/plugins`, `${configDir}/community-plugins.json`];
 }
 
+/**
+ * The size limit a phone or tablet starts with, in megabytes; see
+ * {@link PluginSettings.mobileMaxFileSizeMb}. The vault and Drive sides refuse
+ * a larger file before reading it, from this same number, so a device that
+ * never gets as far as the settings still cannot be made to read one.
+ */
+export const DEFAULT_MOBILE_MAX_FILE_MB = 200;
+
 export const DEFAULT_SETTINGS: PluginSettings = {
     remoteFolderUid: null,
     remoteFolderPath: null,
@@ -166,7 +180,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     transferConcurrency: 3,
 
     maxFileSizeMb: 0,
-    mobileMaxFileSizeMb: 0,
+    mobileMaxFileSizeMb: DEFAULT_MOBILE_MAX_FILE_MB,
     wifiOnly: false,
     excludePatterns: [],
     syncObsidianConfig: true,
