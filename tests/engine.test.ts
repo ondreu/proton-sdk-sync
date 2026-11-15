@@ -153,6 +153,52 @@ class ScriptedVault extends MemoryVault {
     }
 }
 
+/**
+ * A vault with files this device refuses to read: the adapter reports the size
+ * the file has grown to, and anything that tries to hash it is refused with
+ * `FileTooLargeError`, exactly as the size limit makes it happen.
+ */
+class LimitVault extends MemoryVault {
+    /** Paths whose size the adapter overstates, as a file that grew past the limit. */
+    readonly tooLarge = new Set<string>();
+
+    override rename(from: string, to: string): void {
+        super.rename(from, to);
+        if (this.tooLarge.delete(from)) {
+            this.tooLarge.add(to);
+        }
+    }
+
+    override adapter(): DataAdapter {
+        const adapter = super.adapter();
+        const stat = adapter.stat.bind(adapter);
+        adapter.stat = async (path: string) => {
+            const found = await stat(path);
+            return found && this.tooLarge.has(path) ? { ...found, size: 300 * 1024 * 1024 } : found;
+        };
+        return adapter;
+    }
+}
+
+/** Hold the next lookup of a node open, so a start can be stopped while it is still starting. */
+function holdNodeLookup(client: ProtonDriveClient): { entered: Promise<void>; release: () => void } {
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const wait = new Promise<void>((resolve) => (release = resolve));
+    const getNode = (client as unknown as { getNode(uid: string): Promise<unknown> }).getNode.bind(client);
+    let held = false;
+    (client as unknown as { getNode(uid: string): Promise<unknown> }).getNode = async (uid: string) => {
+        if (!held) {
+            held = true;
+            entered();
+            await wait;
+        }
+        return getNode(uid);
+    };
+    return { entered: started, release };
+}
+
 describe('SyncEngine — renaming a new note', () => {
     it('renames the node on Drive when the note was already uploaded', async () => {
         const { vault, drive, engine, settled } = await setup();
@@ -938,6 +984,19 @@ describe('SyncEngine — first-sync plan', () => {
 
         assert.equal(vault.read('remote.md'), undefined);
         assert.equal(drive.text('local.md'), undefined);
+    });
+
+    it('holds a file over the device limit rather than dropping it from the preview', async () => {
+        const vault = new LimitVault();
+        vault.write('big.bin', 'bytes');
+        vault.tooLarge.add('big.bin');
+        const drive = new FakeDrive();
+        const { engine } = await setup({ vault, drive, settings: { maxFileSizeMb: 100 }, start: false });
+
+        const plan = await engine.plan(drive.client() as unknown as ProtonDriveClient, SYNC_ROOT);
+
+        assert.deepEqual(plan.held, ['big.bin'], 'said to be held, not left out as if it were gone');
+        assert.deepEqual(plan.uploads, []);
     });
 });
 
@@ -2051,6 +2110,40 @@ describe('SyncEngine — names the vault spells differently (issue #27)', () => 
         assert.equal(vault.read(COMPOSED), 'menu');
         assert.deepEqual(drive.notePaths(), [COMPOSED]);
     });
+
+    it('keeps the file recorded when the rename to the vault’s spelling fails', async () => {
+        const drive = new FakeDrive();
+        const vault = new MemoryVault();
+        vault.write(DECOMPOSED, 'menu');
+        const node = drive.put(DECOMPOSED, 'menu');
+        const first = await setup({ drive, vault, environment: SENSITIVE, start: false });
+        first.state.setSynced(DECOMPOSED, node.uid, 'file', {
+            hash: node.revision!.sha1,
+            size: 4,
+            localMtime: vault.files.get(COMPOSED)!.mtime,
+            remoteRevisionUid: node.revision!.uid,
+        });
+        vault.write(DECOMPOSED, 'menu, edited here');
+
+        // A rename that cannot reach Drive, as a dropped connection makes it.
+        const client = drive.client() as unknown as ProtonDriveClient;
+        const broken = {
+            ...(client as unknown as Record<string, unknown>),
+            async renameNode() {
+                throw new Error('network down');
+            },
+        } as unknown as ProtonDriveClient;
+        await first.engine.start(broken, SYNC_ROOT);
+        await first.settled();
+
+        assert.equal(first.state.get(DECOMPOSED)?.nodeUid, node.uid, 'the record survived the failed rename');
+        assert.equal(node.trashed, false, 'and the node it points at is still there');
+        assert.deepEqual(
+            vault.notePaths(),
+            [COMPOSED],
+            'the file was not taken for a new one, which would have left a copy of it beside it',
+        );
+    });
 });
 
 describe('SyncEngine — the synced Drive folder going missing (issue #33)', () => {
@@ -2372,6 +2465,84 @@ describe('SyncEngine — a mass deletion on Drive', () => {
         assert.equal(trashed(drive), 0, 'and the next pass removes nothing');
         assert.equal(engine.getSummary().pendingMassDelete, undefined);
     });
+
+    it('keeps a full pass’s hold when an unrelated edit is synced', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 300; i++) {
+            vault.write(`notes/note-${String(i).padStart(3, '0')}.md`, `note ${i}`);
+        }
+        const { drive, engine, settled } = await setup({ vault });
+        for (let i = 0; i < 200; i++) {
+            vault.remove(`notes/note-${String(i).padStart(3, '0')}.md`);
+        }
+        await engine.syncNow();
+        assert.equal(engine.getSummary().pendingMassDelete?.count, 200);
+
+        // An edit somewhere else, which is an incremental pass of its own: it
+        // sees one path, and cannot describe the deletions the full pass saw.
+        vault.write('notes/unrelated.md', 'an edit elsewhere');
+        engine.onVaultChange('notes/unrelated.md');
+        await settled();
+
+        assert.equal(engine.getSummary().pendingMassDelete?.count, 200, 'the hold still stands');
+        assert.equal(trashed(drive), 0);
+
+        await engine.approveMassDelete();
+        assert.equal(trashed(drive), 200, 'and approving it still removes them');
+    });
+
+    it('counts deletions across incremental batches, not one batch at a time', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 80; i++) {
+            vault.write(`note-${String(i).padStart(2, '0')}.md`, `note ${i}`);
+        }
+        const { drive, engine, settled } = await setup({ vault, settings: { massDeleteThreshold: 25 } });
+
+        // A folder evicted file by file: five batches of twelve, with a gap
+        // between them, none of which is over the threshold on its own.
+        for (let batch = 0; batch < 5; batch++) {
+            for (let i = 0; i < 12; i++) {
+                const path = `note-${String(batch * 12 + i).padStart(2, '0')}.md`;
+                vault.remove(path);
+                engine.onVaultChange(path);
+            }
+            await settled();
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+
+        // The batches before the total crossed the threshold went through;
+        // from there the deletions are held, rather than each batch being
+        // judged on its own twelve and let past.
+        const gone = trashed(drive);
+        assert.equal(gone, 24, 'the first two batches were under the threshold together');
+        assert.equal(engine.getSummary().pendingMassDelete?.count, 60 - gone, 'the rest are held');
+
+        await engine.approveMassDelete();
+        assert.equal(trashed(drive), 60, 'and approving them removes every one that was left');
+    });
+
+    it('does not count a folder that still holds files it would not delete', async () => {
+        const vault = new MemoryVault();
+        vault.write('Archive/a.md', 'a');
+        const drive = new FakeDrive();
+        drive.put('Archive/secret.md', 'not for this device');
+        const { engine } = await setup({
+            vault,
+            drive,
+            settings: { massDeleteThreshold: 1, excludePatterns: ['Archive/secret.md'] },
+        });
+        assert.equal(drive.text('Archive/secret.md'), 'not for this device');
+
+        // The folder and the one file in it went from the vault; the excluded
+        // file stays on Drive, so the folder can never be removed.
+        vault.remove('Archive/a.md');
+        vault.remove('Archive');
+        await engine.syncNow();
+
+        assert.equal(drive.at('Archive/secret.md')?.trashed, false, 'the excluded file stays on Drive');
+        assert.equal(engine.getSummary().pendingMassDelete, undefined, 'nothing is held that could not be carried out');
+        assert.equal(drive.at('Archive/a.md'), undefined, 'the file that was deleted here went with it');
+    });
 });
 
 describe('SyncEngine — stopping', () => {
@@ -2420,6 +2591,71 @@ describe('SyncEngine — stopping', () => {
         const signal = (engine as unknown as { abortController: AbortController | null }).abortController?.signal;
         assert.ok(signal, 'the controller is still there');
         assert.equal(signal.aborted, true);
+    });
+
+    it('does not run a pass that was queued before the stop', async () => {
+        const vault = new ScriptedVault();
+        vault.write('a.md', 'one');
+        const { drive, engine } = await setup({ vault });
+
+        // One pass is under way, hashing a.md; a second is queued behind it
+        // and would upload the note written meanwhile.
+        const gate = vault.holdRead('a.md');
+        vault.write('a.md', 'two');
+        const first = engine.syncNow();
+        await gate.entered;
+        vault.write('new.md', 'written after the stop was asked for');
+        const second = engine.syncNow();
+        const stopping = engine.stop();
+        gate.release();
+        await Promise.all([first, second, stopping]);
+
+        assert.equal(drive.at('new.md'), undefined, 'the pass queued before the stop never ran');
+        assert.equal(engine.isConnected(), false);
+    });
+
+    it('does not report a status from the start a stop interrupted', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const drive = new FakeDrive();
+        const { engine } = await setup({ vault, drive, start: false, settings: { syncOnStartup: false } });
+        const client = drive.client() as unknown as ProtonDriveClient;
+
+        const gate = holdNodeLookup(client);
+        const starting = engine.start(client, SYNC_ROOT);
+        await gate.entered;
+        const stopping = engine.stop();
+        gate.release();
+        await Promise.all([starting, stopping]);
+
+        assert.notEqual(engine.getSummary().status, 'idle', 'the start did not claim the engine was ready after the stop');
+        assert.equal(engine.isConnected(), false);
+    });
+
+    it('runs a start asked for after a stop, with the client it was given', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const firstDrive = new FakeDrive();
+        const secondDrive = new FakeDrive();
+        secondDrive.put('from-second.md', 'the second client');
+        const { engine } = await setup({ vault, drive: firstDrive, start: false, settings: { syncOnStartup: false } });
+
+        const firstClient = firstDrive.client() as unknown as ProtonDriveClient;
+        const gate = holdNodeLookup(firstClient);
+        const first = engine.start(firstClient, SYNC_ROOT);
+        await gate.entered;
+        const stopping = engine.stop();
+
+        // Asked for while the first start is still unwinding: it is a start of
+        // its own, not a join of the one the stop belongs to.
+        const secondClient = secondDrive.client() as unknown as ProtonDriveClient;
+        const second = engine.start(secondClient, SYNC_ROOT);
+        gate.release();
+        await Promise.all([first, stopping, second]);
+
+        assert.equal(engine.isConnected(), true);
+        await engine.syncNow();
+        assert.equal(vault.read('from-second.md'), 'the second client', 'the second start is the one in force');
     });
 });
 
@@ -2480,6 +2716,43 @@ describe('SyncEngine — one item failing', () => {
         assert.equal(engine.getSummary().status, 'idle', 'the pass finished');
         assert.deepEqual(vault.notePaths(), ['a2.md', 'b2.md'], 'the file after the failure was still followed');
         assert.ok(state.pendingRetries().includes('a.md'), 'and the one that failed is queued for a retry');
+    });
+});
+
+describe('SyncEngine — a folder that could not be removed from Drive', () => {
+    it('keeps it queued, and removes it on the next pass', async () => {
+        const vault = new MemoryVault();
+        vault.write('Old/a.md', 'a');
+        const drive = new FakeDrive();
+        const { engine, state, settled } = await setup({ vault, drive, start: false });
+        const client = drive.client() as unknown as ProtonDriveClient;
+        await engine.start(client, SYNC_ROOT);
+        const folder = drive.at('Old')!;
+
+        // The folder's removal fails the first time, as a dropped connection
+        // makes it; the file inside it goes first, as usual.
+        const trashNodes = (client as unknown as { trashNodes(uids: string[]): AsyncGenerator<unknown> }).trashNodes;
+        let failing: string | null = folder.uid;
+        (client as unknown as { trashNodes: unknown }).trashNodes = async function* (uids: string[]) {
+            if (failing !== null && uids.includes(failing)) {
+                failing = null;
+                throw new Error('network down');
+            }
+            yield* trashNodes(uids);
+        };
+
+        vault.remove('Old/a.md');
+        engine.onVaultChange('Old/a.md');
+        vault.remove('Old');
+        engine.onVaultFolderDelete('Old');
+        await settled();
+
+        assert.equal(folder.trashed, false, 'the folder is still on Drive');
+        assert.ok(state.pendingRetries().includes('Old'), 'and it is queued for another attempt');
+
+        await engine.syncPath('Old');
+
+        assert.equal(folder.trashed, true, 'the retry removed it');
     });
 });
 
@@ -2594,3 +2867,129 @@ describe('SyncEngine — a file moved on Drive into an excluded path', () => {
         assert.equal(drive.text('note.md'), 'text, edited here', 'and goes up as a file of its own');
     });
 });
+
+describe('SyncEngine — a recorded file that grew past the device limit, then was renamed', () => {
+    it('leaves the node where it is instead of trashing it as a local deletion', async () => {
+        const vault = new LimitVault();
+        vault.write('big.bin', 'the bytes');
+        const drive = new FakeDrive();
+        drive.put('big.bin', 'the bytes');
+        const { engine, state } = await setup({ vault, drive, settings: { maxFileSizeMb: 100 } });
+        const node = drive.at('big.bin')!;
+        // Recorded by an earlier sync: it was read here then, and its Drive
+        // revision has not moved since.
+        state.setSynced('big.bin', node.uid, 'file', {
+            hash: node.revision!.sha1,
+            size: 300 * 1024 * 1024,
+            localMtime: vault.files.get('big.bin')!.mtime,
+            remoteRevisionUid: node.revision!.uid,
+        });
+
+        // It grew past what this device will read, and was renamed here.
+        vault.tooLarge.add('big.bin');
+        vault.rename('big.bin', 'renamed.bin');
+        vault.tooLarge.add('renamed.bin');
+
+        await engine.syncNow();
+
+        assert.equal(node.trashed, false, 'the node was not put in Drive’s trash');
+        assert.equal(drive.at('big.bin')?.uid, node.uid, 'it is still at its old path there');
+        assert.equal(engine.getSummary().status, 'idle', 'the pass finished');
+        assert.equal(vault.read('renamed.bin'), 'the bytes', 'the file is still in the vault');
+        assert.ok(
+            engine.pendingChanges().some((change) => change.path === 'renamed.bin' && change.reason === 'too-large'),
+            'the new name is held as too large, and said so',
+        );
+    });
+});
+
+describe('SyncEngine — an over-limit file moved on Drive where this device does not sync', () => {
+    it('keeps it here, notes the failure, and finishes the pass', async () => {
+        const vault = new LimitVault();
+        vault.write('big.bin', 'the bytes');
+        const drive = new FakeDrive();
+        drive.put('big.bin', 'the bytes');
+        const { engine, state } = await setup({
+            vault,
+            drive,
+            settings: { maxFileSizeMb: 100, excludePatterns: ['Private/'] },
+        });
+        const node = drive.at('big.bin')!;
+        state.setSynced('big.bin', node.uid, 'file', {
+            hash: node.revision!.sha1,
+            size: 300 * 1024 * 1024,
+            localMtime: vault.files.get('big.bin')!.mtime,
+            remoteRevisionUid: node.revision!.uid,
+        });
+        vault.tooLarge.add('big.bin');
+
+        // Another device moved it somewhere this one does not sync.
+        node.parentUid = drive.ensureFolderPath('Private');
+        vault.write('later.md', 'written in the same pass');
+        engine.onVaultChange('later.md');
+
+        await engine.syncNow();
+
+        assert.equal(engine.getSummary().status, 'idle', 'the pass finished rather than unwinding');
+        assert.equal(vault.read('big.bin'), 'the bytes', 'the file stays in the vault');
+        assert.ok(state.pendingRetries().includes('big.bin'), 'and it is queued for another attempt');
+        assert.equal(drive.text('later.md'), 'written in the same pass', 'the rest of the pass still synced');
+    });
+});
+
+describe('SyncEngine — a file moved out just before its folder was trashed', () => {
+    it('keeps it on a full walk, while the file the trash took goes', async () => {
+        const vault = new MemoryVault();
+        vault.write('Old/a.md', 'a');
+        vault.write('Old/b.md', 'b');
+        const { drive, engine } = await setup({ vault });
+        const moved = drive.at('Old/b.md')!;
+
+        // b.md was moved out a moment before Old went to the trash, so the
+        // listing has no Old and, from inside it, no b.md either.
+        moved.parentUid = VOLUME_ROOT;
+        drive.trash('Old', 5_000);
+
+        await engine.syncNow();
+
+        assert.equal(vault.read('Old/a.md'), undefined, 'the file the trash took is gone here too');
+        assert.equal(vault.read('Old/b.md'), 'b', 'the file that was moved out is kept');
+        assert.equal(moved.trashed, false);
+        assert.equal(engine.getSummary().status, 'idle', 'the pass finished');
+    });
+
+    it('takes the files of a folder inside it along, when nothing was moved out', async () => {
+        const vault = new MemoryVault();
+        vault.write('Old/Sub/c.md', 'c');
+        const { drive, engine } = await setup({ vault });
+
+        drive.trash('Old', 5_000);
+        await engine.syncNow();
+
+        assert.equal(vault.read('Old/Sub/c.md'), undefined, 'nothing inside the trashed folder is kept');
+        assert.equal(vault.folders.has('Old'), false);
+    });
+});
+
+describe('SyncEngine — a one-sided conflict policy that still keeps the loser', () => {
+    it('keeps a copy of the local edit when prefer-remote is chosen with copies off', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'the local version');
+        const { drive, engine } = await setup({
+            vault,
+            settings: { conflictPolicy: 'prefer-remote', keepConflictCopies: false },
+        });
+
+        // Edited here, and on another device, since the last sync.
+        vault.write('note.md', 'the local version, edited here');
+        drive.put('note.md', 'the remote version');
+
+        await engine.syncNow();
+
+        assert.equal(vault.read('note.md'), 'the remote version', 'the remote revision keeps the name');
+        const copy = vault.notePaths().find((path) => path !== 'note.md');
+        assert.ok(copy, 'the local edit is still here, under a name of its own');
+        assert.equal(vault.read(copy!), 'the local version, edited here');
+    });
+});
+

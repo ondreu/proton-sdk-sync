@@ -109,9 +109,9 @@ function mergeUnits(
             output.push(...remoteContent);
         } else if (sameLines(remoteContent, baseContent)) {
             output.push(...localContent);
-        } else if (widened(localContent, remoteContent)) {
+        } else if (widened(localContent, remoteContent, span.local, span.remote)) {
             output.push(...remoteContent);
-        } else if (widened(remoteContent, localContent)) {
+        } else if (widened(remoteContent, localContent, span.remote, span.local)) {
             output.push(...localContent);
         } else {
             const merged = onOverlap?.(baseContent, localContent, remoteContent) ?? null;
@@ -216,15 +216,30 @@ function sideContent(base: string[], other: string[], regions: Region[], span: S
  * about it. The wider side keeps every line either side wrote, so taking it
  * loses nothing; refusing would hand the user a conflict over an addition.
  * A deletion is never widened past: an empty slice is a decision, not a prefix.
+ *
+ * Nor is a deletion somewhere else in the span. `sideContent` carries the base
+ * lines a side left alone, so a wide side that still holds a line the narrow
+ * side deleted is not a superset of it: taking it would bring that line back.
+ * The sides' change regions say how much of the span each replaced, and only a
+ * narrow side that gave up no more of it than the wide one did can be a prefix
+ * or a suffix of it.
  */
-function widened(narrow: string[], wide: string[]): boolean {
+function widened(narrow: string[], wide: string[], narrowRegions: Region[], wideRegions: Region[]): boolean {
     if (narrow.length === 0 || wide.length <= narrow.length) {
+        return false;
+    }
+    if (replacedBaseLines(narrowRegions) > replacedBaseLines(wideRegions)) {
         return false;
     }
     return (
         sameLines(wide.slice(0, narrow.length), narrow) ||
         sameLines(wide.slice(wide.length - narrow.length), narrow)
     );
+}
+
+/** How many of a span's base lines these regions replaced. */
+function replacedBaseLines(regions: Region[]): number {
+    return regions.reduce((total, region) => total + (region.baseEnd - region.baseStart), 0);
 }
 
 /**

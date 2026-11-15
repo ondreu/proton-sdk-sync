@@ -133,6 +133,17 @@ describe('mergeThreeWay — an insertion at the edge of a change', () => {
         const remote = lines('a', 'X', 'b', 'c');
         assert.equal(mergedText(base, local, remote), lines('a', 'X', 'c'));
     });
+
+    it('refuses rather than widening past a line the narrow side deleted', () => {
+        // The phone's version is not the laptop's with an insertion: it still
+        // carries "c", which the laptop deleted. Taking it as a superset would
+        // put the deleted line back, as if nothing had removed it.
+        const base = lines('x', 'b', 'c', 'y');
+        const laptop = lines('x', 'B', 'y');
+        const phone = lines('x', 'B', 'extra', 'c', 'y');
+        assert.equal(refusal(base, laptop, phone), 'overlapping-edits');
+        assert.equal(refusal(base, phone, laptop), 'overlapping-edits');
+    });
 });
 
 describe('mergeThreeWay — large notes', () => {

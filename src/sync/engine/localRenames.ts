@@ -3,7 +3,7 @@ import type { RemoteTree } from '../drive';
 import type { PathFilter } from '../paths';
 import type { SyncState } from '../state';
 import type { LocalState } from '../types';
-import type { VaultIO } from '../vault';
+import { FileTooLargeError, type VaultIO } from '../vault';
 
 /** What rename detection needs from the engine. */
 export type LocalRenameHost = {
@@ -67,9 +67,15 @@ export async function followLocalRenames(host: LocalRenameHost, localFiles: stri
         let state;
         try {
             state = await host.vault.getState(path);
-        } catch {
-            // Too large to hash on this device, so it cannot be the file that
-            // went missing; leave it to the ordinary reconciliation.
+        } catch (error) {
+            if (!(error instanceof FileTooLargeError)) {
+                // A failed read is not a reason to pair this file with one that
+                // went missing, or to carry on as if it were not there.
+                throw error;
+            }
+            // Too large to hash on this device, so it cannot be shown to be the
+            // file that went missing; the reconcile leaves the node on Drive
+            // rather than reading the rename as a deletion.
             continue;
         }
         if (state) {
