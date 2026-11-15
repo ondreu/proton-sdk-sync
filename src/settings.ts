@@ -14,7 +14,11 @@ export type PluginSettings = {
     remoteFolderSharedBy: string | null;
 
     conflictPolicy: ConflictPolicy;
-    /** Keeps the losing side as a sibling file under `prefer-*` policies too. */
+    /**
+     * Keeps the losing side as a sibling file under `prefer-*` policies too.
+     * Where the two versions differ it is kept whatever this says; the setting
+     * only covers versions that hold the same bytes, which need no copy.
+     */
     keepConflictCopies: boolean;
 
     /**

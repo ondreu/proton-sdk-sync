@@ -139,13 +139,27 @@ describe('ConflictResolver — prefer-local and prefer-remote', () => {
         assert.equal((preferRemote as { keepAtPath: string }).keepAtPath, 'remote');
     });
 
-    it('discards the loser only when copies are explicitly turned off', async () => {
+    it('keeps the loser even with copies turned off, when the two versions differ', async () => {
         const options = { keepConflictCopies: false };
+        // Neither version is anywhere else, so neither may be discarded: the
+        // setting says a copy is not wanted, not that the text may be lost.
         assert.deepEqual(await resolver('prefer-local', stubDrive().drive, options).resolve(context()), {
-            action: 'take-local',
+            action: 'keep-both',
+            keepAtPath: 'local',
+            copyPath: 'note (conflict 2026-09-18 1431 from laptop).md',
         });
         assert.deepEqual(await resolver('prefer-remote', stubDrive().drive, options).resolve(context()), {
-            action: 'take-remote',
+            action: 'keep-both',
+            keepAtPath: 'remote',
+            copyPath: 'note (conflict 2026-09-18 1431 from laptop).md',
+        });
+    });
+
+    it('takes one side outright with copies off, when both sides hold the same text', async () => {
+        const options = { keepConflictCopies: false };
+        const same = context({ remote: { nodeUid: 'node-1', revisionUid: 'rev-2', hash: 'local-hash' } });
+        assert.deepEqual(await resolver('prefer-local', stubDrive().drive, options).resolve(same), {
+            action: 'take-local',
         });
     });
 });

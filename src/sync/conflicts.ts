@@ -34,7 +34,22 @@ export type Resolution =
 export type ResolverOptions = {
     policy: ConflictPolicy;
     deviceName: string;
+    /**
+     * Whether a `prefer-*` policy leaves a sibling copy of the losing side.
+     *
+     * Only consulted when the two versions hold the same bytes, which need no
+     * copy. Differing versions are always kept, whatever this says: the losing
+     * side is then the only copy of that text.
+     */
     keepConflictCopies: boolean;
+    /**
+     * Whether a `prefer-*` policy may discard the losing side at all.
+     *
+     * True everywhere a copy can be read again. False only for the config
+     * folder, whose files are settled by rule: Obsidian and its plugins read
+     * them by name, so a copy beside one is a file nothing would ever open.
+     */
+    keepLosingSide?: boolean;
 };
 
 /**
@@ -103,13 +118,16 @@ export class ConflictResolver {
     }
 
     /**
-     * A one-sided policy: the chosen side takes the original filename. Unless
-     * the user turned copies off, the other side is kept beside it, which makes
-     * `prefer-*` a statement about which version they want to keep opening, not
-     * a setting that throws work away.
+     * A one-sided policy: the chosen side takes the original filename, and the
+     * other is kept beside it whenever the two differ. Where the content
+     * differs the losing side is the only copy of that text, so it is written
+     * out whatever `keepConflictCopies` says; that setting covers the case
+     * where the versions are the same, which needs no copy.
      */
     private oneSided(winner: 'local' | 'remote', context: ConflictContext): Resolution {
-        if (!this.options.keepConflictCopies) {
+        const differs = context.local !== undefined && context.remote !== undefined && context.local.hash !== context.remote.hash;
+        const keepLoser = differs ? (this.options.keepLosingSide ?? true) : this.options.keepConflictCopies;
+        if (!keepLoser) {
             return { action: winner === 'local' ? 'take-local' : 'take-remote' };
         }
         return this.keepBoth(context, winner);

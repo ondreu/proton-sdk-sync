@@ -7,7 +7,7 @@ import type { PathFilter } from '../paths';
 import { reconcile } from '../reconcile';
 import type { SyncState } from '../state';
 import type { LocalState } from '../types';
-import type { VaultIO } from '../vault';
+import { FileTooLargeError, type VaultIO } from '../vault';
 import type { SyncPlan } from './types';
 
 /** Files checked at once while planning; local work, so well above any transfer limit. */
@@ -61,7 +61,19 @@ export async function planFirstSync(host: PlanHost, client: ProtonDriveClient, r
     await runPooled(
         paths.map((path) => async () => {
             const record = host.state.get(path);
-            const localState = await host.vault.getState(path, record?.base);
+            let localState: LocalState | undefined;
+            try {
+                localState = await host.vault.getState(path, record?.base);
+            } catch (error) {
+                if (!(error instanceof FileTooLargeError)) {
+                    throw error;
+                }
+                // Over this device's limit, so it is held rather than dropped:
+                // the sync that follows holds it too, and a path left out of
+                // the preview reads as one that is not there at all.
+                plan.held.push(path);
+                return;
+            }
             if (localState) {
                 host.plannedLocal.set(path, localState);
             }

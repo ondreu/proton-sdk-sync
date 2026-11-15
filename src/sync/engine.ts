@@ -259,6 +259,14 @@ export class SyncEngine {
     private starting: Promise<void> | null = null;
     /** Deletions held for a decision; see {@link holdMassDelete}. */
     private massDelete: MassDeleteHold | null = null;
+    /**
+     * Paths incremental passes found to be deleting from Drive, counted
+     * together for one poll window: a folder evicted file by file arrives as a
+     * batch at a time, and none of them is over the threshold on its own. Kept
+     * apart from the hold itself so that a batch of one path cannot describe
+     * the state of the vault; see {@link holdMassDelete}.
+     */
+    private readonly batchDeletes = new Set<string>();
     /** The last summary reported through `onChange`, so an unchanged one is not reported again. */
     private reported: string | null = null;
     /** The last "Not synced yet" list, and what it was built from; see {@link pendingChanges}. */
@@ -589,15 +597,21 @@ export class SyncEngine {
             this.logger.debug('A start is already under way; joining it');
             return this.starting;
         }
-        this.starting = this.startOnce(client, rootUid).finally(() => {
-            this.starting = null;
+        const running = this.startOnce(client, rootUid);
+        const starting = running.finally(() => {
+            // Only if this start is still the one in force: a stop clears it,
+            // and a start asked for since owns the field now.
+            if (this.starting === starting) {
+                this.starting = null;
+            }
         });
-        return this.starting;
+        this.starting = starting;
+        return starting;
     }
 
     private async startOnce(client: ProtonDriveClient, rootUid: string): Promise<void> {
         // A new run: passes from before belong to an older generation.
-        this.generation++;
+        const generation = ++this.generation;
         this.drive = new DriveIO(client, this.logger.getLogger('drive'), () => this.sizeLimitBytes());
         this.resolver = this.createResolver(this.drive, this.settings.conflictPolicy);
         this.rootUid = rootUid;
@@ -605,6 +619,7 @@ export class SyncEngine {
         this.folderMissing = null;
         this.failureReasons.clear();
         this.massDelete = null;
+        this.batchDeletes.clear();
         // A new session: nothing has been walked, in the terms this session
         // measures time in.
         this.lastFullSyncMono = null;
@@ -618,6 +633,11 @@ export class SyncEngine {
         // that ended mid-download.
         await this.vault.sweepDownloads();
 
+        // A stop, or a new start, may have happened while that ran: from here
+        // the engine belongs to it, and nothing of this one may be reported.
+        if (!this.stillStarting(generation)) {
+            return;
+        }
         if (this.paused) {
             // Nothing runs until resume, which starts with a full sync and so
             // needs nothing primed here.
@@ -630,9 +650,19 @@ export class SyncEngine {
             // The event scope is only known once the root node has been read,
             // and without it there is nothing to poll.
             await this.enqueue(() => this.primeEventScope());
+        }
+        if (!this.stillStarting(generation)) {
+            return;
+        }
+        if (!this.settings.syncOnStartup) {
             this.setStatus('idle');
         }
         this.scheduleRemotePoll();
+    }
+
+    /** Whether a start that captured `generation` is still the engine's own; see {@link startOnce}. */
+    private stillStarting(generation: number): boolean {
+        return this.running && generation === this.generation;
     }
 
     /**
@@ -648,6 +678,11 @@ export class SyncEngine {
     async stop(): Promise<void> {
         this.running = false;
         this.generation++;
+        // A start that has not finished belongs to the run being stopped: it
+        // must not go on to enqueue a pass, or report a status, for the next
+        // one. Cleared here so a start asked for now is not made to join it.
+        const starting = this.starting;
+        this.starting = null;
         this.batcher.cancel();
         this.polls.cancel();
         if (this.renameTimer !== null) {
@@ -660,6 +695,7 @@ export class SyncEngine {
         this.plannedLocal.clear();
         this.deferredFullSync = false;
         this.abortController?.abort();
+        await starting?.catch(() => undefined);
         await this.queue.catch(() => undefined);
         await this.state.flush();
     }
@@ -832,6 +868,11 @@ export class SyncEngine {
         const generation = this.generation;
         const drive = this.drive;
         const rootUid = this.rootUid;
+        if (!this.running) {
+            // Queued before a stop: its engine is gone, and every write it
+            // would make belongs to a run that is over.
+            return false;
+        }
         if (!drive || !rootUid) {
             this.setStatus('not-configured');
             return false;
@@ -919,7 +960,10 @@ export class SyncEngine {
             // instead, and the user asked; see holdMassDelete. The paths it
             // holds are left out of this pass entirely.
             const localFiles = new Set(local.files);
-            const held = await this.holdMassDelete(paths, tree.files, locallyDeletedFolders, (path) => !localFiles.has(path));
+            const held = await this.holdMassDelete(paths, tree.files, {
+                deletedFolders: locallyDeletedFolders,
+                absent: (path) => !localFiles.has(path),
+            });
             for (const path of held) {
                 paths.delete(path);
             }
@@ -1142,8 +1186,10 @@ export class SyncEngine {
             const skip = new Set([...view.skip, ...unconfirmed]);
             // A batch that would remove a great many files from Drive is held,
             // as in a full pass: an unmounted card produces its deletions as
-            // events, not as a walk.
-            for (const path of await this.holdMassDelete(view.paths, view.states)) {
+            // events, not as a walk. A batch is not the whole state, so it can
+            // only add to a hold, and its deletions are counted with the ones
+            // this poll window's earlier batches reported.
+            for (const path of await this.holdMassDelete(view.paths, view.states, { full: false })) {
                 view.paths.delete(path);
             }
             const failed = new Set(await this.reconcileAll(view.paths, view.states, skip));
@@ -1350,6 +1396,20 @@ export class SyncEngine {
             ...(local !== undefined && { local }),
             ...(remote !== undefined && { remote }),
         });
+        const recordedSize = record?.base?.size;
+        if (action.type === 'delete-remote' && local === undefined && recordedSize !== undefined && recordedSize > limit) {
+            // The record says the file was here, its Drive revision has not
+            // moved, and this device cannot read it: over the size limit, or
+            // not there at all, which from here looks the same. Trashing the
+            // node would take the file off every other device, so it is left
+            // on Drive and held until it can be checked. Narrowing the catch
+            // that reads it is not enough on its own; see
+            // {@link followLocalRenames}, which can no longer pair a rename
+            // with a file it cannot hash.
+            this.logger.info(`Leaving "${path}" on Drive: it cannot be read here, and ${megabytes(recordedSize)} MB is over the limit`);
+            this.tooLarge.set(path, recordedSize);
+            return null;
+        }
         if (remote?.size !== undefined && remote.size > limit && (action.type === 'download' || action.type === 'conflict')) {
             this.logger.info(`Leaving "${path}" on Drive: ${megabytes(remote.size)} MB exceeds this device's limit`);
             this.tooLarge.set(path, remote.size);
@@ -2136,7 +2196,17 @@ export class SyncEngine {
      */
     private async detachExcluded(path: string): Promise<void> {
         const base = this.state.get(path)?.base;
-        const local = base === undefined ? undefined : await this.vault.getState(path, base);
+        let local: LocalState | undefined;
+        try {
+            local = base === undefined ? undefined : await this.vault.getState(path, base);
+        } catch (error) {
+            // Over this device's limit, or not readable at all: whether it holds
+            // edits this device alone has cannot be told, so nothing is removed.
+            // The record stays too, so the next pass tries again rather than
+            // uploading the file back under its old name.
+            this.noteItemFailure(path, error, 'Could not check');
+            return;
+        }
         this.state.delete(path);
         if (base !== undefined && local !== undefined && local.hash !== base.hash) {
             this.logger.info(`Kept "${path}": it was moved on Drive to a path this device does not sync, and has edits here`);
@@ -2189,12 +2259,39 @@ export class SyncEngine {
                 staleFolders.push(record.path);
             }
         }
+        // A folder's contents do not all go with it: a file moved out a moment
+        // before the trash is still there, under another folder, and is not
+        // this device's to delete. Being inside a folder Drive confirmed gone
+        // says nothing about the file itself, so every one of them is settled
+        // in one lookup, exactly as the incremental path does; only a child
+        // that went with its folder may be reconciled as deleted. Settled
+        // before the folders are forgotten: their records carry the uids the
+        // lookup needs, subfolders' included.
+        const childrenInGoneFolders = missing.filter((record) => record.type === 'file' && insideGoneFolder(record.path));
+        const goneWithFolder = new Set(
+            (await this.childrenGoneWith([...goneFolders], childrenInGoneFolders))
+                .filter((child) => child.gone)
+                .map((child) => child.path),
+        );
+
         for (const path of [...goneFolders, ...staleFolders]) {
             this.forgetFolder(path);
         }
 
         for (const record of missing) {
-            if (record.type !== 'file' || insideGoneFolder(record.path)) {
+            if (record.type !== 'file') {
+                continue;
+            }
+            if (insideGoneFolder(record.path)) {
+                if (goneWithFolder.has(record.path)) {
+                    // Confirmed gone with the folder. Absence established; the
+                    // reconcile chooses between deleting the local copy and
+                    // keeping a local edit.
+                    continue;
+                }
+                // Alive somewhere else, or not answered for: left for its own
+                // path to settle, so the folder cleanup finds it still here.
+                skip.add(record.path);
                 continue;
             }
             const location = await this.tryLocate(record.nodeUid);
@@ -2326,11 +2423,14 @@ export class SyncEngine {
      * `massDeleteThreshold` the deletions are kept for a decision instead; the
      * paths are returned so the pass can leave them alone.
      *
-     * The count is made with the same rules the pass uses, on the same inputs,
-     * so what it holds is what would have happened. A hold already in force is
-     * recomputed rather than added to: the user sees the decision again only if
-     * the state behind it changed, and once approved the pass runs with the
-     * guard open.
+     * Only a full pass may replace or clear the hold: it is the only pass that
+     * sees every path, so its count is the one that describes the state. An
+     * incremental pass sees a batch, and a batch that happens to hold nothing
+     * would otherwise clear a hold the walk made and turn the panel's decision
+     * into a no-op. It counts its deletions with those earlier batches reported
+     * in the same poll window ({@link batchDeletes}), so a folder evicted file
+     * by file is still held once the total crosses the threshold, and it can
+     * only ever add to a hold.
      *
      * `absent` answers whether the vault still has the file. A full pass knows
      * that from its listing; an incremental one asks the filesystem, which is
@@ -2339,9 +2439,24 @@ export class SyncEngine {
     private async holdMassDelete(
         paths: Iterable<string>,
         remote: Map<string, RemoteState | undefined>,
-        deletedFolders: Map<string, string> = new Map(),
-        absent: (path: string) => boolean | Promise<boolean> = async (path) => !(await this.vault.exists(path)),
+        {
+            full = true,
+            deletedFolders = new Map<string, string>(),
+            absent = async (path: string) => !(await this.vault.exists(path)),
+        }: {
+            /** Whether this pass saw every path, as the walk does. */
+            full?: boolean;
+            /** Folders the listing has and the vault has not, by path and node uid. */
+            deletedFolders?: Map<string, string>;
+            /** Whether the vault still has the file. */
+            absent?: (path: string) => boolean | Promise<boolean>;
+        } = {},
     ): Promise<Set<string>> {
+        // A full pass starts the count over: what earlier batches saw is part
+        // of what it has now seen for itself.
+        if (full) {
+            this.batchDeletes.clear();
+        }
         const threshold = this.settings.massDeleteThreshold;
         if (threshold <= 0) {
             this.massDelete = null;
@@ -2364,23 +2479,64 @@ export class SyncEngine {
                 }
             }
         }
-        // Every folder in `deletedFolders` is one the listing has and the
-        // vault has not: `syncFolders` only puts those there.
-        const folders = [...deletedFolders.keys()];
-        const count = files.length + folders.length;
-        if (count <= threshold) {
-            // Nothing to hold, and a hold from an earlier pass no longer
-            // describes this state, so it goes with it.
-            this.massDelete = null;
-            return new Set();
+        // Folders the listing has and the vault has not, but only those that
+        // will really go: one still holding files this device does not delete
+        // is skipped by cleanUpDeletedFolders, and counting it would leave a
+        // decision that carrying out can never settle.
+        const folders: string[] = [];
+        for (const [path, uid] of deletedFolders) {
+            if (await this.drive!.hasLiveChildren(uid)) {
+                continue;
+            }
+            folders.push(path);
+        }
+        const deletions = [...files, ...folders];
+
+        if (full) {
+            if (deletions.length <= threshold) {
+                // Nothing to hold, and a hold from an earlier pass no longer
+                // describes this state, so it goes with it.
+                this.massDelete = null;
+                return new Set();
+            }
+            this.massDelete = { paths: deletions, approved: false };
+            this.noteHeldDeletions(deletions.length, threshold);
+            return new Set(this.massDelete.paths);
         }
 
-        this.massDelete = { paths: [...files, ...folders], approved: false };
+        for (const path of deletions) {
+            this.batchDeletes.add(path);
+        }
+        // A decision already carried out leaves no record, and holding that
+        // path would be a promise the panel could not keep: only what is still
+        // to be deleted is held. The count that decides is the whole window's,
+        // including the batches whose deletions went through before it.
+        const outstanding = [...this.batchDeletes].filter((path) => this.state.get(path) !== undefined);
+        const seen = Math.max(this.batchDeletes.size, this.massDelete?.paths.length ?? 0);
+        if (seen <= threshold) {
+            return new Set();
+        }
+        if (this.massDelete === null) {
+            this.massDelete = { paths: outstanding, approved: false };
+            this.noteHeldDeletions(outstanding.length, threshold);
+        } else {
+            // Added to the hold rather than replacing it: a later batch cannot
+            // know about the deletions the earlier ones held.
+            const known = new Set(this.massDelete.paths);
+            for (const path of outstanding) {
+                if (!known.has(path)) {
+                    this.massDelete.paths.push(path);
+                }
+            }
+        }
+        return new Set(this.massDelete.paths);
+    }
+
+    private noteHeldDeletions(count: number, threshold: number): void {
         this.logger.warn(
             `Holding ${count} deletion(s): more than the ${threshold} a pass removes without asking. ` +
                 'Approve them in the sync panel, or keep the files on Drive.',
         );
-        return new Set(this.massDelete.paths);
     }
 
     /**
@@ -2416,7 +2572,10 @@ export class SyncEngine {
                 this.forgetFolder(path);
                 this.logger.info(`Removed folder "${path}" from Drive, deleted locally`);
             } catch (error) {
-                this.logger.warn(`Could not remove folder "${path}" from Drive`, error);
+                // One folder that cannot be removed does not fail the pass, and
+                // is queued so the next one tries again rather than waiting for
+                // another full walk to find it still there.
+                this.noteItemFailure(path, error, 'Could not remove folder');
             }
         }
     }
@@ -2429,13 +2588,16 @@ export class SyncEngine {
                 // arrive in a later batch, and the folder waits for them.
                 continue;
             }
-            this.pendingFolderDeletes.delete(path);
             try {
                 if (await this.vault.exists(path)) {
+                    // Back in the vault: there is nothing to remove.
+                    this.pendingFolderDeletes.delete(path);
                     continue;
                 }
                 const uid = await this.findRemoteFolder(path);
                 if (!uid) {
+                    // Never reached Drive, so nothing is there to remove.
+                    this.pendingFolderDeletes.delete(path);
                     continue;
                 }
                 if (await this.drive!.hasLiveChildren(uid)) {
@@ -2444,9 +2606,12 @@ export class SyncEngine {
                 }
                 await this.drive!.trashNode(uid);
                 this.forgetFolder(path);
+                this.pendingFolderDeletes.delete(path);
                 this.logger.info(`Removed folder "${path}" from Drive, deleted locally`);
             } catch (error) {
-                this.logger.warn(`Could not remove folder "${path}" from Drive`, error);
+                // Kept pending, and queued for a retry: dropping it here left
+                // the folder on Drive until the next full walk noticed it.
+                this.noteItemFailure(path, error, 'Could not remove folder');
             }
         }
     }
@@ -2881,6 +3046,10 @@ export class SyncEngine {
      * could not be looked up, so that the batch is read again on the next poll.
      */
     private async applyRemoteEvents(changes: NodeChange[]): Promise<boolean> {
+        // A poll is a window of its own: the deletions it reports are counted
+        // together, and the count starts over with the next poll. See
+        // {@link batchDeletes}.
+        this.batchDeletes.clear();
         const paths = new Set(this.state.dueRetries());
         const confirmedAbsent = new Set<string>();
         /** Files whose fate could not be established: left alone, and retried. */
@@ -2949,7 +3118,7 @@ export class SyncEngine {
         const location = await this.tryLocate(uid);
         switch (location?.kind) {
             case 'deleted':
-                for (const file of await this.childrenGoneWith(record.nodeUid, record.path, filesWithin(record.path))) {
+                for (const file of await this.childrenGoneWith([record.path], filesWithin(record.path))) {
                     if (file.gone) {
                         confirmedAbsent.add(file.path);
                     } else {
@@ -2993,24 +3162,41 @@ export class SyncEngine {
      * The trash takes a folder's contents, but not always all of them: a file
      * moved out a moment before the folder was trashed is still there, under
      * another folder, and is not this device's to delete. One batched lookup
-     * settles it — a child still under the trashed folder, or itself in the
+     * settles it — a child still under one of the folders, or itself in the
      * trash, is gone; one that has moved elsewhere is not, and is left alone
      * until its own event says what happened. A lookup that fails settles
      * nothing: absence is never inferred from it.
+     *
+     * `folderPaths` is the folders the trash took. The full walk passes every
+     * one it confirmed deleted, so their children are settled at once; the
+     * incremental path passes the one folder whose event it read. Folders
+     * recorded inside them went with the trash as well, and their uids count
+     * too, or a file in a subfolder would be taken for one that moved out.
      */
     private async childrenGoneWith(
-        folderUid: string,
-        folderPath: string,
+        folderPaths: string[],
         children: { path: string; nodeUid: string }[],
     ): Promise<{ path: string; gone: boolean }[]> {
         if (children.length === 0) {
             return [];
         }
+        const folderUids = new Set(
+            this.state
+                .entries()
+                .filter(
+                    (record) =>
+                        record.type === 'folder' && folderPaths.some((folder) => isWithin(record.path, folder)),
+                )
+                .map((record) => record.nodeUid),
+        );
         let found: Map<string, NodeEntity | null>;
         try {
             found = await this.drive!.lookupNodes(children.map((child) => child.nodeUid));
         } catch (error) {
-            this.logger.warn(`Could not check what the trash took with "${folderPath}"`, error);
+            this.logger.warn(
+                `Could not check what the trash took with ${folderPaths.map((path) => `"${path}"`).join(', ')}`,
+                error,
+            );
             return children.map((child) => ({ path: child.path, gone: false }));
         }
         return children.map((child) => {
@@ -3019,9 +3205,9 @@ export class SyncEngine {
                 return { path: child.path, gone: false };
             }
             const node = found.get(child.nodeUid) ?? null;
-            // Gone for good, in the trash itself, or still under the folder
-            // that took it there.
-            const gone = node === null || node.trashTime !== undefined || node.parentUid === folderUid;
+            // Gone for good, in the trash itself, or still under one of the
+            // folders that took it there.
+            const gone = node === null || node.trashTime !== undefined || folderUids.has(node.parentUid ?? '');
             return { path: child.path, gone };
         });
     }
@@ -3187,13 +3373,18 @@ export class SyncEngine {
         }
     }
 
-    private createResolver(drive: DriveIO, policy: ConflictPolicy, keepConflictCopies?: boolean): ConflictResolver {
+    private createResolver(
+        drive: DriveIO,
+        policy: ConflictPolicy,
+        overrides: { keepConflictCopies?: boolean; keepLosingSide?: boolean } = {},
+    ): ConflictResolver {
         return new ConflictResolver(
             drive,
             {
                 policy,
                 deviceName: this.settings.deviceName,
-                keepConflictCopies: keepConflictCopies ?? this.settings.keepConflictCopies,
+                keepConflictCopies: overrides.keepConflictCopies ?? this.settings.keepConflictCopies,
+                keepLosingSide: overrides.keepLosingSide ?? true,
             },
             this.logger.getLogger('conflicts'),
         );
@@ -3217,7 +3408,10 @@ export class SyncEngine {
         if (!this.filter.isConfigPath(path)) {
             return this.resolver!;
         }
-        return this.createResolver(this.drive!, reason === 'both-created' ? 'prefer-remote' : 'prefer-newest', false);
+        return this.createResolver(this.drive!, reason === 'both-created' ? 'prefer-remote' : 'prefer-newest', {
+            keepConflictCopies: false,
+            keepLosingSide: false,
+        });
     }
 
     /** The smallest size limit in force on this device, in bytes; Infinity for none. */
@@ -3300,9 +3494,27 @@ export class SyncEngine {
         return this.pace.current();
     }
 
-    /** Serialises passes so two of them cannot interleave on the same path. */
+    /**
+     * Serialises passes so two of them cannot interleave on the same path.
+     *
+     * The run a task belongs to is captured here, at the moment it is queued:
+     * a pass queued before a stop would otherwise start after it, capture the
+     * new generation from inside {@link fullSync}, and write to Drive for an
+     * engine that no longer exists.
+     */
     private enqueue(task: () => Promise<void>): Promise<void> {
-        this.queue = this.queue.catch(() => undefined).then(task);
+        const generation = this.generation;
+        const running = this.running;
+        this.queue = this.queue
+            .catch(() => undefined)
+            .then(() => {
+                if (!running || !this.running || generation !== this.generation) {
+                    // Queued for a run that is over, or not started yet. There
+                    // is nothing to do, and nothing to report.
+                    return;
+                }
+                return task();
+            });
         return this.queue;
     }
 

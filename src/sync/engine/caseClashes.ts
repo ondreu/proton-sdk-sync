@@ -14,7 +14,7 @@ import {
     windowsName,
 } from '../paths';
 import type { SyncState } from '../state';
-import type { RemoteState } from '../types';
+import type { RemoteState, SyncRecord } from '../types';
 import type { VaultIO } from '../vault';
 import { NodeWithSameNameExistsValidationError } from '@protontech/drive-sdk';
 import { byDepth, movedPath, renameInTree } from './helpers';
@@ -229,16 +229,25 @@ export class CaseClashes {
             if (uid === undefined || vaultSpelling(name) === name || this.host.filter().isExcludedWithAncestors(path)) {
                 continue;
             }
+            // The record of a name under the old spelling cannot be followed to
+            // the new one: the vault may hold a different file there. It is
+            // dropped only for as long as the rename takes, and put back if the
+            // rename does not happen — otherwise the file would go up again as
+            // a second copy, unrecorded.
+            const forgotten = this.host.state.entries().filter((entry) => isWithin(entry.path, path));
             try {
-                for (const record of this.host.state.entries().filter((entry) => isWithin(entry.path, path))) {
+                for (const record of forgotten) {
                     this.host.state.delete(record.path);
                 }
                 const renamed = await this.renameForSpelling(uid, path, isFolder, taken);
-                if (renamed !== null) {
-                    renameInTree(tree, path, renamed);
-                    moved.push([path, renamed]);
+                if (renamed === null) {
+                    this.restoreRecords(forgotten);
+                    continue;
                 }
+                renameInTree(tree, path, renamed);
+                moved.push([path, renamed]);
             } catch (error) {
+                this.restoreRecords(forgotten);
                 this.fail(path, error, 'Could not settle the spelling of');
             }
         }
@@ -280,6 +289,13 @@ export class CaseClashes {
             return;
         }
         this.host.logger.warn(`${what} "${path}"`, error);
+    }
+
+    /** Put back the records a renamed path's old spelling had; see {@link settleSpellings}. */
+    private restoreRecords(records: SyncRecord[]): void {
+        for (const record of records) {
+            this.host.state.set(record);
+        }
     }
 
     /**
