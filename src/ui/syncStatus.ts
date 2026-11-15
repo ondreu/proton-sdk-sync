@@ -165,6 +165,54 @@ export function statusDescription(summary: SyncSummary): string {
     return PRESENTATION[summary.status].description;
 }
 
+/**
+ * What "Sync now" actually did, for the notice that follows it.
+ *
+ * The button said "finished" whatever came back: a pass that never ran —
+ * locked, no folder chosen, waiting for Wi-Fi, Drive unreachable — and one
+ * that stopped on an error read the same as one that caught up. This reports
+ * the state the pass left behind, and what is still waiting when it went
+ * through.
+ */
+export function syncNowResult(summary: SyncSummary): string {
+    switch (summary.status) {
+        case 'locked':
+            return 'the sync is locked, so nothing was compared. Unlock it with your PIN first.';
+        case 'signed-out':
+            return 'not signed in, so there was nothing to compare. Sign in first.';
+        case 'not-configured':
+            return 'no Drive folder is chosen yet, so there was nothing to compare.';
+        case 'waiting-for-wifi':
+            return 'waiting for Wi-Fi, so nothing was compared yet.';
+        case 'folder-missing':
+            return (
+                'the Drive folder this vault syncs with is missing, so nothing was compared. ' +
+                'Restore it on Proton Drive, or choose another folder.'
+            );
+        case 'offline':
+            return `Drive could not be reached, so nothing was compared: ${summary.lastError ?? 'the connection failed'}.`;
+        case 'error':
+            return `the sync stopped before it finished: ${summary.lastError ?? 'see the log for why'}.`;
+        case 'syncing':
+        case 'connecting':
+            return 'the sync is still running; the status bar shows how far it has got.';
+        case 'idle':
+        case 'paused':
+            break;
+    }
+    if (summary.conflicts > 0) {
+        return `finished, but ${count(summary.conflicts, 'file')} still ${summary.conflicts === 1 ? 'needs' : 'need'} a decision.`;
+    }
+    if (summary.pending > 0) {
+        return `finished, but ${count(summary.pending, 'change')} ${summary.pending === 1 ? 'is' : 'are'} still not synced.`;
+    }
+    return 'finished; everything is in sync.';
+}
+
+function count(n: number, noun: string): string {
+    return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
+
 /** A last sync longer ago than this is overdue, and shown in red rather than green. */
 const OVERDUE_AFTER_MS = 60 * 60 * 1000;
 

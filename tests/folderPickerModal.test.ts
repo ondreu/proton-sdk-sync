@@ -95,4 +95,42 @@ describe('FolderPickerModal — unreadable sharing metadata (#13)', () => {
         await modal['choose'](SYNC_ROOT, 'Vault');
         assert.equal(chosen[0]!.shared, false);
     });
+
+    it('creates one folder for a double press', async () => {
+        const { modal, client, chosen } = picker(MemberRole.Admin, true, true);
+        modal['stack'] = [{ kind: 'folder', uid: SYNC_ROOT, name: 'Vault' }];
+        let calls = 0;
+        const create = client.createFolder.bind(client);
+        client.createFolder = async (parentUid, name) => {
+            calls++;
+            // Drive answers a moment later, as it would on a real connection.
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return create(parentUid, name);
+        };
+
+        await Promise.all([modal['createAndChoose']('New vault'), modal['createAndChoose']('New vault')]);
+
+        assert.equal(calls, 1);
+        assert.equal(chosen.length, 1);
+    });
+
+    it('creates again after a failure, once the first try is over', async () => {
+        const { modal, client, chosen } = picker(MemberRole.Admin, true, true);
+        modal['stack'] = [{ kind: 'folder', uid: SYNC_ROOT, name: 'Vault' }];
+        let calls = 0;
+        const create = client.createFolder.bind(client);
+        client.createFolder = async (parentUid, name) => {
+            calls++;
+            if (calls === 1) {
+                throw new Error('Drive is having a moment');
+            }
+            return create(parentUid, name);
+        };
+
+        await modal['createAndChoose']('New vault');
+        await modal['createAndChoose']('New vault');
+
+        assert.equal(calls, 2);
+        assert.equal(chosen.length, 1);
+    });
 });

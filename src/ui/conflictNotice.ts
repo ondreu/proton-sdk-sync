@@ -3,6 +3,7 @@ import { type App, Notice } from 'obsidian';
 import type { ConflictEvent } from '../sync/engine';
 import { isTextPath } from '../sync/media';
 import { outcomeText, REASON_TEXT } from './conflictText';
+import { openVaultFile } from './openFile';
 
 /** Files listed by name; the rest are counted. */
 const MAX_LISTED = 5;
@@ -44,7 +45,9 @@ export function showConflictNotice(app: App, events: ConflictEvent[], actions: C
                 const link = item.createEl('a', { text: event.path, href: '#' });
                 link.addEventListener('click', (click) => {
                     click.preventDefault();
-                    void app.workspace.openLinkText(event.path, '', false);
+                    // A path, not a link: a name with `#` or `^` in it opens
+                    // itself rather than a heading of some other note.
+                    void openVaultFile(app, event.path);
                 });
             } else {
                 item.createSpan({ text: event.path });

@@ -5,6 +5,7 @@ import { MAX_MERGE_BYTES } from '../sync/conflicts';
 import type { NoteVersion } from '../sync/engine';
 import { isTextPath } from '../sync/media';
 import { basename, conflictCopyOriginal, isConflictCopyOf, parentPath } from '../sync/paths';
+import { resolveKeepingLosingVersion } from './conflictDecision';
 import { DiffModal, type DiffOptions } from './diffModal';
 import { getRuntime } from '../runtime';
 
@@ -18,7 +19,13 @@ export function compareWithDrive(plugin: ProtonDriveSyncPlugin, path: string, on
         return;
     }
     const resolve = (policy: 'keep-both' | 'prefer-local' | 'prefer-remote') => async () => {
-        await getRuntime().engine.resolveConflict(path, policy);
+        if (policy === 'keep-both') {
+            await getRuntime().engine.resolveConflict(path, policy);
+        } else {
+            // The version the choice drops is kept beside the note anyway:
+            // seeing the diff is the decision, not a reason to lose one side.
+            await resolveKeepingLosingVersion(getRuntime().engine, plugin.settings, path, policy);
+        }
         new Notice(`Resolved "${path}".`);
         onResolved();
     };

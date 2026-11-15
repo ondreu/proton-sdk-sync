@@ -2,7 +2,16 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { SyncSummary } from '../src/sync/engine';
-import { lastSynced, noteIndicator, pendingText, statusDetails, statusIcon, statusLabel, timeAgo } from '../src/ui/syncStatus';
+import {
+    lastSynced,
+    noteIndicator,
+    pendingText,
+    statusDetails,
+    statusIcon,
+    statusLabel,
+    syncNowResult,
+    timeAgo,
+} from '../src/ui/syncStatus';
 
 const base: SyncSummary = {
     status: 'idle',
@@ -116,5 +125,32 @@ describe('pendingText', () => {
             pendingText({ path: 'video.mp4', reason: 'too-large', detail: '2 MB' }),
             'Over this device’s size limit, so not synced here (2 MB)',
         );
+    });
+});
+
+describe('syncNowResult', () => {
+    it('says what a pass that could not run did not do', () => {
+        assert.match(syncNowResult({ ...base, status: 'locked' }), /locked/);
+        assert.match(syncNowResult({ ...base, status: 'not-configured' }), /no Drive folder/);
+        assert.match(syncNowResult({ ...base, status: 'signed-out' }), /not signed in/);
+        assert.match(syncNowResult({ ...base, status: 'waiting-for-wifi' }), /Wi-Fi/);
+        assert.match(syncNowResult({ ...base, status: 'folder-missing', lastError: 'gone' }), /missing/);
+    });
+
+    it('reports a stop, with the reason the engine gave', () => {
+        assert.match(syncNowResult({ ...base, status: 'error', lastError: 'Drive refused the upload' }), /Drive refused/);
+        assert.match(syncNowResult({ ...base, status: 'offline', lastError: 'ENOTFOUND' }), /ENOTFOUND/);
+    });
+
+    it('only says everything is in sync when it is', () => {
+        assert.equal(syncNowResult({ ...base, status: 'idle' }), 'finished; everything is in sync.');
+        assert.match(syncNowResult({ ...base, status: 'idle', conflicts: 2 }), /2 files still need a decision/);
+        assert.match(syncNowResult({ ...base, status: 'idle', conflicts: 1 }), /1 file still needs a decision/);
+        assert.match(syncNowResult({ ...base, status: 'idle', pending: 3 }), /3 changes are still not synced/);
+        assert.match(syncNowResult({ ...base, status: 'idle', pending: 1 }), /1 change is still not synced/);
+    });
+
+    it('is not fooled by a paused sync that has just caught up', () => {
+        assert.equal(syncNowResult({ ...base, status: 'paused' }), 'finished; everything is in sync.');
     });
 });

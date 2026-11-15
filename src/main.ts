@@ -38,11 +38,13 @@ import { SyncEngine, type ConflictEvent, type OpenEditor, type SyncPlan, type Sy
 import { errorMessage } from './sync/engine/helpers';
 import { SyncState } from './sync/state';
 import { formatLogEntries, Logger, setLogShowsNames } from './util/logger';
+import { ActivityWatch } from './ui/activity';
 import { compareConflictCopyOf, compareWithConflictCopy, conflictPairsFor, versionComparison } from './ui/compare';
 import { showConflictNotice } from './ui/conflictNotice';
 import { ConflictsModal } from './ui/conflictsModal';
 import { DeviceRemovedModal, DevicesModal } from './ui/devicesModal';
 import { FirstSyncModal } from './ui/firstSyncModal';
+import { openVaultFile } from './ui/openFile';
 import { PinFormModal, UnlockModal } from './ui/pinModals';
 import { ReloadModal } from './ui/reloadModal';
 import { CONFLICT_POLICIES, ProtonDriveSyncSettingsTab } from './ui/settingsTab';
@@ -50,7 +52,14 @@ import { SetupModal } from './ui/setupModal';
 import { ShareModal } from './ui/shareModal';
 import { StatusBar } from './ui/statusBar';
 import { SYNC_PANEL_VIEW, SyncPanelView } from './ui/syncPanel';
-import { type NoteIndicator, noteIndicator, statusIcon, statusLabel, statusSpins } from './ui/syncStatus';
+import {
+    type NoteIndicator,
+    noteIndicator,
+    statusIcon,
+    statusLabel,
+    statusSpins,
+    syncNowResult,
+} from './ui/syncStatus';
 
 /** The plugin's own handles; see runtime.ts for why they are not on the instance. */
 const runtime = getRuntime();
@@ -121,10 +130,18 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     /** Wrong PINs entered so far in this run; see {@link UnlockModal}. */
     private readonly pinFailures = { count: 0 };
     private unlocking: Promise<boolean> | null = null;
+    /** The connect in flight; see {@link connect}. */
+    private connecting: Promise<void> | null = null;
     /** The unlocked PIN key, kept across restarts when the PIN has a time limit. */
     private rememberedUnlock!: RememberedUnlock;
     /** Last time the user did anything in Obsidian; measures "away" for the PIN's time limit. */
     private lastActivity = Date.now();
+    /**
+     * What counts as "did something", in every Obsidian window: the PIN's time
+     * limit must not run out while the user works in a pop-out, whose clicks
+     * never reach this window's document.
+     */
+    private readonly activity = new ActivityWatch(() => this.onActivity());
     private lastRememberSave = 0;
     private settingsTab: ProtonDriveSyncSettingsTab | null = null;
     /** What the settings tab last rendered from; see {@link refreshSettingsTab}. */
@@ -139,6 +156,15 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     private ribbonIcon: HTMLElement | null = null;
     /** The sync-state button added to each note's header on mobile; see {@link updateNoteIndicators}. */
     private readonly noteActions = new WeakMap<MarkdownView, HTMLElement>();
+    /**
+     * The same buttons, kept in a list as well.
+     *
+     * A view's header belongs to the view, which outlives the plugin: Obsidian
+     * does not take the buttons down when the plugin unloads, so an update
+     * left one behind per note and the next load added another. The weak map
+     * cannot be walked, so the removal registered below needs this list.
+     */
+    private readonly noteActionEls = new Set<HTMLElement>();
     /** What the status bar, ribbon icon and panel currently show. */
     private summary!: SyncSummary;
     private conflictNoticeTimer: number | null = null;
@@ -176,7 +202,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     },
                     pollSeconds: () => runtime.engine.pollSeconds(),
                     sharedBy: () => this.settings.remoteFolderSharedBy,
-                    openFile: (path) => void this.app.workspace.openLinkText(path, '', false),
+                    openFile: (path) => void this.openPath(path),
                     syncNow: () => void this.syncNowOrSetUp(),
                     togglePause: () => void this.setPaused(!this.settings.paused),
                     showConflicts: () => new ConflictsModal(this.app, this).open(),
@@ -187,6 +213,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // it shows in the sidebar and the ribbon menu, carries the status.
         if (Platform.isMobile) {
             this.ribbonIcon = this.addRibbonIcon('refresh-cw', 'Proton-SDK-Sync', () => void this.openPanel());
+            // The note-header buttons are added to views that belong to the
+            // app, not to the plugin, and survive its unload; take them down
+            // with the plugin or every update leaves one more per note.
+            this.register(() => this.removeNoteActions());
         }
         this.registerInterval(window.setInterval(() => this.refreshStatus(), STATUS_REFRESH_MS));
         this.registerInterval(
@@ -618,10 +648,29 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     /**
      * Bring the sync up, if there is both a session and a chosen folder.
      *
-     * Called on load and again whenever the user signs in or picks a folder, so
-     * the plugin becomes active without a reload.
+     * Called on load and again whenever the user signs in or picks a folder,
+     * so the plugin becomes active without a reload. Several unlock paths run
+     * into it at once — the status bar, the command, the settings tab, a
+     * layout-ready start — and two passes together start the engine twice:
+     * the second start's sweep of unfinished downloads deletes the first
+     * pass's temporary file out from under it. One pass, and the callers that
+     * arrive meanwhile wait for it.
      */
     async connect(): Promise<void> {
+        if (this.connecting !== null) {
+            return this.connecting;
+        }
+        const pass = this.connectOnce().finally(() => {
+            if (this.connecting === pass) {
+                this.connecting = null;
+            }
+        });
+        this.connecting = pass;
+        return pass;
+    }
+
+    /** One attempt at the connection; failures are reported here, not thrown at a caller that joined. */
+    private async connectOnce(): Promise<void> {
         try {
             await this.connectSession();
         } catch (error) {
@@ -817,6 +866,42 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             return;
         }
         await runtime.engine.syncNow();
+    }
+
+    /**
+     * Open a vault file the panel names, by its path.
+     *
+     * `openLinkText` resolves a link, not a path: it creates the note when it
+     * is missing, so tapping a file that was waiting to be deleted brought it
+     * back empty, and it reads `#` and `^` in a name as a heading or block
+     * reference, opening a different note. A file the panel lists is a path,
+     * and one that is gone should say so.
+     */
+    private async openPath(path: string): Promise<void> {
+        if (!(await openVaultFile(this.app, path))) {
+            this.notify(`"${path}" is not in the vault any more, so there is nothing to open.`);
+        }
+    }
+
+    /**
+     * Compare everything against Drive now, and say what actually happened.
+     *
+     * The settings tab used to say "finished" whatever came back, which it
+     * said just as readily for a pass that never ran — locked, no folder,
+     * held for Wi-Fi — or one that stopped on an error. What the pass ended
+     * in is what the notice reports.
+     */
+    async syncNowAndReport(): Promise<void> {
+        if (this.locked) {
+            this.notify(syncNowResult({ ...runtime.engine.getSummary(), status: 'locked' }));
+            return;
+        }
+        if (!this.isConfigured()) {
+            this.notify(syncNowResult({ ...runtime.engine.getSummary(), status: 'not-configured' }));
+            return;
+        }
+        await runtime.engine.syncNow();
+        this.notify(syncNowResult(runtime.engine.getSummary()));
     }
 
     /** Pick another Drive folder for the vault, as the settings tab does. */
@@ -1263,6 +1348,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         if (!Platform.isMobile) {
             return;
         }
+        // A closed view took its button with it; the list should stay as long
+        // as the notes that are open.
+        for (const el of this.noteActionEls) {
+            if (!el.isConnected) {
+                this.noteActionEls.delete(el);
+            }
+        }
         for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
             const view = leaf.view;
             if (!(view instanceof MarkdownView) || !view.file) {
@@ -1277,10 +1369,19 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 action = view.addAction('circle', 'Sync status', () => void this.openPanel());
                 action.addClass('proton-sdk-sync-note-action');
                 this.noteActions.set(view, action);
+                this.noteActionEls.add(action);
             }
             action.show();
             renderNoteAction(action, this.indicatorFor(view.file));
         }
+    }
+
+    /** Take the per-note header buttons down; registered to run when the plugin unloads. */
+    private removeNoteActions(): void {
+        for (const action of this.noteActionEls) {
+            action.remove();
+        }
+        this.noteActionEls.clear();
     }
 
     /**
@@ -1428,9 +1529,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             runtime.engine.pollNow();
         });
 
-        // Using Obsidian restarts the PIN's clock.
-        this.registerDomEvent(document, 'pointerdown', () => this.onActivity());
-        this.registerDomEvent(document, 'keydown', () => this.onActivity());
+        // Using Obsidian restarts the PIN's clock, in this window and in any
+        // pop-out: a pop-out is a window of its own, and a click there never
+        // reaches this document.
+        this.activity.watch(window);
+        this.registerEvent(this.app.workspace.on('window-open', (win) => this.activity.watch(win.win)));
+        this.registerEvent(this.app.workspace.on('window-close', (win) => this.activity.unwatch(win.win)));
+        this.register(() => this.activity.stop());
         this.registerInterval(
             window.setInterval(() => {
                 if (this.lockDue()) {

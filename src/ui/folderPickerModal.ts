@@ -45,6 +45,8 @@ export class FolderPickerModal extends Modal {
     private loading = false;
     /** The last listing failed, so an empty list says nothing about the folder. */
     private failed = false;
+    /** A create is on its way to Drive: a second press must not make a second folder. */
+    private creating = false;
     private myFiles: NodeEntity | null = null;
 
     constructor(
@@ -300,11 +302,19 @@ export class FolderPickerModal extends Modal {
         if (current?.kind !== 'folder') {
             return;
         }
+        // Create and Enter both land here, and a double press is two calls
+        // before the first has an answer: one request, and one folder.
+        if (this.creating) {
+            return;
+        }
+        this.creating = true;
         try {
             const folder = await this.client.createFolder(current.uid, trimmed);
             await this.choose(folder.uid, `${this.currentPath} / ${trimmed}`);
         } catch (error) {
             new Notice(`Could not create that folder: ${message(error)}`);
+        } finally {
+            this.creating = false;
         }
     }
 }

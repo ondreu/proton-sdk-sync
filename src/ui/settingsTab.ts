@@ -6,6 +6,7 @@ import { checkExcludePatterns } from '../sync/paths';
 import type { ConflictPolicy } from '../sync/types';
 import type { LogLevel } from '../util/logger';
 import { ConflictsModal } from './conflictsModal';
+import { ConfirmModal } from './confirmModal';
 import { FolderPickerModal } from './folderPickerModal';
 import { SignInModal } from './signInModal';
 import { getRuntime } from '../runtime';
@@ -336,17 +337,12 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                 },
                 {
                     name: 'Sync now',
-                    desc: 'Compare everything against Drive right away.',
+                    desc: 'Compare everything against Drive right away, and say what it could not do.',
                     render: (setting) => {
                         setting.addButton((button) =>
-                            button.setButtonText('Sync now').onClick(async () => {
-                                if (!this.plugin.isConfigured()) {
-                                    new Notice('Proton-SDK-Sync: sign in and choose a Drive folder first.');
-                                    return;
-                                }
-                                await getRuntime().engine.syncNow();
-                                new Notice('Proton-SDK-Sync: finished.');
-                            }),
+                            button
+                                .setButtonText('Sync now')
+                                .onClick(() => void this.plugin.syncNowAndReport()),
                         );
                     },
                 },
@@ -396,7 +392,9 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                 },
                 {
                     name: 'Keep a copy of the version that loses',
-                    desc: 'Strongly recommended. With this off, the losing version is discarded.',
+                    desc:
+                        'Strongly recommended. With this off, a policy that keeps one side discards the other. ' +
+                        'A choice made in the conflicts dialog keeps both either way.',
                     visible: () => {
                         const current = this.plugin.settings.conflictPolicy;
                         return current === 'prefer-local' || current === 'prefer-remote' || current === 'prefer-newest';
@@ -536,10 +534,25 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                             button
                                 .setButtonText('Rebuild')
                                 .setDestructive()
-                                .onClick(async () => {
-                                    await this.plugin.rebuildState();
-                                    new Notice('Proton-SDK-Sync: sync state rebuilt.');
-                                }),
+                                .onClick(() =>
+                                    new ConfirmModal(this.app, {
+                                        title: 'Rebuild the sync state?',
+                                        text:
+                                            'This device forgets its record of the last sync: which files and ' +
+                                            'folders it has seen, when each was last synced, how far Drive’s list ' +
+                                            'of changes had been read, and which files were left waiting for a ' +
+                                            'decision. Nothing is deleted here or on Drive. Every file that ' +
+                                            'differs on the two sides is then treated as a conflict, so expect ' +
+                                            'conflict copies and prompts, and a long first pass.',
+                                        action: 'Rebuild',
+                                        run: async () => {
+                                            await this.plugin.rebuildState();
+                                            new Notice(
+                                                'Proton-SDK-Sync: sync state rebuilt; comparing everything afresh.',
+                                            );
+                                        },
+                                    }).open(),
+                                ),
                         );
                     },
                 },

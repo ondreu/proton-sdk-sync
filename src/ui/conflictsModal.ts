@@ -5,7 +5,10 @@ import type { ConflictRecord } from '../sync/conflictHistory';
 import { isTextPath } from '../sync/media';
 import type { ConflictInfo, ConflictReason } from '../sync/types';
 import { compareWithConflictCopy, compareWithDrive } from './compare';
+import { confirmOneSided, resolveKeepingLosingVersion, type OneSidedChoice } from './conflictDecision';
+import { ConfirmModal } from './confirmModal';
 import { outcomeText, REASON_TEXT } from './conflictText';
+import { openVaultFile } from './openFile';
 import { getRuntime } from '../runtime';
 
 const PENDING_REASON_TEXT: Record<ConflictReason, string> = {
@@ -84,23 +87,54 @@ export class ConflictsModal extends Modal {
                 button
                     .setButtonText('Keep both')
                     .setCta()
-                    .onClick(() => void this.resolve(entry.path, 'keep-both')),
+                    .onClick(async () => {
+                        try {
+                            await this.settle(entry.path, 'keep-both');
+                        } catch (error) {
+                            new Notice(
+                                `Could not resolve "${entry.path}": ` +
+                                    `${error instanceof Error ? error.message : String(error)}`,
+                            );
+                        }
+                    }),
             )
             .addButton((button) =>
-                button.setButtonText('Keep this device').onClick(() => void this.resolve(entry.path, 'prefer-local')),
+                button
+                    .setButtonText('Keep this device')
+                    .setTooltip('Keeps this version, and the one on Drive beside it')
+                    .onClick(() => this.confirm(entry.path, 'prefer-local')),
             )
             .addButton((button) =>
-                button.setButtonText('Keep Drive').onClick(() => void this.resolve(entry.path, 'prefer-remote')),
+                button
+                    .setButtonText('Keep Drive')
+                    .setTooltip('Keeps the Drive version, and this device’s beside it')
+                    .onClick(() => this.confirm(entry.path, 'prefer-remote')),
             );
     }
 
-    /** Apply one decision, to this file only; see `SyncEngine.resolveConflict`. */
-    private async resolve(path: string, policy: 'keep-both' | 'prefer-local' | 'prefer-remote'): Promise<void> {
+    /** Ask before dropping a version, since a click here writes; see {@link confirmOneSided}. */
+    private confirm(path: string, choice: OneSidedChoice): void {
+        new ConfirmModal(this.app, {
+            ...confirmOneSided(path, choice),
+            run: () => this.settle(path, choice),
+        }).open();
+    }
+
+    /**
+     * Apply one decision, to this file only; see `SyncEngine.resolveConflict`.
+     *
+     * A one-sided choice goes through {@link resolveKeepingLosingVersion}, so
+     * the version it drops is always kept, whatever the copies setting says.
+     * A failure is thrown, for the confirmation to report and stay open on.
+     */
+    private async settle(path: string, policy: 'keep-both' | OneSidedChoice): Promise<void> {
         try {
-            await getRuntime().engine.resolveConflict(path, policy);
+            if (policy === 'keep-both') {
+                await getRuntime().engine.resolveConflict(path, policy);
+            } else {
+                await resolveKeepingLosingVersion(getRuntime().engine, this.plugin.settings, path, policy);
+            }
             new Notice(`Resolved "${path}".`);
-        } catch (error) {
-            new Notice(`Could not resolve "${path}": ${error instanceof Error ? error.message : String(error)}`);
         } finally {
             this.render();
         }
@@ -143,7 +177,7 @@ export class ConflictsModal extends Modal {
     }
 
     private renderRecord(container: HTMLElement, record: ConflictRecord): void {
-        const { vault, workspace } = this.app;
+        const { vault } = this.app;
         const copyExists = record.copyPath !== undefined && vault.getFileByPath(record.copyPath) !== null;
 
         let description = `${new Date(record.time).toLocaleString()} · ${capitalise(REASON_TEXT[record.reason])}; ${outcomeText(record)}.`;
@@ -158,7 +192,13 @@ export class ConflictsModal extends Modal {
             setting.addButton((button) =>
                 button.setButtonText('Open').onClick(() => {
                     this.close();
-                    void workspace.openLinkText(record.path, '', false);
+                    // A path, not a link: a missing file must not be created,
+                    // and a name with `#` or `^` in it must open itself.
+                    void openVaultFile(this.app, record.path).then((opened) => {
+                        if (!opened) {
+                            new Notice(`"${record.path}" is not in the vault any more.`);
+                        }
+                    });
                 }),
             );
         }
