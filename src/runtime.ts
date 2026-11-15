@@ -1,11 +1,11 @@
 /**
  * The plugin's live state, kept out of the plugin instance on purpose.
  *
- * `app.plugins.plugins["proton-sdk-sync"]` is reachable from every other
- * plugin in the vault, and anything hanging off it — the session, its tokens,
- * the authenticated Drive client, the log buffer with note names — is one
- * property lookup away. Keeping these in module scope means the only way in is
- * through the plugin's narrow methods, none of which hand back credentials.
+ * `app.plugins.plugins["proton-sdk-sync"]` is reachable from every other plugin
+ * in the vault, and anything hanging off it — the session, its tokens, the
+ * authenticated Drive client — would be one property lookup away. Keeping them
+ * in module scope means the only way in is through the plugin's own methods,
+ * none of which hand back credentials.
  *
  * SECURITY.md records what this closes and what it cannot: another plugin in
  * the same process can still read the vault and the network stack.
