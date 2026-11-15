@@ -43,6 +43,15 @@ describe('diffLines', () => {
         const big = (seed: string) => Array.from({ length: 6000 }, (_, i) => `${seed}${i}`).join('\n');
         assert.deepEqual(diffLines(big('a'), big('b')), { ok: false, reason: 'too-large' });
     });
+
+    it('diffs a long note with scattered edits instead of declining it', () => {
+        const base = Array.from({ length: 20000 }, (_, i) => `line ${i}`);
+        const edited = base.map((line, i) => (i % 1000 === 7 ? `${line} (edited)` : line));
+        const result = diffLines(base.join('\n'), edited.join('\n'));
+        assert.ok(result.ok, `expected a diff, got ${JSON.stringify(result)}`);
+        assert.equal(result.added, 20);
+        assert.equal(result.removed, 20);
+    });
 });
 
 describe('toSegments', () => {

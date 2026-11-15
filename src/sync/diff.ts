@@ -1,13 +1,14 @@
-import { longestCommonSubsequence, MAX_DIFF_LINES, splitLines } from './merge';
+import { matchLines, splitLines } from './merge';
 
 /**
  * Line diff for showing two versions of a note side by side in one column,
  * the way a code review shows a change: lines only in the old version marked
  * `-`, lines only in the new one marked `+`, the rest as context.
  *
- * Built on the same longest-common-subsequence as the three-way merge, and
- * bounded the same way, so a pathological pair of files is declined rather
- * than freezing the app.
+ * Built on the same longest-common-subsequence as the three-way merge, with
+ * the same fallback to the linear-space walk for large inputs, so a long note
+ * is diffed rather than freezing the app, and a pathological pair of files is
+ * declined instead of crawling.
  */
 
 export type DiffLine =
@@ -41,7 +42,8 @@ export function diffLines(oldText: string, newText: string): DiffResult {
 
     const aMiddle = a.slice(prefix, a.length - suffix);
     const bMiddle = b.slice(prefix, b.length - suffix);
-    if (aMiddle.length > MAX_DIFF_LINES || bMiddle.length > MAX_DIFF_LINES) {
+    const matches = matchLines(aMiddle, bMiddle);
+    if (matches === null) {
         return { ok: false, reason: 'too-large' };
     }
 
@@ -68,7 +70,7 @@ export function diffLines(oldText: string, newText: string): DiffResult {
             added++;
         }
     };
-    for (const [matchI, matchJ] of longestCommonSubsequence(aMiddle, bMiddle)) {
+    for (const [matchI, matchJ] of matches) {
         flushGap(matchI, matchJ);
         context(prefix + i, prefix + j);
         i++;

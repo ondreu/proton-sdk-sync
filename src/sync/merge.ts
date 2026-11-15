@@ -13,13 +13,27 @@
  * that overlap at the word level as well are refused.
  *
  * Deliberately conservative: adjacent edits are treated as overlapping rather
- * than interleaved, and anything too large to diff cheaply is declined. A
- * refused merge costs the user a conflict file; a wrong merge costs them text
- * they never agreed to.
+ * than interleaved, and anything too expensive to diff is declined. A refused
+ * merge costs the user a conflict file; a wrong merge costs them text they
+ * never agreed to.
  */
 
-/** Above this many differing lines, decline rather than run an O(n·m) diff. */
-export const MAX_DIFF_LINES = 5000;
+/**
+ * Above this many lines on either side, the diff stops building the LCS table:
+ * that table holds one entry per pair, which is 100 MB of `Uint32Array` by
+ * 5000 lines, and it is filled synchronously on the thread that renders the
+ * app. The linear-space Myers walk below costs more per line but keeps only a
+ * pair of arrays the length of the input, so the size of a note stops
+ * mattering.
+ */
+export const LCS_TABLE_MAX = 2000;
+
+/**
+ * The most edits a diff may contain before it is declined. Myers costs
+ * O(n·d) in time, so two copies of a note with nothing in common are not worth
+ * the wait, and the caller keeps both files instead.
+ */
+export const MAX_EDIT_DISTANCE = 2000;
 
 export type MergeResult =
     | { merged: true; text: string }
@@ -81,28 +95,26 @@ function mergeUnits(
         // both sides and passes through verbatim.
         output.push(...base.slice(baseCursor, span.baseStart));
 
-        const baseSlice = base.slice(span.baseStart, span.baseEnd);
-        const localSlice = local.slice(
-            project(localRegions, span.baseStart, 'start'),
-            project(localRegions, span.baseEnd, 'end'),
-        );
-        const remoteSlice = remote.slice(
-            project(remoteRegions, span.baseStart, 'start'),
-            project(remoteRegions, span.baseEnd, 'end'),
-        );
+        const baseContent = base.slice(span.baseStart, span.baseEnd);
+        const localContent = sideContent(base, local, span.local, span);
+        const remoteContent = sideContent(base, remote, span.remote, span);
 
-        if (!span.touchedByLocal) {
-            output.push(...remoteSlice);
-        } else if (!span.touchedByRemote) {
-            output.push(...localSlice);
-        } else if (sameLines(localSlice, remoteSlice)) {
-            output.push(...localSlice);
-        } else if (sameLines(localSlice, baseSlice)) {
-            output.push(...remoteSlice);
-        } else if (sameLines(remoteSlice, baseSlice)) {
-            output.push(...localSlice);
+        if (span.local.length === 0) {
+            output.push(...remoteContent);
+        } else if (span.remote.length === 0) {
+            output.push(...localContent);
+        } else if (sameLines(localContent, remoteContent)) {
+            output.push(...localContent);
+        } else if (sameLines(localContent, baseContent)) {
+            output.push(...remoteContent);
+        } else if (sameLines(remoteContent, baseContent)) {
+            output.push(...localContent);
+        } else if (widened(localContent, remoteContent)) {
+            output.push(...remoteContent);
+        } else if (widened(remoteContent, localContent)) {
+            output.push(...localContent);
         } else {
-            const merged = onOverlap?.(baseSlice, localSlice, remoteSlice) ?? null;
+            const merged = onOverlap?.(baseContent, localContent, remoteContent) ?? null;
             if (merged === null) {
                 return { refused: 'overlapping-edits' };
             }
@@ -116,17 +128,27 @@ function mergeUnits(
     return { units: output };
 }
 
-type Span = { baseStart: number; baseEnd: number; touchedByLocal: boolean; touchedByRemote: boolean };
+type Span = {
+    baseStart: number;
+    baseEnd: number;
+    /** The local side's change regions inside the span, in base order. */
+    local: Region[];
+    /** The remote side's change regions inside the span, likewise. */
+    remote: Region[];
+};
 
 /**
  * Collapse both sides' change regions into a single ordered set of spans over
- * the base, recording which sides touched each.
+ * the base, keeping the regions each span was built from.
  *
  * Regions that merely touch — one ending exactly where the other begins — stay
  * separate, because base order already says which comes first. The one case
  * with no such answer is two insertions at the very same point, where either
  * ordering is a guess; those are merged so they surface as a conflict rather
- * than as a silently chosen interleaving.
+ * than as a silently chosen interleaving. An insertion at the point where the
+ * other side's region begins joins that region: it sits before the replaced
+ * base lines and belongs with them, and leaving it in a span of its own is what
+ * once made the two sides read the same inserted line into both spans.
  */
 function mergeSpans(localRegions: Region[], remoteRegions: Region[]): Span[] {
     const tagged = [
@@ -139,15 +161,14 @@ function mergeSpans(localRegions: Region[], remoteRegions: Region[]): Span[] {
         const current = spans[spans.length - 1];
         if (current && overlaps(region, current)) {
             current.baseEnd = Math.max(current.baseEnd, region.baseEnd);
-            current.touchedByLocal ||= fromLocal;
-            current.touchedByRemote ||= !fromLocal;
+            (fromLocal ? current.local : current.remote).push(region);
             continue;
         }
         spans.push({
             baseStart: region.baseStart,
             baseEnd: region.baseEnd,
-            touchedByLocal: fromLocal,
-            touchedByRemote: !fromLocal,
+            local: fromLocal ? [region] : [],
+            remote: fromLocal ? [] : [region],
         });
     }
     return spans;
@@ -164,34 +185,51 @@ function overlaps(region: Region, span: Span): boolean {
 }
 
 /**
- * Translate a base line index into the corresponding index on one side, by
- * accumulating how much every earlier change region grew or shrank it.
+ * One side's content for a span: the content of its own change regions there,
+ * with the base lines it left alone in between.
  *
- * The edge matters for insertions, which occupy no base lines: a region
- * inserted exactly at `baseIndex` sits after a span that starts there and
- * before the end of a span that finishes there. Getting this wrong silently
- * drops appended text, since the projected slice collapses to nothing.
- *
- * Span boundaries never fall strictly inside a region, because `mergeSpans`
- * merges anything that overlaps or touches.
+ * Composing the slice from the regions, rather than projecting base indexes
+ * through both sides' shifts as this once did, is what keeps a line inserted at
+ * a span boundary in exactly one span. The projection had to guess which side
+ * of the boundary an insertion fell on, and the guess that put it in two spans
+ * duplicated the line in the merged note.
  */
-function project(regions: Region[], baseIndex: number, edge: 'start' | 'end'): number {
-    let shift = 0;
+function sideContent(base: string[], other: string[], regions: Region[], span: Span): string[] {
+    const content: string[] = [];
+    let baseCursor = span.baseStart;
     for (const region of regions) {
-        if (region.baseEnd > baseIndex) {
-            break;
+        if (region.baseStart > baseCursor) {
+            content.push(...base.slice(baseCursor, region.baseStart));
         }
-        if (edge === 'start' && region.baseStart === baseIndex) {
-            continue;
-        }
-        shift += region.otherEnd - region.otherStart - (region.baseEnd - region.baseStart);
+        content.push(...other.slice(region.otherStart, region.otherEnd));
+        baseCursor = Math.max(baseCursor, region.baseEnd);
     }
-    return baseIndex + shift;
+    if (baseCursor < span.baseEnd) {
+        content.push(...base.slice(baseCursor, span.baseEnd));
+    }
+    return content;
+}
+
+/**
+ * Whether `wide` is `narrow` with lines added at one end, which is an insertion
+ * that landed on the boundary of the same change rather than a disagreement
+ * about it. The wider side keeps every line either side wrote, so taking it
+ * loses nothing; refusing would hand the user a conflict over an addition.
+ * A deletion is never widened past: an empty slice is a decision, not a prefix.
+ */
+function widened(narrow: string[], wide: string[]): boolean {
+    if (narrow.length === 0 || wide.length <= narrow.length) {
+        return false;
+    }
+    return (
+        sameLines(wide.slice(0, narrow.length), narrow) ||
+        sameLines(wide.slice(wide.length - narrow.length), narrow)
+    );
 }
 
 /**
  * The stretches of `base` that `other` replaced, derived from their longest
- * common subsequence. Returns null when the differing portion is too large to
+ * common subsequence. Returns null when the two have too little in common to
  * diff without a noticeable stall.
  */
 function diffRegions(base: string[], other: string[]): Region[] | null {
@@ -215,11 +253,11 @@ function diffRegions(base: string[], other: string[]): Region[] | null {
     if (baseMiddle.length === 0 && otherMiddle.length === 0) {
         return [];
     }
-    if (baseMiddle.length > MAX_DIFF_LINES || otherMiddle.length > MAX_DIFF_LINES) {
+
+    const matches = matchLines(baseMiddle, otherMiddle);
+    if (matches === null) {
         return null;
     }
-
-    const matches = longestCommonSubsequence(baseMiddle, otherMiddle);
 
     const regions: Region[] = [];
     let baseCursor = 0;
@@ -245,6 +283,18 @@ function diffRegions(base: string[], other: string[]): Region[] | null {
         });
     }
     return regions;
+}
+
+/**
+ * Matched index pairs between two line arrays, ascending, or null when their
+ * differences are too extensive to be worth diffing. Small inputs take the LCS
+ * table; anything larger takes the linear-space walk below.
+ */
+export function matchLines(a: string[], b: string[]): [number, number][] | null {
+    if (a.length <= LCS_TABLE_MAX && b.length <= LCS_TABLE_MAX) {
+        return longestCommonSubsequence(a, b);
+    }
+    return myersMatches(a, b, MAX_EDIT_DISTANCE);
 }
 
 /** Matched index pairs, ascending. Standard quadratic LCS, bounded by the caller. */
@@ -276,6 +326,145 @@ export function longestCommonSubsequence(a: string[], b: string[]): [number, num
         }
     }
     return pairs;
+}
+
+/**
+ * Matched index pairs found with Myers' diff, in space linear in the input.
+ *
+ * It splits the problem at a middle snake and works on the two halves, so it
+ * never holds the whole edit graph the way the LCS table does. The work is
+ * O(n·d) in the edit distance, so `limit` caps the total and null means the
+ * diff was declined rather than slowed to a crawl.
+ */
+function myersMatches(a: string[], b: string[], limit: number): [number, number][] | null {
+    const pairs: [number, number][] = [];
+    // An explicit stack, not recursion: a diff of a large note can split many
+    // times, and the call stack here belongs to the app.
+    const pending: Array<{ aLo: number; aHi: number; bLo: number; bHi: number }> = [
+        { aLo: 0, aHi: a.length, bLo: 0, bHi: b.length },
+    ];
+    let budget = limit;
+
+    if (Math.abs(a.length - b.length) > budget) {
+        // Every edit changes the length by at most one line, so this pair can
+        // never come in under the limit.
+        return null;
+    }
+
+    while (pending.length > 0) {
+        let { aLo, aHi, bLo, bHi } = pending.pop()!;
+
+        // Lines in common at the ends of this range are matches whatever the
+        // diff decides in the middle, and taking them first is what makes a
+        // note with a handful of edits cheap to diff.
+        while (aLo < aHi && bLo < bHi && a[aLo] === b[bLo]) {
+            pairs.push([aLo++, bLo++]);
+        }
+        while (aHi > aLo && bHi > bLo && a[aHi - 1] === b[bHi - 1]) {
+            pairs.push([--aHi, --bHi]);
+        }
+        if (aLo === aHi || bLo === bHi) {
+            continue;
+        }
+
+        const split = middleSnake(a, aLo, aHi, b, bLo, bHi, budget);
+        if (split === 'expensive') {
+            return null;
+        }
+        if (split === 'none') {
+            // Nothing in common in this range: one side replaced all of it.
+            continue;
+        }
+        budget -= split.distance;
+        if (budget < 0) {
+            return null;
+        }
+        // A split at either end would leave one half the size of the whole
+        // range, so there is no smaller problem to hand on.
+        if ((split.a === aLo && split.b === bLo) || (split.a === aHi && split.b === bHi)) {
+            continue;
+        }
+        pending.push({ aLo: split.a, aHi, bLo: split.b, bHi });
+        pending.push({ aLo, aHi: split.a, bLo, bHi: split.b });
+    }
+
+    pairs.sort((p, q) => p[0] - q[0]);
+    return pairs;
+}
+
+/**
+ * A point on an optimal edit path through `a[aLo..aHi)` and `b[bLo..bHi)`, the
+ * edit distance it was found at, `'none'` when the ranges have no line in
+ * common, or `'expensive'` when finding out would cost more than `limit`.
+ *
+ * Myers' refinement: walk forward from the start and backward from the end at
+ * the same time and stop where they meet. The meeting point splits the problem
+ * into two halves that do not depend on each other, which is what lets
+ * {@link myersMatches} run in space linear in the number of lines.
+ */
+function middleSnake(
+    a: string[],
+    aLo: number,
+    aHi: number,
+    b: string[],
+    bLo: number,
+    bHi: number,
+    limit: number,
+): { a: number; b: number; distance: number } | 'none' | 'expensive' {
+    const n = aHi - aLo;
+    const m = bHi - bLo;
+    const delta = n - m;
+    if (Math.abs(delta) > limit) {
+        return 'expensive';
+    }
+    const odd = (delta & 1) !== 0;
+    const max = Math.ceil((n + m) / 2);
+    // The walk never goes past `limit` rounds, so that is as far as the
+    // diagonal arrays have to reach however long the two sides are.
+    const reach = Math.min(max, limit);
+    // `k` runs from -reach to reach, so the arrays are indexed with an offset.
+    const offset = reach + 1;
+    const size = 2 * reach + 3;
+    const forward = new Int32Array(size).fill(-1);
+    const backward = new Int32Array(size).fill(-1);
+    forward[offset + 1] = 0;
+    backward[offset + 1] = 0;
+
+    for (let d = 0; d <= reach; d++) {
+        for (let k = -d; k <= d; k += 2) {
+            const at = offset + k;
+            let x = k === -d || (k !== d && forward[at - 1] < forward[at + 1]) ? forward[at + 1] : forward[at - 1] + 1;
+            let y = x - k;
+            while (x < n && y < m && a[aLo + x] === b[bLo + y]) {
+                x++;
+                y++;
+            }
+            forward[at] = x;
+            // The two walks only meet on the same diagonal when the total
+            // distance is odd for the forward one and even for the backward.
+            const back = delta - k;
+            if (odd && back >= 1 - d && back <= d - 1 && x + backward[offset + back] >= n) {
+                return { a: aLo + x, b: bLo + y, distance: d };
+            }
+        }
+        for (let k = -d; k <= d; k += 2) {
+            const at = offset + k;
+            let x = k === -d || (k !== d && backward[at - 1] < backward[at + 1]) ? backward[at + 1] : backward[at - 1] + 1;
+            let y = x - k;
+            while (x < n && y < m && a[aHi - 1 - x] === b[bHi - 1 - y]) {
+                x++;
+                y++;
+            }
+            backward[at] = x;
+            const ahead = delta - k;
+            if (!odd && ahead >= -d && ahead <= d && x + forward[offset + ahead] >= n) {
+                return { a: aHi - x, b: bHi - y, distance: d };
+            }
+        }
+    }
+    // The walk ran out of rounds before the paths met, which means the edit
+    // distance is larger than the caller can afford.
+    return limit < max ? 'expensive' : 'none';
 }
 
 function sameLines(a: string[], b: string[]): boolean {

@@ -146,8 +146,8 @@ export class ConflictResolver {
             return null;
         }
 
-        let baseText: string;
-        let remoteText: string;
+        let baseText: string | null;
+        let remoteText: string | null;
         let localText: string;
         try {
             const [baseBytes, remoteBytes] = await Promise.all([
@@ -161,6 +161,14 @@ export class ConflictResolver {
             localText = await context.readLocalText();
         } catch (error) {
             this.logger.info(`Could not fetch the common ancestor of "${path}" to merge it`, error);
+            return null;
+        }
+
+        if (baseText === null || remoteText === null) {
+            // A note saved in a legacy encoding has no replacement character in
+            // the file: decoding it with the errors smoothed over would merge
+            // U+FFFD into the text and write that back. Both copies stay.
+            this.logger.info(`Could not merge "${path}": it is not UTF-8 text; keeping both versions`);
             return null;
         }
 
@@ -200,6 +208,17 @@ function isMergeable(path: string, local: LocalState | undefined, remote: Remote
     return isTextPath(path) && (local?.size ?? 0) <= MAX_MERGE_BYTES && (remote.size ?? 0) <= MAX_MERGE_BYTES;
 }
 
-function decodeUtf8(data: ArrayBuffer): string {
-    return new TextDecoder('utf-8', { fatal: false }).decode(data);
+/**
+ * `data` as text, or null when it is not valid UTF-8.
+ *
+ * The bytes are taken at their word rather than with the errors replaced: a
+ * file saved in cp1252 or Latin-2 would otherwise come back full of U+FFFD,
+ * which a merge cannot tell apart from text the user wrote.
+ */
+function decodeUtf8(data: ArrayBuffer): string | null {
+    try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(data);
+    } catch {
+        return null;
+    }
 }
