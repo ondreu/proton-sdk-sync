@@ -4,7 +4,7 @@ import type ProtonDriveSyncPlugin from '../main';
 import { MIN_POLL_SECONDS } from '../settings';
 import { checkExcludePatterns } from '../sync/paths';
 import type { ConflictPolicy } from '../sync/types';
-import type { LogLevel } from '../util/logger';
+import { setLogShowsNames, type LogLevel } from '../util/logger';
 import { ConflictsModal } from './conflictsModal';
 import { ConfirmModal } from './confirmModal';
 import { FolderPickerModal } from './folderPickerModal';
@@ -102,6 +102,15 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     override async setControlValue(key: string, value: unknown): Promise<void> {
         if (key === 'uploadDebounceMs') {
             value = Math.round(Number(value) * 1000);
+        }
+        if (key === 'logShowsNames') {
+            const shows = Boolean(value);
+            this.plugin.settings.logShowsNames = shows;
+            // Applies to the logger already handed out, not only to the next
+            // start.
+            setLogShowsNames(shows);
+            await this.plugin.saveSettings();
+            return;
         }
         if (key === 'pinLockAfterMinutes') {
             this.plugin.settings.pinLockAfterMinutes = Number(value);
@@ -528,7 +537,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                 {
                     name: 'Simultaneous transfers',
                     desc:
-                        'At most this many uploads and downloads at once. The plugin starts at two, goes up while ' +
+                        'At most this many uploads and downloads at once. The plugin starts at three, goes up while ' +
                         'Proton keeps up, and slows down on its own the moment Proton asks it to.',
                     aliases: ['concurrency'],
                     control: { type: 'slider', key: 'transferConcurrency', min: 1, max: 8, step: 1 },
@@ -623,6 +632,13 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             type: 'group',
             heading: 'Recent activity',
             items: [
+                {
+                    name: 'Log note names',
+                    desc:
+                        'Write real file and folder names into the log. Off by default, because the log is ' +
+                        'copied into bug reports; with it off, names are replaced by a placeholder.',
+                    control: { type: 'toggle', key: 'logShowsNames' },
+                },
                 {
                     name: 'Sync log',
                     desc: 'The last 50 entries, newest at the bottom.',

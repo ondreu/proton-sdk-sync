@@ -93,13 +93,6 @@ export type PluginSettings = {
 };
 
 /**
- * Files that should never leave the device, regardless of user configuration.
- *
- * Editor scratch files and OS droppings. The config-folder exclusions depend
- * on where the vault keeps its config, so they are built by
- * {@link configExclusions}.
- */
-/**
  * The folder at the root of the synced Drive folder where each device keeps
  * a note of itself for the vault's device list, and where the others leave
  * it requests; see `DeviceRegistry`. It is the plugin's, not the vault's, so
@@ -108,6 +101,13 @@ export type PluginSettings = {
  */
 export const DEVICES_FOLDER = '.proton-drive-sync';
 
+/**
+ * Files that should never leave the device, regardless of user configuration.
+ *
+ * Editor scratch files and OS droppings. The config-folder exclusions depend
+ * on where the vault keeps its config, so they are built by
+ * {@link configExclusions}.
+ */
 export const ALWAYS_EXCLUDED = [
     `${DEVICES_FOLDER}/`,
     '.trash/**',

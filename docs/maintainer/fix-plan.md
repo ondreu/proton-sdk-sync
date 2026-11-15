@@ -1,5 +1,9 @@
 # Fix plan for 1.0.0
 
+> **Status: done.** Every item below was implemented and tested before 1.0.0;
+> `CHANGELOG.md` lists the user-visible result. The file is kept as the record
+> of what was known to be wrong in 0.11.5 and why each change was made.
+
 Source: issue #40 (external review of 0.11.5), issue #41 (Android sign-in), and
 the audit notes kept outside the repo. Line numbers refer to 0.11.5 and are
 only a hint: find the code by name.

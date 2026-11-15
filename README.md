@@ -143,8 +143,11 @@ choice and the sync state, because both belong to the account you left.
 - **Telemetry:** none. The SDK's telemetry interface is wired to the local log
   and the metrics are dropped; nothing about your files or your usage leaves the
   device except the Drive requests themselves.
-- **Files outside the vault:** none. Everything the plugin writes goes into the
-  vault, apart from the OS keyring entry used by `safeStorage`.
+- **Files outside the vault:** none of yours. Besides its own folder in the
+  vault, the plugin uses Obsidian's secret storage (the session on mobile), a
+  few per-vault keys in Obsidian's localStorage, the OS keyring entry that
+  `safeStorage` needs, and an IndexedDB cache of Drive metadata. All of it stays
+  on the device.
 - **Ads:** none, and no paid tiers.
 
 ## How it works, briefly

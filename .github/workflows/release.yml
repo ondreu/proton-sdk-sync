@@ -41,6 +41,21 @@ jobs:
             echo "::error::Tag '$TAG' is not a bare semver version like 1.2.3. Obsidian matches the release tag against manifest.json's version exactly, so a 'v' prefix or any other form would publish a release it cannot find."
             exit 1
           fi
+          # The repository still carries the upstream 0.x tags. Pushing them
+          # would stamp manifest.json back down and move the release with it.
+          node -e '
+            const fs = require("fs");
+            const parse = (value) => value.split(".").map(Number);
+            const tag = parse(process.argv[1]);
+            const current = parse(JSON.parse(fs.readFileSync("manifest.json", "utf8")).version);
+            const older = tag[0] < current[0] ||
+              (tag[0] === current[0] && (tag[1] < current[1] ||
+                (tag[1] === current[1] && tag[2] < current[2])));
+            if (older) {
+              console.error(`::error::Tag ${process.argv[1]} is older than manifest.json (${current.join(".")}); refusing to publish a downgrade.`);
+              process.exit(1);
+            }
+          ' "$TAG"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4.4.0
@@ -73,6 +88,9 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Lint
+        run: npm run lint
 
       # esbuild bakes the manifest version into the bundle, so this comes after
       # the stamp.
@@ -112,6 +130,7 @@ jobs:
         with:
           subject-path: |
             main.js
+            manifest.json
             styles.css
 
       - name: Extract changelog notes for this version

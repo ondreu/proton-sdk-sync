@@ -48,23 +48,37 @@ export class UnlockModal extends Modal {
         const error = contentEl.createEl('p', { cls: 'proton-sdk-sync-pin-error' });
         let unlockButton!: HTMLButtonElement;
 
+        let checking = false;
         const submit = async () => {
-            const wait = await this.options.waitSeconds();
-            if (wait > 0) {
-                error.setText(`Too many wrong PINs. Try again in ${wait} seconds.`);
+            // Disabled before the first await: a second Enter while the
+            // envelope is being asked would otherwise count as a second guess.
+            if (checking) {
                 return;
             }
+            checking = true;
             unlockButton.disabled = true;
-            error.setText('Checking…');
-            const ok = await this.options.verify(input.getValue());
-            unlockButton.disabled = false;
-            if (ok) {
-                this.finish('unlocked');
-                return;
+            try {
+                const wait = await this.options.waitSeconds();
+                if (wait > 0) {
+                    error.setText(`Too many wrong PINs. Try again in ${wait} seconds.`);
+                    return;
+                }
+                error.setText('Checking…');
+                const ok = await this.options.verify(input.getValue());
+                if (ok) {
+                    this.finish('unlocked');
+                    return;
+                }
+                input.setValue('');
+                const next = await this.options.waitSeconds();
+                error.setText(next > 0 ? `Wrong PIN. Try again in ${next} seconds.` : 'Wrong PIN.');
+            } catch (failure) {
+                error.setText('Could not check the PIN. Try again.');
+                console.error('Proton-SDK-Sync: the PIN could not be checked', failure);
+            } finally {
+                checking = false;
+                unlockButton.disabled = false;
             }
-            input.setValue('');
-            const next = await this.options.waitSeconds();
-            error.setText(next > 0 ? `Wrong PIN. Try again in ${next} seconds.` : 'Wrong PIN.');
         };
 
         const field = new Setting(contentEl).setName('PIN').addText((text) => {

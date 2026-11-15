@@ -145,6 +145,8 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     private settingsTab: ProtonDriveSyncSettingsTab | null = null;
     /** What the settings tab last rendered from; see {@link refreshSettingsTab}. */
     private settingsTabKey = '';
+    /** A rebuild was skipped because the user was typing; see {@link refreshSettingsTab}. */
+    private settingsTabDirty = false;
     /** This device's place in the vault's device list; see {@link DeviceList}. */
     /** This installation's id: the SDK's client id, and the device's id on the device list. */
     /** The device list is off because the vault is shared with other people; see {@link openDeviceList}. */
@@ -257,8 +259,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // nobody is signed out and the old, readable copy goes away.
         await migrateSecret(legacySession, sessionInner);
         await migrateSecret(legacyUnlock, unlockInner);
-        await migrateSecret(legacySession, secretSession);
-        await migrateSecret(legacyUnlock, secretUnlock);
         runtime.sessionSlot = new PinProtectedSlot(sessionInner);
         this.rememberedUnlock = new RememberedUnlock(unlockInner);
         const credentials = new Credentials(
@@ -271,18 +271,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             protonLogger,
         );
         runtime.session = new ProtonSession(credentials, clientUid, protonLogger, () => runtime.state.cursorsFingerprint());
-        // A real end of session — the refresh token is gone, not merely a
-        // timeout — stops the engine. Otherwise it keeps trying with a client
-        // that can no longer authenticate, and the status bar says "idle" while
-        // nothing syncs.
-        runtime.session.setSessionEndedHandler(() => {
-            void runtime.engine.stop();
-            this.showStatus({ ...runtime.engine.getSummary(), status: 'signed-out' });
-            new Notice(
-                'Proton-SDK-Sync: the Proton session ended. Sign in again in the plugin settings.',
-                15000,
-            );
-        });
         // The metadata cache keeps only nodes the vault syncs; see
         // persistentCache.nodeScope.
         runtime.session.setNodeSource(() => this.cacheScopeNodes());
@@ -324,6 +312,18 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 openEditor: (path) => this.openEditor(path),
             },
         );
+        // A real end of session — the refresh token is gone, not merely a
+        // timeout — stops the engine. Otherwise it keeps trying with a client
+        // that can no longer authenticate, and the status bar says "idle" while
+        // nothing syncs.
+        runtime.session.setSessionEndedHandler(() => {
+            void runtime.engine.stop();
+            this.showStatus({ ...runtime.engine.getSummary(), status: 'signed-out' });
+            new Notice(
+                'Proton-SDK-Sync: the Proton session ended. Sign in again in the plugin settings.',
+                15000,
+            );
+        });
 
         runtime.devices = new DeviceList(
             {
@@ -334,7 +334,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     pluginVersion: this.manifest.version,
                     account: runtime.session.accountEmail ?? null,
                 }),
-                handled: () => Number(this.app.loadLocalStorage(HANDLED_REQUEST_KEY)) || 0,
+                handled: () => this.handledRequestAt(),
                 setHandled: (at) => this.app.saveLocalStorage(HANDLED_REQUEST_KEY, at),
             },
             runtime.logger.getLogger('devices'),
@@ -345,6 +345,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.summary = { ...runtime.engine.getSummary(), status: 'connecting' };
         this.settingsTab = new ProtonDriveSyncSettingsTab(this.app, this);
         this.addSettingTab(this.settingsTab);
+        this.settingsTab.containerEl.addEventListener('focusout', () => {
+            // After the focus has landed somewhere else, not before.
+            window.setTimeout(() => {
+                if (!this.settingsTabDirty || this.settingsTab?.containerEl.contains(document.activeElement)) {
+                    return;
+                }
+                this.settingsTabDirty = false;
+                this.settingsTab?.update();
+            }, 0);
+        });
         this.registerCommands();
         this.registerVaultEvents();
         this.registerLifecycleEvents();
@@ -365,16 +375,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         if (this.conflictNoticeTimer !== null) {
             window.clearTimeout(this.conflictNoticeTimer);
         }
-        // Obsidian does not wait for unload, so the ordering is kept here: the
-        // pass in flight is awaited before the state is closed, and nothing of
-        // this instance writes after that. `stop` bumps the generation and
-        // aborts synchronously, so nothing of it lands in the meantime either.
-        void (async () => {
-            await runtime.engine.stop();
-            // Whatever a stale pass left in memory, it must not reach the file
-            // the next instance reads.
-            runtime.state.close();
-        })();
+        // Close the state first: stop() flushes it, and on a reload the next
+        // instance has often loaded and written that same file already, so a
+        // late flush from this one would put an older snapshot on disk. Closing
+        // here makes that flush a no-op; it costs the last second of records,
+        // which the next pass derives again.
+        runtime.state.close();
+        // Obsidian does not wait for unload, so the pass in flight is aborted
+        // and then awaited here. `stop` bumps the generation and aborts
+        // synchronously, so nothing of this instance lands in the meantime.
+        void runtime.engine.stop();
         runtime.devices.open(null);
         void this.rememberUnlock();
     }
@@ -585,10 +595,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
         this.locked = true;
         runtime.logger.info(`Locked after ${this.settings.pinLockAfterMinutes} minute(s) away`);
-        await runtime.engine.stop();
+        // The keys go first: stop() waits for the pass to unwind, which can take
+        // a while, and a PIN that has expired should end access now rather than
+        // after the current download finishes.
         this.closeDeviceList();
         runtime.session.lock();
         runtime.sessionSlot.lock();
+        await runtime.engine.stop();
         await this.rememberedUnlock.clear();
         this.showStatus({ ...runtime.engine.getSummary(), status: 'locked' });
         await this.connect();
@@ -1093,7 +1106,12 @@ export default class ProtonDriveSyncPlugin extends Plugin {
 
     private async loadSettings(): Promise<void> {
         const stored = (await this.loadData()) as Partial<PluginSettings> | null;
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
+        // The id changed with the name, so Obsidian hands a fresh data.json
+        // even to someone who has used the previous plugin for months. Reading
+        // its settings once spares them choosing the folder, the exclusions and
+        // the PIN timing again.
+        const adopted = stored === null ? await this.adoptPreviousSettings() : null;
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? adopted);
 
         let changed = false;
         // Installations configured before the setup assistant existed have
@@ -1120,6 +1138,25 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
         if (changed) {
             await this.saveData(this.settings);
+        }
+    }
+
+    /**
+     * Settings left by the plugin this one replaces, read once.
+     *
+     * Best effort: a missing or unreadable file only means the defaults, and
+     * the logger does not exist yet at this point in the start, so a failure is
+     * deliberately quiet.
+     */
+    private async adoptPreviousSettings(): Promise<Partial<PluginSettings> | null> {
+        const path = `${this.app.vault.configDir}/plugins/proton-drive-sync/data.json`;
+        try {
+            if (!(await this.app.vault.adapter.exists(path))) {
+                return null;
+            }
+            return JSON.parse(await this.app.vault.adapter.read(path)) as Partial<PluginSettings>;
+        } catch {
+            return null;
         }
     }
 
@@ -1347,6 +1384,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             return;
         }
         this.settingsTabKey = key;
+        // A rebuild replaces the fields, so doing it while someone is typing in
+        // one of them (the exclude patterns, a size limit) drops the caret. Wait
+        // until the tab loses focus, then show what changed.
+        if (this.settingsTab.containerEl.contains(document.activeElement)) {
+            this.settingsTabDirty = true;
+            return;
+        }
         this.settingsTab.update();
     }
 
@@ -1491,7 +1535,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         );
     }
 
-    /** Reveal the sync panel, opening it in the right sidebar if it is not open yet. */
     /**
      * Ask about deletions a pass held back.
      *
@@ -1513,6 +1556,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
+    /** Reveal the sync panel, opening it in the right sidebar if it is not open yet. */
     async openPanel(): Promise<void> {
         const { workspace } = this.app;
         let leaf = workspace.getLeavesOfType(SYNC_PANEL_VIEW)[0];
@@ -1626,6 +1670,26 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         const id = crypto.randomUUID();
         this.app.saveLocalStorage(CLIENT_UID_KEY, id);
         return id;
+    }
+
+    /**
+     * The last device request acted on.
+     *
+     * The marker moved with the plugin id; seeding it from the old key stops
+     * the first start after the switch from re-applying a pause or resume that
+     * another device asked for weeks ago.
+     */
+    private handledRequestAt(): number {
+        const stored = Number(this.app.loadLocalStorage(HANDLED_REQUEST_KEY));
+        if (Number.isFinite(stored) && stored > 0) {
+            return stored;
+        }
+        const legacy = Number(this.app.loadLocalStorage('proton-drive-sync-device-request-handled'));
+        if (!Number.isFinite(legacy) || legacy <= 0) {
+            return 0;
+        }
+        this.app.saveLocalStorage(HANDLED_REQUEST_KEY, legacy);
+        return legacy;
     }
 
     private storedInstallationId(): string | null {

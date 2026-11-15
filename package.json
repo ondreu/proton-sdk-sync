@@ -10,7 +10,8 @@
         "build": "tsc --noEmit && node esbuild.config.mjs production",
         "check-types": "tsc --noEmit",
         "test": "node scripts/test.mjs",
-        "lint": "eslint --max-warnings 0"
+        "lint": "eslint --max-warnings 0",
+        "check:manifest": "node scripts/check-manifest.mjs"
     },
     "dependencies": {
         "@protontech/crypto": "^2.2.0",

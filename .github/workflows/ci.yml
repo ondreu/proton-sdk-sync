@@ -42,6 +42,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Check the manifest against the directory requirements
+        run: npm run check:manifest
+
   lint:
     name: Lint (Obsidian review rules)
     runs-on: ubuntu-latest
