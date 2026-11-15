@@ -149,11 +149,21 @@ export class Logger {
         return new Logger(this.minLevel, `${this.scope}:${scope}`, root);
     }
 
+    /**
+     * The level in force, read from the root every time.
+     *
+     * A child took a copy of the root's level when it was made, and the
+     * plugin hands out its children once, at load: the session's, the
+     * engine's, one per drive and per poll. Setting the level on the root
+     * alone left every one of them at the level they started with, so
+     * changing it in the settings did nothing for the lines that matter.
+     */
+    private get threshold(): LogLevel {
+        return (this.root ?? this).minLevel;
+    }
+
     setLevel(level: LogLevel): void {
-        this.minLevel = level;
-        if (this.root) {
-            this.root.setLevel(level);
-        }
+        (this.root ?? this).minLevel = level;
     }
 
     getEntries(): readonly LogEntry[] {
@@ -177,7 +187,7 @@ export class Logger {
     }
 
     private write(level: LogLevel, message: string, args: unknown[]): void {
-        if (LEVEL_ORDER[level] < LEVEL_ORDER[this.minLevel]) {
+        if (LEVEL_ORDER[level] < LEVEL_ORDER[this.threshold]) {
             return;
         }
 
