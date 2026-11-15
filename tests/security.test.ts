@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { before, describe, it } from 'node:test';
 
+import { CryptoProxy } from '@protontech/crypto';
+
+import { ApiClient, type SessionCredentials, type SessionInfo } from '../src/proton/account';
+import { HTTPError } from '../src/proton/account/http';
+import type { Credentials } from '../src/proton/credentials';
 import { assertProtonUrl } from '../src/proton/endpoints';
 import { migrateSecret, ObsidianSecretSlot, SafeStorageFileSlot } from '../src/proton/secretStore';
 import { redactArgument, redactNames, setLogShowsNames, Logger } from '../src/util/logger';
@@ -192,5 +197,268 @@ describe('the session is stored encrypted outside secret storage', () => {
         secrets.set('proton-drive-sync-session-x', '{"uid":"old"}');
         assert.equal(await migrateSecret(legacy, target), false);
         assert.equal(await target.read(), '{"uid":"u1"}');
+    });
+});
+
+type Sent = { url: string; method: string; headers: Headers };
+type Reply = Response | Error;
+
+/** A `fetch` that records what it was sent and answers from a script. */
+function scriptedFetch(reply: (sent: Sent) => Reply) {
+    const sent: Sent[] = [];
+    const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const request = { url: String(input), method: init?.method ?? 'GET', headers: new Headers(init?.headers) };
+        sent.push(request);
+        const answer = reply(request);
+        if (answer instanceof Error) {
+            throw answer;
+        }
+        return answer;
+    };
+    return { fetch: fetch as typeof globalThis.fetch, sent };
+}
+
+const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+const html = (body: string, status: number) =>
+    new Response(body, { status, headers: { 'content-type': 'text/html' } });
+
+class FakeCredentials implements SessionCredentials {
+    uid: string | undefined = 'uid-1';
+    accessToken: string | undefined = 'old';
+    refreshToken: string | undefined = 'refresh-1';
+    signedOut = false;
+
+    on(): void {}
+    isLoggedIn(): boolean {
+        return !this.signedOut;
+    }
+    isTelemetryEnabled(): boolean {
+        return false;
+    }
+    getUserKeyPassword(): string | undefined {
+        return undefined;
+    }
+    async load(): Promise<void> {}
+    async setUserKeyPassword(): Promise<void> {}
+    async setSessionInfo(info: SessionInfo): Promise<void> {
+        this.uid = info.uid;
+        this.accessToken = info.accessToken;
+        this.refreshToken = info.refreshToken ?? this.refreshToken;
+    }
+    async setTelemetryEnabled(): Promise<void> {}
+    async signOut(): Promise<void> {
+        this.signedOut = true;
+        this.uid = undefined;
+        this.accessToken = undefined;
+        this.refreshToken = undefined;
+    }
+}
+
+describe('a refresh Proton refused, and one the network never delivered', () => {
+    function api(reply: (sent: Sent) => Reply) {
+        const credentials = new FakeCredentials();
+        const ended = { count: 0 };
+        const transport = scriptedFetch(reply);
+        const client = new ApiClient({
+            baseUrl: 'drive-api.proton.me',
+            appVersion: 'test',
+            credentials,
+            logger: new Logger('error'),
+            fetch: transport.fetch,
+            onSessionEnded: () => (ended.count += 1),
+        });
+        const get = () => client.authenticatedRequest.get(`${client.baseUrlWithProtocol}/core/v4/users`).json();
+        return { credentials, ended, transport, get };
+    }
+
+    it('keeps the session when a captive portal answers the refresh', async () => {
+        const { credentials, ended, get } = api((request) =>
+            request.url.endsWith('/auth/v4/refresh')
+                ? html('<html><body>Sign in to the hotel Wi-Fi</body></html>', 403)
+                : json({}, 401),
+        );
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(credentials.signedOut, false, 'a portal refused the request, not Proton');
+        assert.equal(credentials.accessToken, 'old');
+        assert.equal(ended.count, 0);
+    });
+
+    it('keeps the session when the refresh never gets an answer', async () => {
+        let refreshes = 0;
+        const { credentials, ended, get } = api((request) => {
+            if (request.url.endsWith('/auth/v4/refresh')) {
+                refreshes += 1;
+                return new TypeError('Failed to fetch');
+            }
+            return json({}, 401);
+        });
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(refreshes, 3, 'one try and two retries');
+        assert.equal(credentials.signedOut, false);
+        assert.equal(ended.count, 0);
+    });
+
+    it('tries the refresh again when Proton is busy, instead of signing out', async () => {
+        let refreshes = 0;
+        const { credentials, ended, get } = api((request) => {
+            if (request.url.endsWith('/auth/v4/refresh')) {
+                refreshes += 1;
+                return refreshes === 1 ? json({}, 503) : json({ UID: 'uid-1', AccessToken: 'new' });
+            }
+            return request.headers.get('authorization') === 'Bearer new' ? json({ User: 'me' }) : json({}, 401);
+        });
+
+        assert.deepEqual(await get(), { User: 'me' });
+        assert.equal(credentials.accessToken, 'new');
+        assert.equal(credentials.signedOut, false);
+        assert.equal(ended.count, 0);
+    });
+
+    it('ends the session once when Proton refuses the refresh token', async () => {
+        const { credentials, ended, get } = api((request) =>
+            request.url.endsWith('/auth/v4/refresh')
+                ? json({ Code: 10013, Error: 'invalid_grant' }, 401)
+                : json({}, 401),
+        );
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(credentials.signedOut, true);
+        assert.equal(credentials.accessToken, undefined);
+        assert.equal(ended.count, 1, 'the owner is told once, so the engine can stop');
+    });
+
+    it('ends the session on a 400 invalid_grant and a 403 invalid_credentials', async () => {
+        for (const [status, error] of [
+            [400, 'invalid_grant'],
+            [403, 'invalid_credentials'],
+        ] as const) {
+            const { credentials, ended, get } = api((request) =>
+                request.url.endsWith('/auth/v4/refresh') ? json({ Code: 1, Error: error }, status) : json({}, 401),
+            );
+            await assert.rejects(get(), HTTPError);
+            assert.equal(credentials.signedOut, true, `${status} ${error}`);
+            assert.equal(ended.count, 1, `${status} ${error}`);
+        }
+    });
+});
+
+describe('ProtonSession', () => {
+    let sessionModule: typeof import('../src/proton/session');
+
+    before(async () => {
+        // The app build defines this through esbuild; the session reads it at load.
+        (globalThis as { __PLUGIN_VERSION__?: string }).__PLUGIN_VERSION__ = '0.0.0-test';
+        sessionModule = await import('../src/proton/session');
+    });
+
+    /** What `ProtonSession` asks of `Credentials`, with the parts a test needs to see. */
+    class FakeSessionCredentials {
+        uid: string | undefined;
+        accessToken: string | undefined;
+        refreshToken: string | undefined;
+        accountEmail: string | undefined;
+        listenerRegistrations = 0;
+        loads = 0;
+        unloaded = 0;
+
+        on(): void {
+            this.listenerRegistrations += 1;
+        }
+        isLoggedIn(): boolean {
+            return false;
+        }
+        async load(): Promise<void> {
+            this.loads += 1;
+        }
+        unload(): void {
+            this.unloaded += 1;
+        }
+    }
+
+    const newSession = (credentials: FakeSessionCredentials) =>
+        new sessionModule.ProtonSession(credentials as unknown as Credentials, 'client-uid', new Logger('error'));
+
+    it('builds the account once, however often init runs', async () => {
+        const credentials = new FakeSessionCredentials();
+        const session = newSession(credentials);
+
+        await session.init();
+        await session.init();
+
+        assert.equal(credentials.listenerRegistrations, 1, 'one session listener, not one per init');
+        assert.equal(credentials.loads, 2, 'the stored session is read again each time');
+    });
+
+    it('drops the decrypted keys when the PIN locks', async () => {
+        const credentials = new FakeSessionCredentials();
+        const session = newSession(credentials);
+        await session.init();
+
+        const clearKeyStore = CryptoProxy.clearKeyStore;
+        let cleared = 0;
+        CryptoProxy.clearKeyStore = async () => {
+            cleared += 1;
+        };
+        try {
+            session.lock();
+        } finally {
+            CryptoProxy.clearKeyStore = clearKeyStore;
+        }
+
+        assert.equal(cleared, 1, 'the imported private keys go with the session');
+        assert.equal(credentials.unloaded, 1);
+        assert.equal(session.isSignedIn(), false);
+        assert.throws(() => session.getClient(), /Not signed in/);
+    });
+});
+
+describe('finishing a sign-in the network interrupted (#41)', () => {
+    let finishSignInSetup: typeof import('../src/proton/session').finishSignInSetup;
+
+    before(async () => {
+        (globalThis as { __PLUGIN_VERSION__?: string }).__PLUGIN_VERSION__ = '0.0.0-test';
+        finishSignInSetup = (await import('../src/proton/session')).finishSignInSetup;
+    });
+
+    it('keeps trying the steps after the approval, then reports the address', async () => {
+        let tries = 0;
+        const email = await finishSignInSetup({
+            complete: async () => {
+                tries += 1;
+                if (tries === 1) {
+                    throw new TypeError('net::ERR_NAME_NOT_RESOLVED');
+                }
+                return 'someone@proton.me';
+            },
+            lastKnownEmail: () => undefined,
+            logger: new Logger('error'),
+            delaysMs: [0],
+        });
+
+        assert.equal(email, 'someone@proton.me');
+        assert.equal(tries, 2);
+    });
+
+    it('still ends in a usable session when the steps keep failing', async () => {
+        let tries = 0;
+        const email = await finishSignInSetup({
+            complete: async () => {
+                tries += 1;
+                throw new TypeError('Failed to fetch');
+            },
+            lastKnownEmail: () => 'known@proton.me',
+            logger: new Logger('error'),
+            delaysMs: [0],
+        });
+
+        assert.equal(email, 'known@proton.me');
+        assert.equal(tries, 2);
     });
 });

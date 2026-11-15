@@ -8,8 +8,28 @@ import type { Logger } from '../util/logger';
  */
 export interface SecretSlot {
     read(): Promise<string | null>;
-    /** `null` clears the secret. */
+    /**
+     * `null` clears the secret.
+     *
+     * @throws {@link LockedSlotError} when the slot is PIN-protected and
+     * locked, and the value would have to be stored in the clear; the caller
+     * keeps it in memory and drops the write.
+     */
     write(value: string | null): Promise<void>;
+}
+
+/**
+ * The slot is locked, so the value was not stored.
+ *
+ * A PIN-protected slot stores ciphertext; writing while it is locked would put
+ * the plaintext back in its place, which is how a token refresh that finished
+ * after the PIN locked replaced the envelope with readable tokens.
+ */
+export class LockedSlotError extends Error {
+    constructor() {
+        super('The stored secret is locked; the write was refused');
+        this.name = 'LockedSlotError';
+    }
 }
 
 /**

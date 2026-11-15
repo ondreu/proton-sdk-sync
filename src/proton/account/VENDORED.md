@@ -40,6 +40,20 @@ Vendored from commit `6cbf2f442079ded7fadf93dc59494e71e04f19bb` (2026-09-15).
   refresh logic itself (`refreshSessionIfPossible`, `performTokenRefresh`) is
   upstream's. Marked `LOCAL ADDITION` / `LOCAL CHANGE` in the file.
 
+- `apiClient.ts` also narrowed what a failed refresh means. A 408, a 429, a
+  5xx, and a request that never got an answer are retried with a short
+  backoff; only a 401, a 400 `invalid_grant` or a 403 `invalid_credentials`
+  sign out. Everything else used to sign out, which a captive portal's 403
+  did while the session was fine. The optional `onSessionEnded` on
+  `ApiClientOptions` tells the host after a real sign-out, so it can stop a
+  client that has no token left to use. Marked `LOCAL CHANGE` in the file.
+
+- `auth.ts` retries the fork status poll when the request never reached
+  Proton, instead of failing a sign-in the user had already approved on a
+  phone that briefly lost its network (issue #41). It takes an optional
+  `timing` so tests need not spend the real poll delays. Marked
+  `LOCAL CHANGE` in the file.
+
 - `authWeb.ts` decrypts the sign-in fork payload with WebCrypto instead of
   `node:crypto`, so sign-in works on Obsidian mobile, where there is no Node.
   `parseUserKeyPassword` became async as a result, and its one call in
