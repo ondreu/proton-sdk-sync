@@ -27,30 +27,58 @@ function token(value: string): string {
 /** A quoted name or path, or a bare token, replaced by its token; prose is left alone. */
 const QUOTED = /"([^"\n]+)"|'([^'\n]+)'/g;
 const TOKEN = /[^\s"']+/g;
-/** Drive node uids are opaque, but long, stable, and they identify a file across devices. */
-const NODE_UID = /[A-Za-z0-9_+/=~-]{60,}/g;
+/**
+ * Drive node uids are opaque, long, and they identify a file across devices.
+ *
+ * They are base64url of 32 bytes: 43 characters without padding, 44 with,
+ * 32 at the short end. The threshold used to be 60, which let every real uid
+ * straight into the log.
+ */
+const NODE_UID = /[A-Za-z0-9_+/=~-]{32,}/g;
 
 /**
- * A host, as opposed to a file name.
+ * Proton's own hosts, named one by one.
  *
- * `drive-api.proton.me` is not the user's data and redacting it makes a bug
- * report undiagnosable, so it is left alone. Two labels are ambiguous
- * (`note.md` is a file, `proton.me` is a host), so only three or more are
- * treated as a host; the vault's own names almost never look like that.
+ * `drive-api.proton.me` is not the user's data, and redacting it makes a bug
+ * report undiagnosable. What must not be guessed at is the shape of a host: a
+ * rule like "three labels is a host" waves through `2026-05-01.meeting.md`,
+ * `recipe.v2.md` and `invoice.2026.01.pdf`, which are note names.
  */
-const HOST = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.){2,}[a-z]{2,24}$/i;
+const PROTON_HOSTS = ['drive-api.proton.me', 'account.proton.me'];
+
+/**
+ * Proton's API paths, which are endpoints rather than notes.
+ *
+ * Only these keep a leading slash; another absolute path is the user's - it
+ * appears in OS errors and stack frames - and is redacted.
+ */
+const PROTON_PATH_PREFIXES = ['/drive/', '/auth/', '/core/', '/storage/', '/account/'];
 
 function looksLikeName(value: string): boolean {
     if (!/[A-Za-z]/.test(value)) {
         return false;
     }
     const core = value.replace(/[.,;:)\]}]+$/, '');
-    // A URL, a host, or an API path names an endpoint, not a note. Vault paths
-    // are relative (`Projekty/Trisula.md`); a leading slash is Drive's API.
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(core) || core.startsWith('/') || HOST.test(core)) {
+    // A Proton URL, host or API path names an endpoint, not a note. Vault
+    // paths are relative (`Projekty/Trisula.md`), and any other absolute path
+    // is the user's.
+    if (isProtonEndpoint(core)) {
         return false;
     }
     return core.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(core);
+}
+
+/** Whether a token names Proton's API rather than anything the user owns. */
+function isProtonEndpoint(value: string): boolean {
+    const lower = value.toLowerCase();
+    const url = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(value);
+    if (url) {
+        return PROTON_HOSTS.includes(url[1].toLowerCase().replace(/:\d+$/, ''));
+    }
+    if (PROTON_HOSTS.includes(lower.replace(/\/+$/, ''))) {
+        return true;
+    }
+    return lower.startsWith('/') && PROTON_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix));
 }
 
 /** Replace anything that looks like a vault path or a file name. */

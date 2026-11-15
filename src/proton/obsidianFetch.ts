@@ -45,6 +45,7 @@ export async function obsidianFetch(input: RequestInfo | URL, init?: RequestInit
     const requestedAt = new Date();
     const response = await requestUrl(params);
     requestStats.record(response.status);
+    refuseRedirect(request.url, response.status, response.headers);
     followServerTime(response.headers, requestedAt);
 
     // `requestUrl` lowercases header names and omits the status text. Neither
@@ -53,6 +54,34 @@ export async function obsidianFetch(input: RequestInfo | URL, init?: RequestInit
         status: response.status,
         headers: new Headers(response.headers ?? {}),
     });
+}
+
+/**
+ * Refuse a redirect instead of following it, so the session token cannot be
+ * carried to another host.
+ *
+ * The host allow-list (`endpoints.ts`) is checked before a request is sent, and
+ * it says nothing about where a 302 would take that request. `requestUrl` has
+ * no option to turn redirect-following off and reports only the last answer, so
+ * a redirect it has already followed cannot be seen here at all; what this
+ * catches is the case where the 3xx does come back — a Location to a host that
+ * did not answer, a transport that stops following. Following it, even to
+ * another Proton host, would re-send `Authorization` somewhere this plugin did
+ * not choose, so a redirect is treated as an error and surfaces as a failed
+ * request instead.
+ */
+function refuseRedirect(from: string, status: number, headers: Record<string, string> | undefined): void {
+    if (status < 300 || status >= 400) {
+        return;
+    }
+    const location = headers?.['location'] ?? headers?.['Location'];
+    let to = 'another address';
+    try {
+        to = location ? new URL(location, from).host : to;
+    } catch {
+        // Not a usable URL: the message below stays vague, which is fine.
+    }
+    throw new Error(`Refusing a redirect to ${to}: this plugin does not follow requests to another host`);
 }
 
 /**

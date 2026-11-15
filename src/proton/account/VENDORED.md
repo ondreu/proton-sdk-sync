@@ -40,13 +40,19 @@ Vendored from commit `6cbf2f442079ded7fadf93dc59494e71e04f19bb` (2026-09-15).
   refresh logic itself (`refreshSessionIfPossible`, `performTokenRefresh`) is
   upstream's. Marked `LOCAL ADDITION` / `LOCAL CHANGE` in the file.
 
-- `apiClient.ts` also narrowed what a failed refresh means. A 408, a 429, a
-  5xx, and a request that never got an answer are retried with a short
-  backoff; only a 401, a 400 `invalid_grant` or a 403 `invalid_credentials`
-  sign out. Everything else used to sign out, which a captive portal's 403
-  did while the session was fine. The optional `onSessionEnded` on
-  `ApiClientOptions` tells the host after a real sign-out, so it can stop a
-  client that has no token left to use. Marked `LOCAL CHANGE` in the file.
+- `apiClient.ts` also narrowed what a failed refresh means. A 401 used to
+  sign out without reading the body, so a proxy or a captive portal answering
+  401 with its own challenge wiped the session and the PIN; now a 400, 401 or
+  403 counts only when the body is Proton's JSON naming a dead session
+  (`invalid_credentials`, `invalid_refresh_token`, `invalid_grant`, or Code
+  10013). Anything else keeps the tokens and reports a transient failure. A
+  refresh is repeated only on a 429 or a connection that was never made:
+  repeating a 408 or a 5xx could present a refresh token Proton had already
+  rotated, and the resulting 401 ended a session that was fine. The refresh
+  token is re-read before each retry, and a change abandons the retry. The
+  optional `onSessionEnded` on `ApiClientOptions` tells the host after a real
+  sign-out, so it can stop a client that has no token left to use. Marked
+  `LOCAL CHANGE` in the file.
 
 - `auth.ts` retries the fork status poll when the request never reached
   Proton, instead of failing a sign-in the user had already approved on a

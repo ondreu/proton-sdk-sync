@@ -34,6 +34,11 @@ export type LegacySessionFile = {
  */
 export class Credentials implements SessionCredentials {
     private session: StoredSession | null = null;
+    /**
+     * Set by {@link unload}: the session is out of memory on purpose, and
+     * nothing may put it back except a load.
+     */
+    private locked = false;
     private readonly listeners = new Set<() => void>();
     /** The save queue: each save starts after the one before it has finished. */
     private pendingSave: Promise<void> = Promise.resolve();
@@ -92,12 +97,35 @@ export class Credentials implements SessionCredentials {
         return this.session.cacheKey;
     }
 
+    /**
+     * Read the stored session, unless this run already holds one.
+     *
+     * A session in memory is newer than the stored one whenever a refresh
+     * landed while the PIN was locked: the slot keeps that refresh aside and
+     * only writes it on the next unlock (see `PinProtectedSlot.write`), so
+     * re-reading here would put the pre-refresh tokens back in front of the
+     * fresh pair. Nothing is thrown when the slot cannot be read: the plugin
+     * starts signed out, which is recoverable, while a throw here is not.
+     */
     async load(): Promise<void> {
-        this.session = null;
-        let stored = await this.slot.read();
+        if (this.session !== null) {
+            this.logger.debug('Keeping the session already in memory');
+            return;
+        }
+        let stored: string | null;
+        try {
+            stored = await this.slot.read();
+        } catch (error) {
+            // Locked with the PIN, or a file this device cannot open; either
+            // way there is no session to restore, and the unlock dialog or the
+            // settings tab offers what to do about it.
+            this.logger.warn('Could not read the stored Proton session; starting signed out', error);
+            return;
+        }
         if (stored === null) {
             stored = await this.migrateLegacyFile();
         }
+        this.locked = false;
         if (stored === null) {
             return;
         }
@@ -110,6 +138,14 @@ export class Credentials implements SessionCredentials {
     }
 
     async setSessionInfo(info: SessionInfo): Promise<void> {
+        if (this.locked) {
+            // The PIN locked the session away; a refresh that finishes
+            // afterwards must not bring it back into memory behind the lock.
+            // The tokens it carries are gone with it, which is why the slot
+            // keeps a refused write for the next unlock.
+            this.logger.debug('The session is unloaded for the PIN lock; dropping a token refresh');
+            return;
+        }
         this.session = {
             version: 1,
             telemetryEnabled: false,
@@ -124,6 +160,11 @@ export class Credentials implements SessionCredentials {
     }
 
     async setUserKeyPassword(userKeyPassword: string): Promise<void> {
+        // Only a sign-in sets the key password, and it does so before the new
+        // session; a token refresh never does. A new sign-in is not the locked
+        // session coming back, so the lock is lifted for it rather than
+        // dropping the signed-in tokens on the floor. (See `setSessionInfo`.)
+        this.locked = false;
         this.session = {
             version: 1,
             uid: '',
@@ -161,11 +202,13 @@ export class Credentials implements SessionCredentials {
      */
     unload(): void {
         this.session = null;
+        this.locked = true;
         this.emitChanged();
     }
 
     async signOut(): Promise<void> {
         this.session = null;
+        this.locked = false;
         await this.enqueueSave(null);
         await this.removeLegacyFile();
         this.emitChanged();
@@ -200,8 +243,9 @@ export class Credentials implements SessionCredentials {
      *
      * A PIN-locked slot refuses a plaintext write, and rightly: the stored
      * session is the envelope, and replacing it with the tokens would undo the
-     * PIN. The tokens are already in memory, so the write is dropped and the
-     * envelope stays; the next unlock writes the session again.
+     * PIN. The slot keeps the value it refused and writes it at the next
+     * unlock, so a refresh that landed under the lock is not lost; nothing
+     * more to do here.
      */
     private async write(value: string | null): Promise<void> {
         try {
@@ -210,7 +254,7 @@ export class Credentials implements SessionCredentials {
             if (!(error instanceof LockedSlotError)) {
                 throw error;
             }
-            this.logger.debug('The PIN is locked; keeping the refreshed session in memory only');
+            this.logger.debug('The PIN is locked; the slot keeps the refreshed session for the next unlock');
             return;
         }
         if (value !== null) {
@@ -253,7 +297,18 @@ export class Credentials implements SessionCredentials {
             this.logger.warn('Could not decrypt the session saved by an older version; will try again next launch');
             return null;
         }
-        await this.slot.write(decrypted);
+        try {
+            await this.slot.write(decrypted);
+        } catch (error) {
+            if (!(error instanceof LockedSlotError)) {
+                throw error;
+            }
+            // The slot is locked; the session is usable for this run and the
+            // old file stays for the next start, rather than being deleted
+            // with nowhere to put it.
+            this.logger.debug('The PIN is locked; keeping the old session file until the unlock');
+            return decrypted;
+        }
         await this.removeLegacyFile();
         this.logger.info('Moved the stored Proton session into Obsidian’s secret storage');
         return decrypted;

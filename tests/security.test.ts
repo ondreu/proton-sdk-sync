@@ -7,8 +7,17 @@ import { ApiClient, type SessionCredentials, type SessionInfo } from '../src/pro
 import { HTTPError } from '../src/proton/account/http';
 import type { Credentials } from '../src/proton/credentials';
 import { assertProtonUrl } from '../src/proton/endpoints';
-import { migrateSecret, ObsidianSecretSlot, SafeStorageFileSlot } from '../src/proton/secretStore';
+import { obsidianFetch } from '../src/proton/obsidianFetch';
+import { PinProtectedSlot } from '../src/proton/pinLock';
+import {
+    LockedSlotError,
+    migrateSecret,
+    ObsidianSecretSlot,
+    SafeStorageFileSlot,
+    UnreadableSlotError,
+} from '../src/proton/secretStore';
 import { redactArgument, redactNames, setLogShowsNames, Logger } from '../src/util/logger';
+import { setRequestUrlHandler } from './stubs/obsidian';
 
 function memoryAdapter() {
     const files = new Map<string, string>();
@@ -19,6 +28,14 @@ function memoryAdapter() {
             read: async (path: string) => files.get(path) ?? '',
             write: async (path: string, data: string) => {
                 files.set(path, data);
+            },
+            rename: async (from: string, to: string) => {
+                const data = files.get(from);
+                if (data === undefined) {
+                    throw new Error(`no such file: ${from}`);
+                }
+                files.delete(from);
+                files.set(to, data);
             },
             remove: async (path: string) => {
                 files.delete(path);
@@ -126,10 +143,8 @@ describe('requests go to Proton and nowhere else', () => {
     it('allows the hosts the plugin actually uses', () => {
         for (const url of [
             'https://drive-api.proton.me/drive/v2/shares/my-files',
-            'https://drive.proton.me/api/',
             'https://account.proton.me/auth/v4',
             'https://zrh-storage.proton.me/storage/blocks',
-            'https://pass.proton.me/',
         ]) {
             assert.doesNotThrow(() => assertProtonUrl(url), url);
         }
@@ -141,6 +156,11 @@ describe('requests go to Proton and nowhere else', () => {
             'https://proton.me.evil.example/collect',
             'http://drive-api.proton.me/drive',
             'https://notproton.me/x',
+            // Proton's own, and not a host this plugin has any business with:
+            // an allow-list by domain would have waved these through.
+            'https://drive.proton.me/api/',
+            'https://pass.proton.me/',
+            'https://account.proton.ch/auth/v4',
             'file:///etc/passwd',
         ]) {
             assert.throws(() => assertProtonUrl(url), /only talks to Proton/, url);
@@ -160,15 +180,45 @@ describe('the session is stored encrypted outside secret storage', () => {
         assert.deepEqual(await slot.read(), '{"accessToken":"secret-token"}');
     });
 
-    it('clears the file on sign-out, and reports nothing when it cannot decrypt', async () => {
+    it('clears the file on sign-out, and separates absent from unreadable', async () => {
         const { adapter, files } = memoryAdapter();
         const slot = new SafeStorageFileSlot(adapter as never, 'session.bin', fakeSafeStorage());
+
+        // Nothing written yet: absent, which is not an error.
+        assert.equal(await slot.read(), null);
+
         await slot.write('x');
         await slot.write(null);
         assert.equal(files.has('session.bin'), false);
 
+        // Present but not ours to open: unreadable, and saying "nothing here"
+        // is what let a PIN-protected slot fall back to plaintext.
         files.set('session.bin', Buffer.from('garbage').toString('base64'));
-        assert.equal(await slot.read(), null);
+        await assert.rejects(slot.read(), UnreadableSlotError);
+    });
+
+    it('writes beside the file and renames, so a torn write cannot lose the envelope', async () => {
+        const { adapter, files } = memoryAdapter();
+        const slot = new SafeStorageFileSlot(adapter as never, 'session.bin', fakeSafeStorage());
+        await slot.write('the old session');
+        const before = files.get('session.bin');
+
+        // A crash between the write and the rename: the new value never
+        // becomes the file, and the old envelope is still the one that opens.
+        const rename = adapter.rename;
+        adapter.rename = async () => {
+            throw new Error('crash');
+        };
+        try {
+            await assert.rejects(slot.write('the new session'), /crash/);
+        } finally {
+            adapter.rename = rename;
+        }
+
+        assert.equal(files.get('session.bin'), before);
+        assert.equal(await slot.read(), 'the old session');
+        assert.equal(files.has('session.bin.tmp'), false, 'no half-written file is left behind');
+        assert.equal(files.size, 1);
     });
 
     it('moves a session out of secret storage and clears the old copy', async () => {
@@ -197,6 +247,82 @@ describe('the session is stored encrypted outside secret storage', () => {
         secrets.set('proton-drive-sync-session-x', '{"uid":"old"}');
         assert.equal(await migrateSecret(legacy, target), false);
         assert.equal(await target.read(), '{"uid":"u1"}');
+    });
+
+    it('treats an unreadable session file as occupied, not as empty', async () => {
+        const { adapter, files } = memoryAdapter();
+        const target = new SafeStorageFileSlot(adapter as never, 'session.bin', fakeSafeStorage());
+        files.set('session.bin', Buffer.from('garbage').toString('base64'));
+
+        const secrets = new Map<string, string>([['proton-drive-sync-session-x', '{"uid":"u1"}']]);
+        const legacy = new ObsidianSecretSlot(
+            {
+                getSecret: (id: string) => secrets.get(id) ?? '',
+                setSecret: (id: string, value: string) => void secrets.set(id, value),
+            } as never,
+            'proton-drive-sync-session-x',
+        );
+
+        assert.equal(await migrateSecret(legacy, target), false);
+        assert.equal(secrets.size, 1, 'the readable copy is not cleared while the target cannot be read');
+    });
+});
+
+describe('a PIN-protected session the device can no longer decrypt', () => {
+    it('still reports a PIN, and never replaces the envelope with plaintext', async () => {
+        const { adapter, files } = memoryAdapter();
+        const inner = new SafeStorageFileSlot(adapter as never, 'session.bin', fakeSafeStorage());
+        await inner.write('{"uid":"u","accessToken":"a","userKeyPassword":"k"}');
+        const pinSet = { value: false };
+        const record = {
+            isSet: () => pinSet.value,
+            set: (value: boolean) => void (pinSet.value = value),
+        };
+        const slot = new PinProtectedSlot(inner, 1000, () => Date.now(), record);
+        await slot.setPin('482915');
+        assert.equal(pinSet.value, true, 'the setting records that a PIN is set');
+
+        // The keystore was reinstalled: the file is there and will not open.
+        files.set('session.bin', Buffer.from('garbage').toString('base64'));
+        const unreadable = files.get('session.bin');
+
+        const restarted = new PinProtectedSlot(inner, 1000, () => Date.now(), record);
+        assert.equal(await restarted.protection(), 'pin', 'unreadable is not unprotected');
+        assert.equal(await restarted.isLocked(), true);
+        assert.equal(await restarted.unlock('482915'), false, 'nothing can open it, so nothing is claimed');
+
+        // A refresh landing now must not write the session in the clear over it.
+        await assert.rejects(
+            restarted.write('{"accessToken":"plaintext-token"}'),
+            LockedSlotError,
+            'the tokens must not be stored readable',
+        );
+        assert.equal(files.get('session.bin'), unreadable);
+        assert.equal(Buffer.from(files.get('session.bin')!, 'base64').toString('utf8'), 'garbage');
+    });
+});
+
+describe('the transport does not carry the session through a redirect', () => {
+    it('refuses a 302 to a host that is not Proton', async () => {
+        const seen: string[] = [];
+        setRequestUrlHandler(async (param) => {
+            seen.push(param.url);
+            return {
+                status: 302,
+                headers: { location: 'https://evil.example/collect' },
+                arrayBuffer: new ArrayBuffer(0),
+                json: null,
+                text: '',
+            };
+        });
+
+        await assert.rejects(
+            obsidianFetch('https://drive-api.proton.me/drive/v2/volumes', {
+                headers: { Authorization: 'Bearer session-token' },
+            }),
+            /redirect/i,
+        );
+        assert.deepEqual(seen, ['https://drive-api.proton.me/drive/v2/volumes'], 'it is not followed');
     });
 });
 
@@ -304,18 +430,84 @@ describe('a refresh Proton refused, and one the network never delivered', () => 
         assert.equal(ended.count, 0);
     });
 
-    it('tries the refresh again when Proton is busy, instead of signing out', async () => {
+    it('tries the refresh again when Proton is rate limiting, instead of signing out', async () => {
         let refreshes = 0;
         const { credentials, ended, get } = api((request) => {
             if (request.url.endsWith('/auth/v4/refresh')) {
                 refreshes += 1;
-                return refreshes === 1 ? json({}, 503) : json({ UID: 'uid-1', AccessToken: 'new' });
+                return refreshes === 1 ? json({}, 429) : json({ UID: 'uid-1', AccessToken: 'new' });
             }
             return request.headers.get('authorization') === 'Bearer new' ? json({ User: 'me' }) : json({}, 401);
         });
 
         assert.deepEqual(await get(), { User: 'me' });
         assert.equal(credentials.accessToken, 'new');
+        assert.equal(credentials.signedOut, false);
+        assert.equal(ended.count, 0);
+    });
+
+    it('keeps the session when the refresh gets a 401 with a portal page in it', async () => {
+        const { credentials, ended, get } = api((request) =>
+            request.url.endsWith('/auth/v4/refresh')
+                ? html('<html><body>Authentication required</body></html>', 401)
+                : json({}, 401),
+        );
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(credentials.signedOut, false, 'a proxy challenge is not Proton ending the session');
+        assert.equal(credentials.accessToken, 'old');
+        assert.equal(credentials.refreshToken, 'refresh-1');
+        assert.equal(ended.count, 0);
+    });
+
+    it('ends the session once when a 401 names a dead refresh token', async () => {
+        const { credentials, ended, get } = api((request) =>
+            request.url.endsWith('/auth/v4/refresh')
+                ? json({ Code: 10013, Error: 'invalid_refresh_token' }, 401)
+                : json({}, 401),
+        );
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(credentials.signedOut, true);
+        assert.equal(ended.count, 1, 'the owner is told once, so the engine can stop');
+    });
+
+    it('does not repeat a refresh a 502 may have processed, so a later 401 cannot end the session', async () => {
+        let refreshes = 0;
+        const { credentials, ended, get } = api((request) => {
+            if (request.url.endsWith('/auth/v4/refresh')) {
+                refreshes += 1;
+                return refreshes === 1 ? json({}, 502) : json({ Error: 'invalid_grant' }, 401);
+            }
+            return json({}, 401);
+        });
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(refreshes, 1, 'a 502 may have rotated the token, so it is not replayed');
+        assert.equal(credentials.signedOut, false);
+        assert.equal(ended.count, 0);
+    });
+
+    it('does not retry a refresh with a token another refresh already replaced', async () => {
+        let refreshes = 0;
+        const { credentials, ended, get } = api((request) => {
+            if (request.url.endsWith('/auth/v4/refresh')) {
+                refreshes += 1;
+                // The connection was never made, and meanwhile another refresh
+                // won the race and stored a new token.
+                credentials.refreshToken = 'refresh-2';
+                return new TypeError('Failed to fetch');
+            }
+            return json({}, 401);
+        });
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(refreshes, 1, 'presenting the spent token again would end the session');
+        assert.equal(credentials.refreshToken, 'refresh-2');
         assert.equal(credentials.signedOut, false);
         assert.equal(ended.count, 0);
     });
