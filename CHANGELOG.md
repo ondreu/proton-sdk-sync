@@ -33,7 +33,14 @@ out.
 ### Security
 
 - The session is never written in the clear while a PIN is set: a refresh that
-  arrives during lock is dropped, and the next unlock fetches a new one.
+  arrives during lock is kept aside and written, encrypted, at the next unlock.
+- An unreadable session file no longer looks like "no PIN": the plugin records
+  that a PIN was set, so a torn write or a keychain that is not ready cannot
+  turn into a plaintext session.
+- A 401 from a captive portal or a proxy no longer signs you out; only a
+  rejection that names a dead token does.
+- A refresh that a gateway may already have processed is not retried, so a
+  timeout cannot present a token Proton has just replaced.
 - Only a genuine credential rejection signs out. A timeout, a captive portal or
   a transient network failure retries instead of wiping the session and the PIN.
 - PIN envelopes use a higher work factor, wrong PINs back off, and the failure

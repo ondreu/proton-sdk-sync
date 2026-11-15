@@ -15,9 +15,16 @@ through Proton's standard web-login flow, and stores it encrypted:
 
 Optional PIN protection wraps that value in an authenticated envelope
 (AES-256-GCM, PBKDF2-SHA-256, 1,000,000 iterations, random salt). While the
-plugin is locked, a token refresh is not written at all — it is dropped, and the
-next unlock fetches a new one. Wrong PINs back off from one second to thirty
-seconds, and the failure count survives a restart.
+plugin is locked, a token refresh is kept aside and written, encrypted, at the
+next unlock; the envelope is never replaced with readable tokens. Wrong PINs
+back off from one second to thirty seconds, and the failure count survives a
+restart.
+
+A six-digit PIN is not a strong secret against someone holding a copy of the
+file: at this work factor the whole keyspace costs about 1.5 CPU-days on one
+core, less on a GPU. The PIN is there to keep a stolen, unlocked device out, and
+a longer PIN is worth choosing. The failure counter only slows guessing at the
+device — anyone with the file can remove it.
 
 Signing out ends the session server-side through Proton's revoke endpoint before
 forgetting it locally.

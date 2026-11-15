@@ -19,7 +19,7 @@ import {
 } from 'obsidian';
 
 import { Credentials } from './proton/credentials';
-import { PinProtectedSlot, RememberedUnlock } from './proton/pinLock';
+import { PIN_ITERATIONS, PinProtectedSlot, RememberedUnlock } from './proton/pinLock';
 import { ConflictHistory } from './sync/conflictHistory';
 import {
     decryptLegacySession,
@@ -259,8 +259,14 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // nobody is signed out and the old, readable copy goes away.
         await migrateSecret(legacySession, sessionInner);
         await migrateSecret(legacyUnlock, unlockInner);
-        runtime.sessionSlot = new PinProtectedSlot(sessionInner);
-        this.rememberedUnlock = new RememberedUnlock(unlockInner);
+        runtime.sessionSlot = new PinProtectedSlot(sessionInner, PIN_ITERATIONS, () => Date.now(), {
+            isSet: () => this.settings.pinProtected,
+            set: (value) => {
+                this.settings.pinProtected = value;
+                void this.saveSettings();
+            },
+        });
+        this.rememberedUnlock = new RememberedUnlock(unlockInner, () => Date.now(), { encryptedOnly: true });
         const credentials = new Credentials(
             runtime.sessionSlot,
             {

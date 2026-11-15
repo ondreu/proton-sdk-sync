@@ -19,6 +19,7 @@ export type PluginSettings = {
      * Where the two versions differ it is kept whatever this says; the setting
      * only covers versions that hold the same bytes, which need no copy.
      */
+    /** Kept for configurations written before 1.0.0; the losing side is now always kept when it differs. */
     keepConflictCopies: boolean;
 
     /**
@@ -94,6 +95,15 @@ export type PluginSettings = {
      * Obsidian within it does not ask either; see `RememberedUnlock`.
      */
     pinLockAfterMinutes: number;
+    /**
+     * Whether a PIN was set, recorded outside the encrypted file.
+     *
+     * The envelope can become unreadable — a torn write, a keychain that is not
+     * unlocked yet, a copied profile — and "cannot read it" must not be mistaken
+     * for "there is no PIN", which would let the next write store the session in
+     * the clear. See `PinProtectedSlot`.
+     */
+    pinProtected: boolean;
 };
 
 /**
@@ -197,6 +207,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     onboardingComplete: false,
 
     pinLockAfterMinutes: 0,
+    pinProtected: false,
 };
 
 /**

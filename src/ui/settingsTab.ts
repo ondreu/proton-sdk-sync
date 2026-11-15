@@ -400,17 +400,6 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                     control: { type: 'dropdown', key: 'conflictPolicy', options: CONFLICT_POLICIES },
                 },
                 {
-                    name: 'Keep a copy of the version that loses',
-                    desc:
-                        'Strongly recommended. With this off, a policy that keeps one side discards the other. ' +
-                        'A choice made in the conflicts dialog keeps both either way.',
-                    visible: () => {
-                        const current = this.plugin.settings.conflictPolicy;
-                        return current === 'prefer-local' || current === 'prefer-remote' || current === 'prefer-newest';
-                    },
-                    control: { type: 'toggle', key: 'keepConflictCopies' },
-                },
-                {
                     name: `${conflicts} file${conflicts === 1 ? '' : 's'} waiting on a decision`,
                     visible: conflicts > 0,
                     render: (setting) => {

@@ -141,9 +141,9 @@ download. Compare the fresh stat with the one written instead of a timer.
 Files: `sync/vault.ts`, `sync/engine.ts`. Do: drop the timer; compare
 size+mtime+ino where present.
 
-**F16 (M) PIN is cheap to attack.** 6 digits with PBKDF2 600k is about a minute
-offline on a GPU; `PinFormModal` verifies without backoff and the failure
-counter resets on restart.
+**F16 (M) PIN is cheap to attack.** 6 digits with PBKDF2 600k is about 1.5
+CPU-days for the whole keyspace, minutes on a GPU; `PinFormModal` verified
+without backoff and the failure counter reset on restart.
 Files: `proton/pinLock.ts`, `ui/pinModals.ts`. Do: keep the 6-digit minimum but
 raise the work factor to 1,000,000 (the envelope records it, so old ones still
 open), add exponential backoff per failure (1 s → 30 s), and persist the
