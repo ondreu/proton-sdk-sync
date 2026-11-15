@@ -12,8 +12,28 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  */
 const REFRESH_RETRY_DELAYS_MS = [300, 900];
 
-/** Statuses that mean "ask again later", not "this session is over". */
-const RETRYABLE_REFRESH_STATUSES = [408, 429, 500, 502, 503, 504];
+/**
+ * The one status a refresh is repeated on.
+ *
+ * LOCAL CHANGE (not upstream): only a 429 means "nothing happened, ask
+ * later". A refresh rotates the refresh token, so a 408 or a 5xx may have been
+ * processed before the answer went missing, and repeating it presents a token
+ * Proton has already replaced - which comes back 401 and signed the user out.
+ * See {@link ApiClient.requestRefresh}.
+ */
+const RETRYABLE_REFRESH_STATUSES = [429];
+
+/**
+ * Errors that prove the request never reached Proton: the connection was
+ * never made, or the TLS handshake failed. Only these are safe to repeat.
+ */
+const NEVER_LEFT_THE_PROCESS =
+    /certificate|handshake|\b(?:tls|ssl)\b|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_CONNECTION_REFUSED|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ENETUNREACH/i;
+
+/** Proton's names for a session that is really gone; see {@link sessionIsOver}. */
+const SESSION_ERRORS = ['invalid_credentials', 'invalid_refresh_token', 'invalid_grant'];
+/** The code Proton answers a dead refresh token with. */
+const SESSION_ERROR_CODE = 10013;
 
 type RefreshResponseBody =
     AuthPaths['/auth/{_version}/refresh']['post']['responses']['200']['content']['application/json'];
@@ -141,6 +161,13 @@ export class ApiClient {
                 this.options.logger.warn('Proton ended the session; signing out');
                 await this.options.credentials.signOut();
                 this.options.onSessionEnded?.();
+            } else {
+                // A proxy, a captive portal or a busy server answered, not
+                // Proton's session endpoint: the tokens are kept and the next
+                // request tries again.
+                this.options.logger.warn(
+                    `Refreshing the session got ${response.status} without a session error; keeping the session`,
+                );
             }
             return false;
         }
@@ -162,11 +189,15 @@ export class ApiClient {
     }
 
     /**
-     * POST the refresh, trying again what the network or a busy server dropped.
+     * POST the refresh, trying again only what provably never left the process.
      *
-     * LOCAL CHANGE (not upstream): a 408, a 429 or a 5xx here used to return
-     * with no new token, and the request that was waiting for one failed for
-     * the rest of the run. Resolves null when no attempt got an answer at all.
+     * LOCAL CHANGE (not upstream): a 408, a 429 or a 5xx here used to be
+     * repeated. A refresh rotates the refresh token, so anything Proton may
+     * have processed cannot be replayed: the second attempt presents a token
+     * that has already been replaced, comes back 401 and ends a session that
+     * was fine. Only a 429 and a connection that was never made are repeated,
+     * and the token is re-read before each retry in case another refresh won
+     * the race. Resolves null when no attempt got an answer.
      */
     private async requestRefresh(refreshToken: string): Promise<TypedResponse<RefreshResponseBody> | null> {
         for (let attempt = 0; ; attempt++) {
@@ -189,7 +220,20 @@ export class ApiClient {
                     this.options.logger.warn('Failed to refresh session: the request did not get through', error);
                     return null;
                 }
+                if (!neverLeftTheProcess(error)) {
+                    this.options.logger.warn(
+                        'Failed to refresh session; not repeating a request that may have arrived',
+                        error,
+                    );
+                    return null;
+                }
                 this.options.logger.warn('Failed to refresh session; trying again', error);
+            }
+            if (this.options.credentials.refreshToken !== refreshToken) {
+                // Another refresh already used this token; presenting it again
+                // would be refused and would look like the end of the session.
+                this.options.logger.info('Not repeating the refresh: the refresh token changed meanwhile');
+                return null;
             }
             await sleepMs(REFRESH_RETRY_DELAYS_MS[attempt]);
         }
@@ -197,33 +241,51 @@ export class ApiClient {
 }
 
 /**
+ * Whether a failed request can be repeated, because it never reached Proton.
+ *
+ * `fetch` (and Obsidian's `requestUrl` behind it) rejects with a `TypeError`
+ * when the request could not be completed at all, and with a message naming a
+ * connection or TLS failure otherwise. A reset after the request went out is
+ * not in this list on purpose: the refresh may have been processed.
+ */
+function neverLeftTheProcess(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return false;
+    }
+    return error.name === 'TypeError' || NEVER_LEFT_THE_PROCESS.test(`${error.name}: ${error.message}`);
+}
+
+/**
  * Whether a refused refresh means the session is over, rather than Proton being
  * unreachable.
  *
- * LOCAL CHANGE (not upstream): every 4xx but 429 used to sign out. A 408 is not
- * a refusal, and a captive portal answers 403 with its own page - signing out
- * over that wiped the session and the PIN for anyone who opened Obsidian in a
- * hotel. Only 401, a 400 `invalid_grant` and a 403 `invalid_credentials` mean
- * the token is dead. See VENDORED.md.
+ * LOCAL CHANGE (not upstream): every 4xx but 429 used to sign out, and a 401
+ * did so without reading the body. That is wrong twice over: a 408 is not a
+ * refusal, and a captive portal or a proxy answering 401 with its own
+ * basic-auth challenge says nothing about the session - signing out over it
+ * wiped the session and the PIN. A 400/401/403 counts only when the body is
+ * Proton's JSON naming a dead session: `invalid_credentials`,
+ * `invalid_refresh_token`, `invalid_grant`, or Code 10013. Anything else is a
+ * transient failure, and the tokens are kept for the next request to try.
  */
 async function sessionIsOver(response: Response): Promise<boolean> {
-    if (response.status === 401) {
-        return true;
-    }
-    if (response.status !== 400 && response.status !== 403) {
+    if (response.status !== 400 && response.status !== 401 && response.status !== 403) {
         return false;
     }
-    const error = await errorName(response);
-    return response.status === 400 ? error === 'invalid_grant' : error === 'invalid_credentials';
+    return namesDeadSession(response);
 }
 
-async function errorName(response: Response): Promise<string | undefined> {
+async function namesDeadSession(response: Response): Promise<boolean> {
     try {
-        const body = (await response.json()) as { Error?: unknown } | null;
-        return typeof body?.Error === 'string' ? body.Error : undefined;
+        const body = (await response.json()) as { Error?: unknown; Code?: unknown } | null;
+        if (body?.Code === SESSION_ERROR_CODE) {
+            return true;
+        }
+        return typeof body?.Error === 'string' && SESSION_ERRORS.includes(body.Error);
     } catch {
-        // Not Proton's JSON, so most likely a portal's page.
-        return undefined;
+        // Not Proton's JSON, so most likely a portal's page or a proxy's
+        // challenge: nothing here judges the session.
+        return false;
     }
 }
 

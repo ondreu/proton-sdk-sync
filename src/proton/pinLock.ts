@@ -1,4 +1,4 @@
-import { LockedSlotError, type SecretSlot } from './secretStore';
+import { LockedSlotError, UnreadableSlotError, type SecretSlot } from './secretStore';
 
 /**
  * An optional PIN over the stored Proton session.
@@ -31,8 +31,12 @@ export const MIN_PIN_LENGTH = 6;
  * PBKDF2-SHA256 rounds used for a new PIN.
  *
  * Six digits is only a million guesses, so the work factor is what stands
- * between a copied envelope and the session: at this setting a GPU spends
- * minutes per PIN rather than seconds.
+ * between a copied envelope and the session: at this setting the whole
+ * six-digit space costs about 1.5 CPU-days on one core, and a GPU shortens
+ * that but does not make it free. That is enough to stop someone who finds a
+ * copy of the file from reading it this evening; it is not enough to survive
+ * a determined attacker with hardware, which is why a longer PIN is worth
+ * choosing over six digits.
  */
 export const PIN_ITERATIONS = 1_000_000;
 
@@ -81,8 +85,32 @@ export class LockedError extends Error {
 
 export type Protection = 'none' | 'plain' | 'pin';
 
+/**
+ * Where the plugin records that a PIN is set, outside the secret it protects.
+ *
+ * Needed because the stored envelope cannot always be read: a session.bin the
+ * OS keystore can no longer open looks exactly as if there were nothing there.
+ * With this flag kept in the plugin's own settings, a slot that once had a PIN
+ * keeps refusing to write plaintext even when what it holds cannot be checked
+ * — the case that used to end with the tokens stored in the clear.
+ */
+export type PinSetRecord = {
+    /** Whether a PIN was set, according to the plugin's settings. */
+    isSet(): boolean;
+    /** Record a PIN being set, or removed. */
+    set(value: boolean): void;
+};
+
 export class PinProtectedSlot implements SecretSlot {
     private unlocked: UnlockedKey | null = null;
+    /**
+     * A value written while the slot was locked, kept until the next unlock.
+     *
+     * Dropping it lost a refreshed token pair for good: Proton rotates the
+     * refresh token away on the first use, so what the envelope held before
+     * the refresh was already dead, and the next start signed the user out.
+     */
+    private pending: string | null = null;
 
     constructor(
         private readonly inner: SecretSlot,
@@ -90,15 +118,26 @@ export class PinProtectedSlot implements SecretSlot {
         private readonly iterations = PIN_ITERATIONS,
         /** The backoff's clock; a test moves it rather than waiting in real time. */
         private readonly now: () => number = () => Date.now(),
+        /** The plugin's record of a PIN being set; see {@link PinSetRecord}. */
+        private readonly pinSet?: PinSetRecord,
     ) {}
 
     /** What is stored: nothing, a session as is, or one locked with a PIN. */
     async protection(): Promise<Protection> {
-        const raw = await this.inner.read();
-        if (raw === null) {
-            return 'none';
+        switch (await this.stored()) {
+            case 'none':
+                return 'none';
+            case 'plain':
+                return 'plain';
+            case 'envelope':
+                return 'pin';
+            case 'unreadable':
+                // Unreadable is not empty. Reporting 'none' invited the next
+                // write to put the session in the clear over whatever this is;
+                // with no record to consult, assume the PIN that would explain
+                // a file we cannot open.
+                return (await this.pinWasSet()) ? 'pin' : 'plain';
         }
-        return parseEnvelope(raw) ? 'pin' : 'plain';
     }
 
     /** Whether the stored session is locked and has not been unlocked in this run. */
@@ -128,21 +167,27 @@ export class PinProtectedSlot implements SecretSlot {
      *
      * While the PIN is locked the value is not stored at all: what is there is
      * the envelope, and writing the value as is would replace it with readable
-     * tokens. The caller keeps the value in memory and drops the write.
+     * tokens. The value is kept instead, and written — encrypted — by the next
+     * {@link unlock}.
      *
      * @throws {@link LockedSlotError} in that case.
      */
     async write(value: string | null): Promise<void> {
         if (value === null) {
             this.unlocked = null;
+            this.pending = null;
             await this.inner.write(null);
+            await this.recordPinSet(false);
             return;
         }
         if (this.unlocked) {
+            this.pending = null;
             await this.inner.write(JSON.stringify(await encrypt(value, this.unlocked)));
             return;
         }
-        if (parseEnvelope((await this.inner.read()) ?? '')) {
+        const stored = await this.stored();
+        if (stored === 'envelope' || (stored === 'unreadable' && (await this.pinWasSet()))) {
+            this.pending = value;
             throw new LockedSlotError();
         }
         await this.inner.write(value);
@@ -159,11 +204,19 @@ export class PinProtectedSlot implements SecretSlot {
             return false;
         }
         this.unlocked = key;
+        await this.writePending();
         await this.clearFailures();
         return true;
     }
 
-    /** Whether `pin` opens the stored session, without changing anything. */
+    /**
+     * Whether `pin` opens the stored session, without changing what is stored.
+     *
+     * A right PIN unlocks the slot for this run, as {@link unlock} does: it is
+     * the same proof, and the PIN dialogs verify the current PIN in order to
+     * change or remove it, which they can only do while the session is
+     * readable.
+     */
     async verify(pin: string): Promise<boolean> {
         if (!(await this.mayTryNow())) {
             return false;
@@ -173,6 +226,8 @@ export class PinProtectedSlot implements SecretSlot {
             await this.recordFailure();
             return false;
         }
+        this.unlocked = key;
+        await this.writePending();
         await this.clearFailures();
         return true;
     }
@@ -184,38 +239,70 @@ export class PinProtectedSlot implements SecretSlot {
      * survives a restart: closing and reopening Obsidian does not hand another
      * run of guesses. It slows someone guessing at the unlocked device; a copy
      * of the envelope taken elsewhere is slowed by the key derivation instead.
+     *
+     * The counters are attacker-controlled once the file is copied, so they
+     * are read defensively: a non-numeric or negative count is no count, a
+     * `lastFailureAt` in the future is not a wait, and the wait never exceeds
+     * {@link BACKOFF_MAX_MS}. Otherwise a single edit to the stored file could
+     * lock the owner out for years, or for ever.
      */
     async attemptState(): Promise<PinAttemptState> {
-        const envelope = parseEnvelope((await this.inner.read()) ?? '');
-        const failures = envelope?.failures ?? 0;
-        const lastFailureAt = envelope?.lastFailureAt ?? null;
-        const retryAt = failures > 0 && lastFailureAt !== null ? lastFailureAt + backoffMs(failures) : null;
-        const retryAfterMs = retryAt === null ? 0 : Math.max(0, retryAt - this.now());
-        return { failures, lastFailureAt, retryAfterMs, retryAt };
+        let envelope: Envelope | null = null;
+        try {
+            envelope = parseEnvelope((await this.inner.read()) ?? '');
+        } catch (error) {
+            if (!(error instanceof UnreadableSlotError)) {
+                throw error;
+            }
+            // An unreadable file has no counters to respect; the PIN dialog
+            // must still open so the user can forget it.
+        }
+        const failures = validFailures(envelope?.failures);
+        const lastFailureAt = validLastFailure(envelope?.lastFailureAt, this.now());
+        const retryAfterRaw = failures > 0 && lastFailureAt !== null ? lastFailureAt + backoffMs(failures) : null;
+        const retryAfterMs =
+            retryAfterRaw === null ? 0 : Math.min(Math.max(0, retryAfterRaw - this.now()), BACKOFF_MAX_MS);
+        return {
+            failures,
+            lastFailureAt,
+            retryAfterMs,
+            retryAt: retryAfterMs === 0 ? null : this.now() + retryAfterMs,
+        };
     }
 
-    /** Protect the stored session with a new PIN, replacing any old one. Needs the session readable. */
+    /**
+     * Protect the stored session with a new PIN, replacing any old one.
+     *
+     * Needs the session readable, or a value kept by {@link write} while the
+     * slot was locked: re-keying what is already in memory is safe, and it is
+     * the only copy of the newest tokens.
+     */
     async setPin(pin: string): Promise<void> {
         if (pin.length < MIN_PIN_LENGTH) {
             throw new Error(`The PIN needs at least ${MIN_PIN_LENGTH} characters`);
         }
-        const session = await this.read();
-        if (session === null) {
-            throw new Error('Sign in to Proton first; there is no session to protect yet');
-        }
+        const session = await this.sessionToProtect();
         const salt = crypto.getRandomValues(new Uint8Array(16));
         const raw = await deriveKeyBytes(pin, salt, this.iterations);
         this.unlocked = { key: await importAesKey(raw), raw, salt, iterations: this.iterations };
+        this.pending = null;
         await this.write(session);
+        await this.recordPinSet(true);
     }
 
-    /** Store the session without a PIN again. Needs the session readable. */
+    /**
+     * Store the session without a PIN again.
+     *
+     * A locked slot is refused rather than emptied: what is there can only be
+     * read with the current PIN, and deleting it would sign the user out of a
+     * session they still have on Proton.
+     */
     async removePin(): Promise<void> {
-        const session = await this.read();
+        const session = await this.sessionToProtect();
         this.unlocked = null;
-        if (session !== null) {
-            await this.inner.write(session);
-        }
+        this.pending = null;
+        await this.inner.write(session);
+        await this.recordPinSet(false);
     }
 
     /** Forget the key in memory, so the session needs the PIN again. Nothing stored changes. */
@@ -223,9 +310,18 @@ export class PinProtectedSlot implements SecretSlot {
         this.unlocked = null;
     }
 
-    /** The unlocked key, serialised for {@link RememberedUnlock}; null while locked. */
+    /**
+     * The unlocked key, serialised for {@link RememberedUnlock}; null while
+     * locked, and null when the slot underneath is not encrypted by the OS.
+     *
+     * The key is the PIN by another name: written where anything can read it,
+     * it removes the PIN's protection entirely, so it is only handed out for a
+     * slot the OS encrypts — the desktop file, never Obsidian's secret
+     * storage. On a phone the PIN is then asked for at every launch, which is
+     * what a PIN is for.
+     */
     exportKey(): string | null {
-        if (!this.unlocked) {
+        if (!this.unlocked || !osEncrypted(this.inner)) {
             return null;
         }
         return JSON.stringify({ key: toBase64(this.unlocked.raw), salt: toBase64(this.unlocked.salt) });
@@ -249,6 +345,7 @@ export class PinProtectedSlot implements SecretSlot {
         } catch {
             return false;
         }
+        await this.writePending();
         // A remembered key opens the session the PIN protects, so it counts as
         // a success: someone who had the device and the PIN is back.
         await this.clearFailures();
@@ -262,11 +359,94 @@ export class PinProtectedSlot implements SecretSlot {
      */
     async forget(): Promise<void> {
         this.unlocked = null;
+        this.pending = null;
         await this.inner.write(null);
+        await this.recordPinSet(false);
+    }
+
+    /** What the slot underneath holds, as far as it can be told. */
+    private async stored(): Promise<'none' | 'plain' | 'envelope' | 'unreadable'> {
+        let raw: string | null;
+        try {
+            raw = await this.inner.read();
+        } catch (error) {
+            if (error instanceof UnreadableSlotError) {
+                return 'unreadable';
+            }
+            throw error;
+        }
+        if (raw === null) {
+            return 'none';
+        }
+        return parseEnvelope(raw) ? 'envelope' : 'plain';
+    }
+
+    /** Whether the plugin's settings say a PIN was set; absent, the safe answer is yes. */
+    private async pinWasSet(): Promise<boolean> {
+        return this.pinSet?.isSet() ?? true;
+    }
+
+    private async recordPinSet(value: boolean): Promise<void> {
+        try {
+            // The plugin writes the flag to its settings; `Promise.resolve`
+            // covers a plain setter as well as one that saves asynchronously.
+            await Promise.resolve(this.pinSet?.set(value));
+        } catch {
+            // Best effort: the settings write is the caller's; the slot is
+            // already in the right state either way.
+        }
+    }
+
+    /** Write what a locked slot refused, now that the key is here. */
+    private async writePending(): Promise<void> {
+        const value = this.pending;
+        if (value === null || !this.unlocked) {
+            return;
+        }
+        this.pending = null;
+        try {
+            await this.inner.write(JSON.stringify(await encrypt(value, this.unlocked)));
+        } catch (error) {
+            // Put it back: the next unlock gets another try, and until then
+            // the newest tokens stay in memory rather than nowhere.
+            this.pending = value;
+            throw error;
+        }
+    }
+
+    /** The session a new or removed PIN applies to: the newest one this run knows of. */
+    private async sessionToProtect(): Promise<string> {
+        if (this.pending !== null) {
+            return this.pending;
+        }
+        let session: string | null;
+        try {
+            session = await this.read();
+        } catch (error) {
+            if (error instanceof LockedError) {
+                throw new Error('Enter the current PIN first; the stored session cannot be read without it');
+            }
+            throw error;
+        }
+        if (session === null) {
+            throw new Error('Sign in to Proton first; there is no session to protect yet');
+        }
+        return session;
     }
 
     private async keyFor(pin: string): Promise<UnlockedKey | null> {
-        const stored = await this.inner.read();
+        let stored: string | null;
+        try {
+            stored = await this.inner.read();
+        } catch (error) {
+            if (!(error instanceof UnreadableSlotError)) {
+                throw error;
+            }
+            // Nothing a PIN can open: the file is there but this device cannot
+            // decrypt it. Counted as a wrong PIN rather than thrown at the
+            // dialog, which offers "Forgot PIN" for exactly this case.
+            return null;
+        }
         const envelope = stored === null ? null : parseEnvelope(stored);
         if (!envelope) {
             return null;
@@ -295,7 +475,17 @@ export class PinProtectedSlot implements SecretSlot {
      * legitimate unlock.
      */
     private async recordFailure(): Promise<void> {
-        const envelope = parseEnvelope((await this.inner.read()) ?? '');
+        let envelope: Envelope | null;
+        try {
+            envelope = parseEnvelope((await this.inner.read()) ?? '');
+        } catch (error) {
+            if (error instanceof UnreadableSlotError) {
+                // Nothing to count beside a file this device cannot open, and
+                // losing the count is where it stood before; see below.
+                return;
+            }
+            throw error;
+        }
         if (!envelope) {
             // No PIN is set, so there is no guessing to slow and nothing to count against.
             return;
@@ -305,7 +495,15 @@ export class PinProtectedSlot implements SecretSlot {
 
     /** Forget the wait once a PIN was accepted. */
     private async clearFailures(): Promise<void> {
-        const envelope = parseEnvelope((await this.inner.read()) ?? '');
+        let envelope: Envelope | null;
+        try {
+            envelope = parseEnvelope((await this.inner.read()) ?? '');
+        } catch (error) {
+            if (error instanceof UnreadableSlotError) {
+                return;
+            }
+            throw error;
+        }
         if (!envelope || (envelope.failures === undefined && envelope.lastFailureAt === undefined)) {
             return;
         }
@@ -331,6 +529,41 @@ export class PinProtectedSlot implements SecretSlot {
  */
 function backoffMs(failures: number): number {
     return failures <= 0 ? 0 : Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
+}
+
+/**
+ * The failure count, as far as it can be believed.
+ *
+ * It is stored in the same file as the ciphertext, so anyone who can edit the
+ * file can edit it. A count that is not a finite positive number is no count;
+ * a count of a million is thirty seconds' wait, not a lockout.
+ */
+function validFailures(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        return 0;
+    }
+    return Math.min(Math.floor(value), 1_000);
+}
+
+/**
+ * When the last wrong PIN was tried, if that is a time this run can act on.
+ *
+ * A date in the future would hold off every try until it arrived — a file
+ * edited to say "next year" locked the owner out — and a value that is not a
+ * number would make the wait `NaN`, which compares false everywhere and
+ * refuses every PIN for ever. Anything further ahead than the longest wait is
+ * treated as no time at all.
+ */
+function validLastFailure(value: unknown, now: number): number | null {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > now + BACKOFF_MAX_MS) {
+        return null;
+    }
+    return value;
+}
+
+/** Whether the OS encrypts what `slot` holds; a slot that does not say is read as no. */
+function osEncrypted(slot: SecretSlot): boolean {
+    return slot.isEncrypted?.() === true;
 }
 
 async function deriveKeyBytes(
@@ -422,19 +655,42 @@ function fromBase64(text: string): Uint8Array<ArrayBuffer> {
  * enforces: an expired key is deleted the next time the plugin looks, and
  * until then it is still there to be read. Only used when the user picks a
  * time limit; the default, a PIN at every launch, never stores it.
+ *
+ * It is also only used where the OS encrypts the slot. Obsidian's secret
+ * storage is readable by every plugin and is plaintext on mobile, so a key
+ * kept there would sit in the clear and the PIN would protect nothing; on such
+ * a device {@link canRemember} is false and {@link save} refuses.
  */
 export class RememberedUnlock {
     constructor(
         private readonly slot: SecretSlot,
         private readonly now: () => number = () => Date.now(),
+        /** Refuse a slot the OS does not encrypt. On by default; see the class comment. */
+        private readonly options: { encryptedOnly?: boolean } = {},
     ) {}
 
-    async save(exportedKey: string, expiresAt: number): Promise<void> {
+    /** Whether a key may be kept here at all. */
+    canRemember(): boolean {
+        return this.options.encryptedOnly === false || osEncrypted(this.slot);
+    }
+
+    /**
+     * Keep the key until `expiresAt`, or report false without writing anything
+     * when the slot is not encrypted.
+     */
+    async save(exportedKey: string, expiresAt: number): Promise<boolean> {
+        if (!this.canRemember()) {
+            return false;
+        }
         await this.slot.write(JSON.stringify({ exportedKey, expiresAt }));
+        return true;
     }
 
     /** The key, if one is stored and has not expired. An expired one is deleted. */
     async load(): Promise<string | null> {
+        if (!this.canRemember()) {
+            return null;
+        }
         const raw = await this.slot.read();
         if (raw === null) {
             return null;

@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import type { DataAdapter, SecretStorage } from 'obsidian';
 
 import { Credentials } from '../src/proton/credentials';
-import { LockedError, PinProtectedSlot } from '../src/proton/pinLock';
+import { PinProtectedSlot } from '../src/proton/pinLock';
 import { ObsidianSecretSlot, type SecretSlot } from '../src/proton/secretStore';
 import { Logger } from '../src/util/logger';
 
@@ -123,7 +123,7 @@ describe('Credentials', () => {
         assert.equal(notified, true);
     });
 
-    it('keeps the refreshed tokens in memory, not in the envelope, while the PIN is locked', async () => {
+    it('keeps a refresh the locked envelope refused, and it is what the unlock restores', async () => {
         const inner = memorySlot(SESSION);
         const pinSlot = new PinProtectedSlot(inner, 1000);
         await pinSlot.setPin('482915');
@@ -132,18 +132,85 @@ describe('Credentials', () => {
         await credentials.load();
         assert.equal(credentials.isLoggedIn(), true);
 
-        // What lockNow does, then a token refresh that finishes afterwards.
-        credentials.unload();
+        // What lockNow does next, then a token refresh that finishes just
+        // before the credentials unload: the write is refused, and Proton has
+        // already rotated the refresh token away.
         pinSlot.lock();
         await credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'refreshed-token', refreshToken: 'refresh-2' });
 
         const stored = inner.value!;
         assert.ok(stored.startsWith('{"format":"proton-drive-sync/pin-v1"'), stored);
         assert.ok(!stored.includes('refreshed-token'), 'the envelope must not be replaced by plaintext');
-        // The update is dropped from the store, not from memory: the plugin
-        // keeps working with the new token until it locks or closes.
+        assert.equal(credentials.accessToken, 'refreshed-token', 'the run keeps using the fresh pair');
+
+        // The unlock is what writes it, and the session loaded afterwards is
+        // the fresh pair rather than the one Proton already replaced.
+        credentials.unload();
+        assert.equal(await pinSlot.unlock('482915'), true);
+        await credentials.load();
         assert.equal(credentials.accessToken, 'refreshed-token');
-        await assert.rejects(pinSlot.read(), LockedError);
+        assert.equal(credentials.refreshToken, 'refresh-2');
+        assert.ok(inner.value!.startsWith('{"format":"proton-drive-sync/pin-v1"'), String(inner.value));
+    });
+
+    it('drops a token refresh that lands after unload, rather than signing back in behind the lock', async () => {
+        const slot = memorySlot(SESSION);
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(slot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+        await credentials.load();
+
+        credentials.unload();
+        await credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'refreshed-token', refreshToken: 'refresh-2' });
+
+        assert.equal(credentials.accessToken, undefined);
+        assert.equal(credentials.isLoggedIn(), false);
+        assert.equal(slot.value, SESSION, 'the stored session is what the unlock reads');
+    });
+
+    it('accepts a new sign-in after a lock, which the lock was never about', async () => {
+        const slot = memorySlot(SESSION);
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(slot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+        await credentials.load();
+        credentials.unload();
+
+        // What the fork sign-in does: the key password, then the session.
+        await credentials.setUserKeyPassword('key-password-2');
+        await credentials.setSessionInfo({ uid: 'uid-9', accessToken: 'signed-in', refreshToken: 'r9' });
+
+        assert.equal(credentials.isLoggedIn(), true);
+        assert.equal(credentials.accessToken, 'signed-in');
+        assert.equal(JSON.parse(slot.value!).accessToken, 'signed-in');
+    });
+
+    it('loads nothing from a locked slot instead of throwing', async () => {
+        const inner = memorySlot(SESSION);
+        const pinSlot = new PinProtectedSlot(inner, 1000);
+        await pinSlot.setPin('482915');
+        pinSlot.lock();
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(pinSlot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+
+        await credentials.load();
+
+        assert.equal(credentials.isLoggedIn(), false);
+        assert.equal(inner.value!.startsWith('{"format":"proton-drive-sync/pin-v1"'), true);
+    });
+
+    it('leaves a session already in memory alone, rather than re-reading an older envelope', async () => {
+        const slot = memorySlot(SESSION);
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(slot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+        await credentials.load();
+
+        // The slot's write was refused, so what is stored is still the older
+        // pair while memory holds the fresh one.
+        await credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'fresh', refreshToken: 'r2' });
+        slot.value = SESSION;
+        await credentials.load();
+
+        assert.equal(credentials.accessToken, 'fresh');
+        assert.equal(credentials.refreshToken, 'r2');
     });
 
     it('tells listeners when the session is unloaded for a lock', async () => {

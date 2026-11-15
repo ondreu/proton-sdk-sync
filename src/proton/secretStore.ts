@@ -7,6 +7,14 @@ import type { Logger } from '../util/logger';
  * encrypt what it stores; see `PinProtectedSlot`.
  */
 export interface SecretSlot {
+    /**
+     * The stored value, or `null` when nothing is stored.
+     *
+     * @throws {@link UnreadableSlotError} when something is stored but cannot
+     * be read back. That is not the same as nothing being there, and callers
+     * must not treat it as one: a PIN-protected envelope that cannot be opened
+     * would otherwise look like an empty slot and be replaced with plaintext.
+     */
     read(): Promise<string | null>;
     /**
      * `null` clears the secret.
@@ -16,6 +24,14 @@ export interface SecretSlot {
      * keeps it in memory and drops the write.
      */
     write(value: string | null): Promise<void>;
+    /**
+     * Whether the platform encrypts what this slot holds at rest.
+     *
+     * Only a slot that answers `true` may keep a derived PIN key across
+     * restarts; see `RememberedUnlock`. Optional so a test double need not
+     * implement it, and read as "not encrypted" when absent.
+     */
+    isEncrypted?(): boolean;
 }
 
 /**
@@ -29,6 +45,25 @@ export class LockedSlotError extends Error {
     constructor() {
         super('The stored secret is locked; the write was refused');
         this.name = 'LockedSlotError';
+    }
+}
+
+/**
+ * Something is stored, but it cannot be read back.
+ *
+ * Distinct from `null`, which means nothing is stored. A file that exists and
+ * will not decrypt is usually a session this device can no longer open — a
+ * reinstalled keychain, a different OS user, a torn write — and reporting it
+ * as absent made a PIN-protected slot look unprotected, after which the next
+ * token refresh stored the session in the clear over the envelope.
+ */
+export class UnreadableSlotError extends Error {
+    constructor(
+        readonly path: string,
+        options?: { cause?: unknown },
+    ) {
+        super(`The stored secret at ${path} cannot be read; it was left as it is`, options);
+        this.name = 'UnreadableSlotError';
     }
 }
 
@@ -56,6 +91,16 @@ export class ObsidianSecretSlot implements SecretSlot {
 
     async write(value: string | null): Promise<void> {
         this.storage.setSecret(this.id, value ?? '');
+    }
+
+    /**
+     * No: this is one namespace every plugin can read with a single call, and
+     * on mobile nothing encrypts it at rest. A derived key kept here would
+     * stand in for the PIN without being protected any better than the
+     * envelope is.
+     */
+    isEncrypted(): boolean {
+        return false;
     }
 }
 
@@ -128,39 +173,90 @@ export class SafeStorageFileSlot implements SecretSlot {
         private readonly safeStorage: SafeStorageWithEncryption,
     ) {}
 
+    /**
+     * The stored session, `null` when there is none.
+     *
+     * @throws {@link UnreadableSlotError} when the file exists and cannot be
+     * decrypted. Returning `null` for that made a lock look like an empty
+     * slot; see {@link UnreadableSlotError}.
+     */
     async read(): Promise<string | null> {
         if (!(await this.adapter.exists(this.path))) {
             return null;
         }
+        let encoded: string;
         try {
-            const encoded = await this.adapter.read(this.path);
+            encoded = await this.adapter.read(this.path);
+        } catch (error) {
+            // Present but unreadable: a different OS user, a filesystem the
+            // app cannot reach. Not the same as an absent file.
+            throw new UnreadableSlotError(this.path, { cause: error });
+        }
+        try {
             const value = this.safeStorage.decryptString(Buffer.from(encoded, 'base64')) || null;
             if (value !== null) {
                 // Heal a file an older version wrote readable by everyone.
                 this.closeToOthers();
             }
             return value;
-        } catch {
-            // A different OS user, a reinstalled keychain, or a corrupted file:
-            // the secret is unreadable, and saying so is better than throwing
-            // on every start. The caller signs in again.
-            return null;
+        } catch (error) {
+            // A reinstalled keychain, another OS user, or a damaged file: the
+            // secret is unreadable, and saying so is better than throwing on
+            // every start. What must not happen is calling it absent.
+            throw new UnreadableSlotError(this.path, { cause: error });
         }
     }
 
+    /**
+     * Store the session, whole or not at all.
+     *
+     * `write` truncates before it writes, so a crash or a full disk halfway
+     * through leaves a file that no longer decrypts - the very state that
+     * reads as unreadable. Writing beside the file and renaming over it means
+     * the old envelope stays in place until the new one is complete.
+     */
     async write(value: string | null): Promise<void> {
         if (value === null) {
-            if (await this.adapter.exists(this.path)) {
-                await this.adapter.remove(this.path);
-            }
+            await this.removeQuietly(this.path);
+            await this.removeQuietly(this.tempPath);
             return;
         }
-        await this.adapter.write(this.path, this.safeStorage.encryptString(value).toString('base64'));
+        const encoded = this.safeStorage.encryptString(value).toString('base64');
+        await this.adapter.write(this.tempPath, encoded);
+        this.closeToOthers(this.tempPath);
+        try {
+            await this.adapter.rename(this.tempPath, this.path);
+        } catch (error) {
+            // The old envelope is still there and still opens; leave it that
+            // way rather than falling back to a direct write.
+            await this.removeQuietly(this.tempPath);
+            throw error;
+        }
         this.closeToOthers();
     }
 
+    /** SafeStorage: whatever the OS keystore is, this file is encrypted with it. */
+    isEncrypted(): boolean {
+        return true;
+    }
+
+    /** Where a write lands before it is renamed over {@link path}. */
+    private get tempPath(): string {
+        return `${this.path}.tmp`;
+    }
+
+    private async removeQuietly(path: string): Promise<void> {
+        try {
+            if (await this.adapter.exists(path)) {
+                await this.adapter.remove(path);
+            }
+        } catch {
+            // Best effort: a file left behind is overwritten by the next write.
+        }
+    }
+
     /** Make an existing file private, in case an older version wrote it 0644. */
-    closeToOthers(): void {
+    closeToOthers(target = this.path): void {
         const fs = nodeFs();
         if (!fs) {
             return;
@@ -168,9 +264,9 @@ export class SafeStorageFileSlot implements SecretSlot {
         // `fs` resolves a relative path against Obsidian's working directory,
         // which is not the vault, so the path has to become absolute first.
         const base = (this.adapter as unknown as { getBasePath?: () => string }).getBasePath?.();
-        const target = base && !this.path.startsWith('/') ? `${base}/${this.path}` : this.path;
+        const resolved = base && !target.startsWith('/') ? `${base}/${target}` : target;
         try {
-            fs.chmodSync(target, 0o600);
+            fs.chmodSync(resolved, 0o600);
         } catch {
             // Best effort: a filesystem without modes, or a path the app cannot
             // reach from Node. The permission check reports what it sees.
@@ -207,9 +303,17 @@ export function encryptedStorage(logger: Logger): SafeStorageWithEncryption | nu
  * Move a value left in Obsidian's secret storage into `to`, then clear it, so
  * upgrading does not sign anyone out and the old copy stops being readable by
  * other plugins. Best effort: a failure here means the user signs in again.
+ *
+ * An unreadable target counts as occupied: it is not an empty slot, and
+ * overwriting it would lose whatever it holds.
  */
 export async function migrateSecret(from: ObsidianSecretSlot, to: SecretSlot): Promise<boolean> {
-    const existing = await to.read();
+    let existing: string | null;
+    try {
+        existing = await to.read();
+    } catch {
+        return false;
+    }
     if (existing !== null) {
         return false;
     }

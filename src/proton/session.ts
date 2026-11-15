@@ -180,9 +180,13 @@ export class ProtonSession {
             this.auth = account.auth;
             this.addresses = account.addresses;
             this.srp = account.srp;
-        } else {
+        } else if (!this.credentials.isLoggedIn()) {
             // Unlocking after the PIN locked, or signing in again: read what is
-            // stored now, without building the account a second time.
+            // stored now, without building the account a second time. Skipped
+            // when a session is already in memory, which is the newer copy -
+            // a refresh that landed while the PIN was locked is written to the
+            // envelope by the unlock, and re-reading before that would restore
+            // the tokens Proton has already rotated away.
             await this.auth.loadSession();
         }
 
