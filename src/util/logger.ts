@@ -46,6 +46,9 @@ const NODE_UID = /[A-Za-z0-9_+/=~-]{32,}/g;
  */
 const PROTON_HOSTS = ['drive-api.proton.me', 'account.proton.me'];
 
+/** Proton's regional block storage, handed out by the Drive API at runtime. */
+const PROTON_HOST = /^(?:[a-z0-9-]+\.)*(?:proton\.me|proton\.ch)$/;
+
 /**
  * Proton's API paths, which are endpoints rather than notes.
  *
@@ -68,14 +71,20 @@ function looksLikeName(value: string): boolean {
     return core.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(core);
 }
 
+/** A Proton host, named or regional; see `PROTON_HOSTS`. */
+function isProtonHost(host: string): boolean {
+    return PROTON_HOSTS.includes(host) || PROTON_HOST.test(host);
+}
+
 /** Whether a token names Proton's API rather than anything the user owns. */
 function isProtonEndpoint(value: string): boolean {
     const lower = value.toLowerCase();
     const url = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(value);
     if (url) {
-        return PROTON_HOSTS.includes(url[1].toLowerCase().replace(/:\d+$/, ''));
+        return isProtonHost(url[1].toLowerCase().replace(/:\d+$/, ''));
     }
-    if (PROTON_HOSTS.includes(lower.replace(/\/+$/, ''))) {
+    const bare = lower.replace(/\/+$/, '');
+    if (isProtonHost(bare)) {
         return true;
     }
     return lower.startsWith('/') && PROTON_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix));

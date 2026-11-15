@@ -217,8 +217,17 @@ export class SafeStorageFileSlot implements SecretSlot {
      */
     async write(value: string | null): Promise<void> {
         if (value === null) {
-            await this.removeQuietly(this.path);
+            // Best effort for the temp file, but a session that could not be
+            // removed is worth saying: the next start would find it and offer
+            // the PIN for a session the user believes is gone.
             await this.removeQuietly(this.tempPath);
+            if (await this.adapter.exists(this.path)) {
+                try {
+                    await this.adapter.remove(this.path);
+                } catch (error) {
+                    console.warn("Proton-SDK-Sync: could not remove the stored session", error);
+                }
+            }
             return;
         }
         const encoded = this.safeStorage.encryptString(value).toString('base64');
@@ -235,9 +244,9 @@ export class SafeStorageFileSlot implements SecretSlot {
         this.closeToOthers();
     }
 
-    /** SafeStorage: whatever the OS keystore is, this file is encrypted with it. */
+    /** SafeStorage over a real keystore; see {@link osKeystoreAvailable}. */
     isEncrypted(): boolean {
-        return true;
+        return osKeystoreAvailable(this.safeStorage);
     }
 
     /** Where a write lands before it is renamed over {@link path}. */
@@ -277,6 +286,16 @@ export class SafeStorageFileSlot implements SecretSlot {
 export type SafeStorageWithEncryption = SafeStorage & { encryptString(value: string): Buffer };
 
 /** Electron's `safeStorage`, when this platform can encrypt at all; null otherwise (mobile, or no keyring). */
+/** Whether the OS keystore behind `safeStorage` is a real one. */
+export function osKeystoreAvailable(storage: SafeStorage): boolean {
+    // Electron falls back to `basic_text` — a hard-coded password — when no
+    // keystore is present (a Linux box without libsecret, typically). Its
+    // encrypted files are readable by anything that can read the file, which is
+    // not what a session or a remembered PIN key is kept in a keystore for.
+    const backend = (storage as SafeStorage & { getSelectedStorageBackend?: () => string }).getSelectedStorageBackend?.();
+    return backend !== 'basic_text';
+}
+
 export function encryptedStorage(logger: Logger): SafeStorageWithEncryption | null {
     if (!Platform.isDesktopApp) {
         return null;
@@ -289,7 +308,11 @@ export function encryptedStorage(logger: Logger): SafeStorageWithEncryption | nu
                 ((required?.remote as Record<string, unknown> | undefined)?.safeStorage as
                     | SafeStorageWithEncryption
                     | undefined);
-            if (candidate?.isEncryptionAvailable?.() === true && typeof candidate.encryptString === 'function') {
+            if (
+                candidate?.isEncryptionAvailable?.() === true &&
+                typeof candidate.encryptString === 'function' &&
+                osKeystoreAvailable(candidate)
+            ) {
                 return candidate;
             }
         } catch (error) {

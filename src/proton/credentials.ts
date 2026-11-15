@@ -39,6 +39,14 @@ export class Credentials implements SessionCredentials {
      * nothing may put it back except a load.
      */
     private locked = false;
+    /**
+     * A token pair that arrived while the PIN had the session unloaded.
+     *
+     * Held in memory only, and only until the next load: writing it is refused
+     * while locked, and dropping it would leave a rotated-away refresh token in
+     * the envelope. See {@link setSessionInfo}.
+     */
+    private pendingRefresh: SessionInfo | null = null;
     private readonly listeners = new Set<() => void>();
     /** The save queue: each save starts after the one before it has finished. */
     private pendingSave: Promise<void> = Promise.resolve();
@@ -135,15 +143,33 @@ export class Credentials implements SessionCredentials {
         } catch (error) {
             this.logger.error('Failed to read the stored session', error);
         }
+        if (this.session !== null && this.pendingRefresh !== null) {
+            // A refresh that finished while the PIN had the session unloaded:
+            // applied over what was stored, so the key password and the rest
+            // of the session survive, and written now that the slot can.
+            const { uid, accessToken, refreshToken } = this.pendingRefresh;
+            this.pendingRefresh = null;
+            this.session = {
+                ...this.session,
+                uid,
+                accessToken,
+                ...(refreshToken !== undefined && { refreshToken }),
+            };
+            await this.persist();
+            this.emitChanged();
+        }
     }
 
     async setSessionInfo(info: SessionInfo): Promise<void> {
         if (this.locked) {
-            // The PIN locked the session away; a refresh that finishes
-            // afterwards must not bring it back into memory behind the lock.
-            // The tokens it carries are gone with it, which is why the slot
-            // keeps a refused write for the next unlock.
-            this.logger.debug('The session is unloaded for the PIN lock; dropping a token refresh');
+            // The PIN locked the session away. The tokens must not be written
+            // — the slot would refuse, and the envelope is the only copy that
+            // may exist on disk — but they must not be dropped either: Proton
+            // rotates the refresh token on use, so the stored one is already
+            // dead. They wait here and are merged at the next load(), which is
+            // the first moment they can be stored encrypted.
+            this.logger.debug('The session is unloaded for the PIN lock; holding a token refresh for the next unlock');
+            this.pendingRefresh = info;
             return;
         }
         this.session = {
@@ -203,12 +229,14 @@ export class Credentials implements SessionCredentials {
     unload(): void {
         this.session = null;
         this.locked = true;
+        this.pendingRefresh = null;
         this.emitChanged();
     }
 
     async signOut(): Promise<void> {
         this.session = null;
         this.locked = false;
+        this.pendingRefresh = null;
         await this.enqueueSave(null);
         await this.removeLegacyFile();
         this.emitChanged();

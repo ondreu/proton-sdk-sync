@@ -226,6 +226,8 @@ export class SyncEngine {
      * follows it while the files are unchanged, so nothing is hashed twice.
      */
     private readonly plannedLocal = new Map<string, LocalState>();
+    /** Records a rename could explain but this device cannot read; see `followLocalRenames`. */
+    private readonly unverifiableRenames = new Set<string>();
     /** Settings files downloaded by the first sync now running; null when this is not a first sync. */
     private adoptingSettings: string[] | null = null;
     /**
@@ -411,6 +413,10 @@ export class SyncEngine {
             return;
         }
         this.massDelete = null;
+        // The batch that produced the hold is answered too; leaving it would
+        // let the next incremental pass rebuild the same question out of
+        // deletions that have already been carried out.
+        this.batchDeletes.clear();
         this.report();
         if (!this.drive || !this.rootUid) {
             return;
@@ -693,6 +699,12 @@ export class SyncEngine {
         this.pendingRenames = [];
         this.pendingFolderDeletes.clear();
         this.plannedLocal.clear();
+        this.unverifiableRenames.clear();
+        // A decision about deletions belongs to the run that found them: with
+        // the engine stopped there is nothing to approve, and the panel must
+        // not offer it.
+        this.massDelete = null;
+        this.batchDeletes.clear();
         this.deferredFullSync = false;
         this.abortController?.abort();
         await starting?.catch(() => undefined);
@@ -1396,18 +1408,13 @@ export class SyncEngine {
             ...(local !== undefined && { local }),
             ...(remote !== undefined && { remote }),
         });
-        const recordedSize = record?.base?.size;
-        if (action.type === 'delete-remote' && local === undefined && recordedSize !== undefined && recordedSize > limit) {
-            // The record says the file was here, its Drive revision has not
-            // moved, and this device cannot read it: over the size limit, or
-            // not there at all, which from here looks the same. Trashing the
-            // node would take the file off every other device, so it is left
-            // on Drive and held until it can be checked. Narrowing the catch
-            // that reads it is not enough on its own; see
-            // {@link followLocalRenames}, which can no longer pair a rename
-            // with a file it cannot hash.
-            this.logger.info(`Leaving "${path}" on Drive: it cannot be read here, and ${megabytes(recordedSize)} MB is over the limit`);
-            this.tooLarge.set(path, recordedSize);
+        if (action.type === 'delete-remote' && local === undefined && this.unverifiableRenames.has(path)) {
+            // The file is gone from here, but a same-sized file that could not
+            // be read might be it under a new name; see `followLocalRenames`.
+            // Trashing the node would take it off every other device, so it
+            // waits. A path with no such candidate is simply deleted, which is
+            // what a user deleting a large file expects.
+            this.logger.info(`Leaving "${path}" on Drive: it is missing here, and a file of the same size could not be read`);
             return null;
         }
         if (remote?.size !== undefined && remote.size > limit && (action.type === 'download' || action.type === 'conflict')) {
@@ -2331,6 +2338,7 @@ export class SyncEngine {
             filter: () => this.filter,
             vault: this.vault,
             plannedLocal: this.plannedLocal,
+            unverifiableRenames: this.unverifiableRenames,
             moveRemoteNode: (nodeUid, toPath) => this.moveRemoteNode(nodeUid, toPath),
             logger: this.logger,
         };
@@ -2474,6 +2482,10 @@ export class SyncEngine {
                 continue;
             }
             if (await absent(path)) {
+                if (this.unverifiableRenames.has(path)) {
+                    // A rename this device cannot rule out; decide() keeps it.
+                    continue;
+                }
                 if (removesRemote(reconcile({ path, base: record.base, remote: remoteState }))) {
                     files.push(path);
                 }
@@ -2485,7 +2497,15 @@ export class SyncEngine {
         // decision that carrying out can never settle.
         const folders: string[] = [];
         for (const [path, uid] of deletedFolders) {
-            if (await this.drive!.hasLiveChildren(uid)) {
+            try {
+                if (await this.drive!.hasLiveChildren(uid)) {
+                    continue;
+                }
+            } catch (error) {
+                // Not counted this pass: a folder that cannot be checked must
+                // not hold the whole walk, and counting it could promise a
+                // deletion that never happens.
+                this.logger.warn(`Could not check whether "${path}" still holds files`, error);
                 continue;
             }
             folders.push(path);
@@ -2516,18 +2536,29 @@ export class SyncEngine {
         if (seen <= threshold) {
             return new Set();
         }
-        if (this.massDelete === null) {
-            this.massDelete = { paths: outstanding, approved: false };
-            this.noteHeldDeletions(outstanding.length, threshold);
-        } else {
-            // Added to the hold rather than replacing it: a later batch cannot
-            // know about the deletions the earlier ones held.
-            const known = new Set(this.massDelete.paths);
-            for (const path of outstanding) {
-                if (!known.has(path)) {
-                    this.massDelete.paths.push(path);
-                }
+        // Added to the hold rather than replacing it: a later batch cannot know
+        // about the deletions the earlier ones held. Only paths still to be
+        // deleted stay in it — a file that came back, or whose record is gone,
+        // is no longer part of the question, and holding it would keep it out
+        // of every pass until the next full walk.
+        const held: string[] = [];
+        for (const path of new Set([...(this.massDelete?.paths ?? []), ...outstanding])) {
+            if (this.state.get(path) === undefined) {
+                continue;
             }
+            if (await absent(path)) {
+                held.push(path);
+            }
+        }
+        if (held.length === 0) {
+            this.massDelete = null;
+            return new Set();
+        }
+        if (this.massDelete === null) {
+            this.massDelete = { paths: held, approved: false };
+            this.noteHeldDeletions(held.length, threshold);
+        } else {
+            this.massDelete.paths = held;
         }
         return new Set(this.massDelete.paths);
     }
@@ -2574,7 +2605,11 @@ export class SyncEngine {
             } catch (error) {
                 // One folder that cannot be removed does not fail the pass, and
                 // is queued so the next one tries again rather than waiting for
-                // another full walk to find it still there.
+                // another full walk to find it still there. It goes into the
+                // folder queue as well: a retry keyed on a folder path is never
+                // read back as a file, so the state retry alone would be
+                // cleared without the folder being touched.
+                this.pendingFolderDeletes.add(path);
                 this.noteItemFailure(path, error, 'Could not remove folder');
             }
         }

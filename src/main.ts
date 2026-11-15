@@ -267,6 +267,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             },
         });
         this.rememberedUnlock = new RememberedUnlock(unlockInner, () => Date.now(), { encryptedOnly: true });
+        if (!this.settings.pinProtected && (await runtime.sessionSlot.protection()) === 'pin') {
+            // A PIN set before this version was recorded nowhere; without the
+            // record, an unreadable envelope reads as "no PIN" and may be
+            // overwritten in the clear.
+            this.settings.pinProtected = true;
+            await this.saveSettings();
+        }
         const credentials = new Credentials(
             runtime.sessionSlot,
             {
@@ -540,6 +547,17 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
+    /**
+     * Whether the unlocked key has anywhere encrypted to wait out a time limit.
+     *
+     * Without a keystore — mobile, or a Linux desktop falling back to Electron's
+     * `basic_text` — the key would sit in the clear, so the setting is not
+     * offered and the PIN is asked for whenever Obsidian starts.
+     */
+    canRememberPin(): boolean {
+        return this.rememberedUnlock.canRemember();
+    }
+
     /** The time limit for the PIN changed in the settings. */
     async onPinLockAfterChanged(): Promise<void> {
         this.markActive();
@@ -622,7 +640,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             new PinFormModal(this.app, {
                 mode: 'confirm',
                 purpose,
-                verify: (pin) => runtime.sessionSlot.verify(pin),
+                // Proving the PIN for a sign-out must not unlock the slot: the
+                // user can still cancel, and the interface would then say
+                // "locked" over a session whose key is in memory.
+                verify: (pin) => runtime.sessionSlot.verifyOnly(pin),
                 apply: async () => undefined,
                 onDone: resolve,
             }).open();
@@ -940,6 +961,12 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
         if (!this.isConfigured()) {
             this.notify(syncNowResult({ ...runtime.engine.getSummary(), status: 'not-configured' }));
+            return;
+        }
+        if (!runtime.engine.isConnected()) {
+            // The engine is stopped — locked, signed out, or between runs — and
+            // a pass asked for now would be dropped, so do not report one.
+            this.notify('Nothing was compared: syncing is not running right now.');
             return;
         }
         await runtime.engine.syncNow();

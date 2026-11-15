@@ -253,4 +253,20 @@ describe('mergeThreeWay — edits to the same line', () => {
             'a\r\nthe new text here\r\nz',
         );
     });
+    it('does not resurrect a line one side deleted to make room for an insertion', () => {
+        // The wide side carries `c` back because it kept the base line; taking
+        // it would bring back what the narrow side deleted, so this is a
+        // conflict, not a merge.
+        assert.equal(
+            refusal('x/b/c/y', 'x/B/y', 'x/B/extra/c/y'),
+            'overlapping-edits',
+            'a word-level merge would put the deleted c back',
+        );
+    });
+
+    it('does not duplicate a line when the sides changed different base lines', () => {
+        // The narrow side deleted `x`; the wide side still has it. A word merge
+        // of the span produced W/X/X/y/z, dropping the deletion and doubling X.
+        assert.equal(refusal('w/x/y/z', 'W/X/x/y/z', 'W/X/y/z'), 'overlapping-edits');
+    });
 });

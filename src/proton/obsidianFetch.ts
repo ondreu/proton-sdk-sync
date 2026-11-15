@@ -71,7 +71,7 @@ export async function obsidianFetch(input: RequestInfo | URL, init?: RequestInit
  * request instead.
  */
 function refuseRedirect(from: string, status: number, headers: Record<string, string> | undefined): void {
-    if (status < 300 || status >= 400) {
+    if (status < 300 || status >= 400 || status === 304) {
         return;
     }
     const location = headers?.['location'] ?? headers?.['Location'];

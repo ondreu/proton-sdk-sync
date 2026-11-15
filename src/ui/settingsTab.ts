@@ -237,7 +237,15 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                         'this device could take your sign-in as if there were no PIN, and if Obsidian stays closed the key ' +
                         'stays there until it next runs. "Every time Obsidian opens" never keeps it.',
                     aliases: ['lock', 'timeout', 'auto-lock', 'idle'],
-                    visible: signedIn && !locked && this.plugin.pinEnabled,
+                    // Without a keystore there is nowhere encrypted to keep the
+                    // unlocked key, so the limit could not be honoured; better
+                    // not to offer it than to ask for the PIN every time anyway.
+                    visible:
+                        signedIn &&
+                        !locked &&
+                        this.plugin.pinEnabled &&
+                        Platform.isDesktopApp &&
+                        this.plugin.canRememberPin(),
                     control: { type: 'dropdown', key: 'pinLockAfterMinutes', options: PIN_LOCK_OPTIONS },
                 },
             ],

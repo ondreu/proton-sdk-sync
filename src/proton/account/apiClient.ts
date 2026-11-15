@@ -252,7 +252,10 @@ function neverLeftTheProcess(error: unknown): boolean {
     if (!(error instanceof Error)) {
         return false;
     }
-    return error.name === 'TypeError' || NEVER_LEFT_THE_PROCESS.test(`${error.name}: ${error.message}`);
+    // Not `error.name === 'TypeError'`: a fetch transport reports a connection
+    // reset *after* sending as a TypeError, and replaying that would present a
+    // refresh token Proton has already rotated. Only the message decides.
+    return NEVER_LEFT_THE_PROCESS.test(`${error.name}: ${error.message}`);
 }
 
 /**
@@ -269,9 +272,10 @@ function neverLeftTheProcess(error: unknown): boolean {
  * transient failure, and the tokens are kept for the next request to try.
  */
 async function sessionIsOver(response: Response): Promise<boolean> {
-    if (response.status !== 400 && response.status !== 401 && response.status !== 403) {
-        return false;
-    }
+    // The body decides, not the status: Proton has answered 422 with
+    // Code 10013 for a dead refresh token, and a status-only rule left the
+    // session "signed in" while every request failed. A body that is not
+    // Proton's JSON — a portal's page, a proxy's challenge — never counts.
     return namesDeadSession(response);
 }
 

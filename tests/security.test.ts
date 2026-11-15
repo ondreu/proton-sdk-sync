@@ -418,7 +418,9 @@ describe('a refresh Proton refused, and one the network never delivered', () => 
         const { credentials, ended, get } = api((request) => {
             if (request.url.endsWith('/auth/v4/refresh')) {
                 refreshes += 1;
-                return new TypeError('Failed to fetch');
+                // The shape Obsidian's requestUrl rejects with when the request
+                // never left the device.
+                return new Error('net::ERR_INTERNET_DISCONNECTED');
             }
             return json({}, 401);
         });
@@ -426,6 +428,26 @@ describe('a refresh Proton refused, and one the network never delivered', () => 
         await assert.rejects(get(), HTTPError);
 
         assert.equal(refreshes, 3, 'one try and two retries');
+        assert.equal(credentials.signedOut, false);
+        assert.equal(ended.count, 0);
+    });
+
+    it('does not repeat a refresh that a reset may have delivered', async () => {
+        let refreshes = 0;
+        const { credentials, ended, get } = api((request) => {
+            if (request.url.endsWith('/auth/v4/refresh')) {
+                refreshes += 1;
+                // What a fetch transport says when the connection dropped after
+                // the request was sent: it may already have been processed, and
+                // repeating it would present a rotated token.
+                return new TypeError('Failed to fetch');
+            }
+            return json({}, 401);
+        });
+
+        await assert.rejects(get(), HTTPError);
+
+        assert.equal(refreshes, 1, 'one attempt, because the request may have been handled');
         assert.equal(credentials.signedOut, false);
         assert.equal(ended.count, 0);
     });

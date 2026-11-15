@@ -218,6 +218,21 @@ export class PinProtectedSlot implements SecretSlot {
      * readable.
      */
     async verify(pin: string): Promise<boolean> {
+        return this.check(pin, true);
+    }
+
+    /**
+     * Check a PIN without unlocking the slot.
+     *
+     * For a caller that may be cancelled — proving the PIN before signing out,
+     * for instance. Adopting the key there would leave the session unlocked
+     * while the interface still says it is locked.
+     */
+    async verifyOnly(pin: string): Promise<boolean> {
+        return this.check(pin, false);
+    }
+
+    private async check(pin: string, adopt: boolean): Promise<boolean> {
         if (!(await this.mayTryNow())) {
             return false;
         }
@@ -226,8 +241,10 @@ export class PinProtectedSlot implements SecretSlot {
             await this.recordFailure();
             return false;
         }
-        this.unlocked = key;
-        await this.writePending();
+        if (adopt) {
+            this.unlocked = key;
+            await this.writePending();
+        }
         await this.clearFailures();
         return true;
     }
@@ -329,7 +346,15 @@ export class PinProtectedSlot implements SecretSlot {
 
     /** Unlock with a key from {@link exportKey}. False if it does not open the stored session. */
     async unlockWithKey(exported: string): Promise<boolean> {
-        const envelope = parseEnvelope((await this.inner.read()) ?? '');
+        let stored: string | null;
+        try {
+            stored = await this.inner.read();
+        } catch {
+            // Nothing can be unlocked from a file that cannot be read; the PIN
+            // form is the way forward.
+            return false;
+        }
+        const envelope = parseEnvelope(stored ?? '');
         if (!envelope) {
             return false;
         }
@@ -689,9 +714,19 @@ export class RememberedUnlock {
     /** The key, if one is stored and has not expired. An expired one is deleted. */
     async load(): Promise<string | null> {
         if (!this.canRemember()) {
+            // Nothing may be kept here, and anything an older version kept
+            // should not stay: it is the key to the session, in the clear.
+            await this.clear();
             return null;
         }
-        const raw = await this.slot.read();
+        let raw: string | null;
+        try {
+            raw = await this.slot.read();
+        } catch {
+            // Unreadable is not a reason to refuse to start: treat it as
+            // nothing remembered, and let the PIN prompt take over.
+            return null;
+        }
         if (raw === null) {
             return null;
         }

@@ -114,7 +114,11 @@ function mergeUnits(
         } else if (widened(remoteContent, localContent, span.remote, span.local)) {
             output.push(...localContent);
         } else {
-            const merged = onOverlap?.(baseContent, localContent, remoteContent) ?? null;
+            // The word-level retry is a guess about one stretch of text
+            // rewritten twice. When the two sides changed different base
+            // lines, joining them word by word can drop one side's line and
+            // duplicate another, so that case is a conflict, not a merge.
+            const merged = sameChangeScope(span) ? (onOverlap?.(baseContent, localContent, remoteContent) ?? null) : null;
             if (merged === null) {
                 return { refused: 'overlapping-edits' };
             }
@@ -235,6 +239,19 @@ function widened(narrow: string[], wide: string[], narrowRegions: Region[], wide
         sameLines(wide.slice(0, narrow.length), narrow) ||
         sameLines(wide.slice(wide.length - narrow.length), narrow)
     );
+}
+
+/**
+ * Whether both sides changed the same base lines.
+ *
+ * Only then does a word-level merge of the span mean anything: the two sides
+ * disagree about how one piece of text reads, rather than about different
+ * lines. A span whose sides cover different base lines is refused instead; see
+ * the caller.
+ */
+function sameChangeScope(span: Span): boolean {
+    const scope = (regions: Region[]) => regions.map((region) => `${region.baseStart}:${region.baseEnd}`).join(',');
+    return scope(span.local) === scope(span.remote);
 }
 
 /** How many of a span's base lines these regions replaced. */

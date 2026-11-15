@@ -19,7 +19,7 @@ const PROTON_HOSTS = ['account.proton.me', 'drive-api.proton.me'];
  * hands the URL out from the Drive API, so it cannot be listed here in
  * advance. Everything else under `proton.me` is refused.
  */
-const REGIONAL_STORAGE_HOST = /^[a-z]{3}-storage\.proton\.me$/;
+const REGIONAL_STORAGE_HOST = /^[a-z0-9-]+-storage\.proton\.me$/;
 
 export function isProtonUrl(url: string): boolean {
     let parsed: URL;

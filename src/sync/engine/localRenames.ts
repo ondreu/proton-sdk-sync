@@ -12,6 +12,12 @@ export type LocalRenameHost = {
     readonly vault: VaultIO;
     /** Local states already worked out in this pass, for the reconcile to reuse. */
     readonly plannedLocal: Map<string, LocalState>;
+    /**
+     * Records whose file is gone, where a same-sized local file could not be
+     * read and so could not be shown to be that file. The reconcile leaves
+     * those nodes on Drive; every other absent record is a real deletion.
+     */
+    readonly unverifiableRenames: Set<string>;
     moveRemoteNode(nodeUid: string, toPath: string): Promise<void>;
     readonly logger: Logger;
 };
@@ -37,6 +43,7 @@ export type LocalRenameHost = {
  * else is left to the reconcile, as before.
  */
 export async function followLocalRenames(host: LocalRenameHost, localFiles: string[], tree: RemoteTree): Promise<void> {
+    host.unverifiableRenames.clear();
     const present = new Set(localFiles);
     const missing = host.state.entries().filter((record) => {
         const remote = tree.files.get(record.path);
@@ -69,13 +76,20 @@ export async function followLocalRenames(host: LocalRenameHost, localFiles: stri
             state = await host.vault.getState(path);
         } catch (error) {
             if (!(error instanceof FileTooLargeError)) {
-                // A failed read is not a reason to pair this file with one that
-                // went missing, or to carry on as if it were not there.
-                throw error;
+                // One unreadable candidate is not a reason to fail the pass:
+                // note it and go on with the next one. It is not paired, so
+                // the reconcile decides its own path as usual.
+                host.logger.warn(`Could not read "${path}" while looking for renames`, error);
+                continue;
             }
-            // Too large to hash on this device, so it cannot be shown to be the
-            // file that went missing; the reconcile leaves the node on Drive
-            // rather than reading the rename as a deletion.
+            // Too large to hash here. If a missing record is exactly this
+            // size, the two may be the same file, and the reconcile must not
+            // read the absence as a deletion.
+            for (const record of missing) {
+                if (record.base!.size === stat.size) {
+                    host.unverifiableRenames.add(record.path);
+                }
+            }
             continue;
         }
         if (state) {
