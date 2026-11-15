@@ -629,3 +629,34 @@ button.proton-sdk-sync-version:hover {
 .proton-sdk-sync-status details p {
     padding-left: 1em;
 }
+
+/* Deletions a pass held back: a warning block in the panel, above the list. */
+.proton-sdk-sync-mass-delete {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4em;
+    margin: 0.6em 0;
+    padding: 0.6em 0.8em;
+    border-left: 3px solid var(--color-orange);
+    border-radius: var(--radius-s);
+    background: var(--background-secondary);
+}
+
+.proton-sdk-sync-mass-delete p {
+    margin: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.proton-sdk-sync-mass-delete button {
+    align-self: flex-start;
+}
+
+.proton-sdk-sync-mass-delete-list {
+    max-height: 40vh;
+    overflow-y: auto;
+    margin: 0.4em 0;
+    padding-left: 1.2em;
+    font-size: var(--font-ui-small);
+    overflow-wrap: anywhere;
+}

@@ -44,6 +44,7 @@ import { showConflictNotice } from './ui/conflictNotice';
 import { ConflictsModal } from './ui/conflictsModal';
 import { DeviceRemovedModal, DevicesModal } from './ui/devicesModal';
 import { FirstSyncModal } from './ui/firstSyncModal';
+import { MassDeleteModal } from './ui/massDeleteModal';
 import { openVaultFile } from './ui/openFile';
 import { PinFormModal, UnlockModal } from './ui/pinModals';
 import { ReloadModal } from './ui/reloadModal';
@@ -127,8 +128,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     locked = false;
     /** Whether a PIN protects the stored session; cached for the settings tab, which renders synchronously. */
     pinEnabled = false;
-    /** Wrong PINs entered so far in this run; see {@link UnlockModal}. */
-    private readonly pinFailures = { count: 0 };
     private unlocking: Promise<boolean> | null = null;
     /** The connect in flight; see {@link connect}. */
     private connecting: Promise<void> | null = null;
@@ -203,6 +202,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     pollSeconds: () => runtime.engine.pollSeconds(),
                     sharedBy: () => this.settings.remoteFolderSharedBy,
                     openFile: (path) => void this.openPath(path),
+                    reviewMassDelete: () => this.reviewMassDelete(),
                     syncNow: () => void this.syncNowOrSetUp(),
                     togglePause: () => void this.setPaused(!this.settings.paused),
                     showConflicts: () => new ConflictsModal(this.app, this).open(),
@@ -271,6 +271,18 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             protonLogger,
         );
         runtime.session = new ProtonSession(credentials, clientUid, protonLogger, () => runtime.state.cursorsFingerprint());
+        // A real end of session — the refresh token is gone, not merely a
+        // timeout — stops the engine. Otherwise it keeps trying with a client
+        // that can no longer authenticate, and the status bar says "idle" while
+        // nothing syncs.
+        runtime.session.setSessionEndedHandler(() => {
+            void runtime.engine.stop();
+            this.showStatus({ ...runtime.engine.getSummary(), status: 'signed-out' });
+            new Notice(
+                'Proton-SDK-Sync: the Proton session ended. Sign in again in the plugin settings.',
+                15000,
+            );
+        });
         // The metadata cache keeps only nodes the vault syncs; see
         // persistentCache.nodeScope.
         runtime.session.setNodeSource(() => this.cacheScopeNodes());
@@ -303,6 +315,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             {
                 isMobile: Platform.isMobileApp,
                 windows: Platform.isWin,
+                // Patterns in the settings mean what the filesystem under the
+                // vault means: on a case-insensitive one, `Templates` and
+                // `templates` are the same folder.
+                caseInsensitive: Platform.isWin || Platform.isMacOS || Platform.isIosApp,
                 isMetered: () => networkConnection()?.type === 'cellular',
                 isHidden: () => document.visibilityState === 'hidden',
                 openEditor: (path) => this.openEditor(path),
@@ -458,7 +474,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             new UnlockModal(this.app, {
                 verify: (pin) => runtime.sessionSlot.unlock(pin),
                 forget: () => runtime.sessionSlot.forget(),
-                failures: this.pinFailures,
+                waitSeconds: async () => Math.ceil((await runtime.sessionSlot.attemptState()).retryAfterMs / 1000),
                 onDone: (result) => {
                     if (result === 'unlocked') {
                         this.locked = false;
@@ -1267,6 +1283,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     private onSyncChange(summary: SyncSummary): void {
+        const held = summary.pendingMassDelete?.count ?? 0;
+        if (held > 0 && (this.summary.pendingMassDelete?.count ?? 0) === 0) {
+            this.notify(
+                `${held} item(s) in the Drive folder are not in this vault any more. Nothing has been deleted on ` +
+                    'Drive: open the sync panel to keep them or trash them.',
+            );
+        }
         if (summary.status === 'folder-missing' && this.summary.status !== 'folder-missing') {
             this.notify(
                 `${summary.lastError ?? 'the Drive folder this vault syncs with is missing'}. Nothing syncs until it is ` +
@@ -1469,6 +1492,27 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /** Reveal the sync panel, opening it in the right sidebar if it is not open yet. */
+    /**
+     * Ask about deletions a pass held back.
+     *
+     * Nothing is deleted until the answer is "trash": the modal's default is to
+     * keep the files on Drive and download them back, which is what recovers an
+     * unmounted card or a folder emptied outside Obsidian.
+     */
+    reviewMassDelete(): void {
+        const pending = runtime.engine.pendingMassDelete();
+        if (!pending) {
+            return;
+        }
+        new MassDeleteModal(this.app, pending, (choice) => {
+            if (choice === 'trash') {
+                void runtime.engine.approveMassDelete();
+            } else if (choice === 'keep') {
+                void runtime.engine.denyMassDelete();
+            }
+        }).open();
+    }
+
     async openPanel(): Promise<void> {
         const { workspace } = this.app;
         let leaf = workspace.getLeavesOfType(SYNC_PANEL_VIEW)[0];

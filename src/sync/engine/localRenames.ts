@@ -64,7 +64,14 @@ export async function followLocalRenames(host: LocalRenameHost, localFiles: stri
         if (!stat || !sizes.has(stat.size)) {
             continue;
         }
-        const state = await host.vault.getState(path);
+        let state;
+        try {
+            state = await host.vault.getState(path);
+        } catch {
+            // Too large to hash on this device, so it cannot be the file that
+            // went missing; leave it to the ordinary reconciliation.
+            continue;
+        }
         if (state) {
             // The reconcile would hash it anyway; keep the result for it.
             host.plannedLocal.set(path, state);

@@ -50,6 +50,8 @@ export type SyncPanelHost = {
     sharedBy(): string | null;
     /** Open a note, from the "Not synced yet" list. */
     openFile(path: string): void;
+    /** Ask about deletions a pass held back; see {@link PendingMassDelete}. */
+    reviewMassDelete(): void;
     syncNow(): void;
     togglePause(): void;
     showConflicts(): void;
@@ -84,6 +86,8 @@ export class SyncPanelView extends ItemView {
     private lastSyncedIconEl!: HTMLElement;
     private lastSyncedTextEl!: HTMLElement;
     private detailsEl!: HTMLElement;
+    /** The block that asks about deletions a pass held back, when there are any. */
+    private massDeleteEl!: HTMLElement;
     private syncButton!: ButtonComponent;
     private pauseButton!: ButtonComponent;
     private shareButton!: ButtonComponent;
@@ -152,6 +156,7 @@ export class SyncPanelView extends ItemView {
         this.lastSyncedTextEl = this.lastSyncedEl.createSpan({ cls: 'proton-sdk-sync-last-synced-text' });
 
         this.detailsEl = root.createEl('ul', { cls: 'proton-sdk-sync-panel-details' });
+        this.massDeleteEl = root.createDiv({ cls: 'proton-sdk-sync-mass-delete' });
 
         // One to a row, in the order they are reached for; the settings,
         // needed least, at the bottom.
@@ -240,6 +245,7 @@ export class SyncPanelView extends ItemView {
         this.conflictsButton.buttonEl.toggleClass('mod-warning', summary.conflicts > 0);
         this.deletedButton.setDisabled(!this.host.canListVersions());
 
+        this.renderMassDelete(summary);
         this.renderPending(this.host.pendingChanges(), summary);
         this.noteChanged();
         if (!this.host.canListVersions()) {
@@ -325,6 +331,24 @@ export class SyncPanelView extends ItemView {
             this.host.sharedBy() === null &&
             !HOLDING_OFF.has(this.host.summary().status)
         );
+    }
+
+    /**
+     * A pass that would delete a large share of the Drive folder is holding the
+     * deletions instead. Say so where the sync's state is, not only in a notice
+     * that is gone by the time the user looks.
+     */
+    private renderMassDelete(summary: SyncSummary): void {
+        this.massDeleteEl.empty();
+        const pending = summary.pendingMassDelete;
+        if (!pending) {
+            return;
+        }
+        this.massDeleteEl.createEl('p', {
+            text: `${pending.count} item${pending.count === 1 ? '' : 's'} in the Drive folder have no match in this vault. Nothing has been deleted on Drive.`,
+        });
+        const button = this.massDeleteEl.createEl('button', { text: 'Review' });
+        button.addEventListener('click', () => this.host.reviewMassDelete());
     }
 
     /**

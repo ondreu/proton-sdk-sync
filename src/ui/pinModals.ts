@@ -2,10 +2,6 @@ import { App, Modal, Setting, TextComponent } from 'obsidian';
 
 import { MIN_PIN_LENGTH } from '../proton/pinLock';
 
-/** Wrong PINs allowed before each further try has to wait, doubling up to {@link MAX_WAIT_SECONDS}. */
-const FREE_ATTEMPTS = 3;
-const MAX_WAIT_SECONDS = 60;
-
 const LOST_PIN_WARNING =
     'The PIN is not stored anywhere, not even on this device. If you forget it, it cannot be recovered: you ' +
     'will have to sign in to Proton again on this device and choose a new PIN. Your notes are not affected.';
@@ -14,8 +10,12 @@ export type UnlockOptions = {
     verify: (pin: string) => Promise<boolean>;
     /** Delete the locked session, for a forgotten PIN. */
     forget: () => Promise<void>;
-    /** Wrong tries so far, kept by the caller so closing and reopening does not reset the wait. */
-    failures: { count: number };
+    /**
+     * How long the stored envelope will refuse a PIN, in seconds; 0 when it
+     * will take one now. The slot keeps this, so the wait survives closing the
+     * dialog and restarting Obsidian.
+     */
+    waitSeconds: () => Promise<number>;
     onDone: (result: 'unlocked' | 'dismissed' | 'forgotten') => void;
 };
 
@@ -49,7 +49,7 @@ export class UnlockModal extends Modal {
         let unlockButton!: HTMLButtonElement;
 
         const submit = async () => {
-            const wait = this.secondsToWait();
+            const wait = await this.options.waitSeconds();
             if (wait > 0) {
                 error.setText(`Too many wrong PINs. Try again in ${wait} seconds.`);
                 return;
@@ -59,13 +59,11 @@ export class UnlockModal extends Modal {
             const ok = await this.options.verify(input.getValue());
             unlockButton.disabled = false;
             if (ok) {
-                this.options.failures.count = 0;
                 this.finish('unlocked');
                 return;
             }
-            this.options.failures.count++;
             input.setValue('');
-            const next = this.secondsToWait();
+            const next = await this.options.waitSeconds();
             error.setText(next > 0 ? `Wrong PIN. Try again in ${next} seconds.` : 'Wrong PIN.');
         };
 
@@ -135,11 +133,6 @@ export class UnlockModal extends Modal {
                         this.finish('forgotten');
                     }),
             );
-    }
-
-    private secondsToWait(): number {
-        const extra = this.options.failures.count - FREE_ATTEMPTS + 1;
-        return extra <= 0 ? 0 : Math.min(MAX_WAIT_SECONDS, 2 ** extra);
     }
 
     private finish(result: 'unlocked' | 'dismissed' | 'forgotten'): void {

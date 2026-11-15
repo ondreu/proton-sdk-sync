@@ -31,7 +31,7 @@ import {
 import { reconcile, removesRemote } from './reconcile';
 import type { SyncState } from './state';
 import type { ConflictPolicy, ConflictReason, LocalState, RemoteState, SyncAction } from './types';
-import { LARGE_FILE_BYTES, VaultIO } from './vault';
+import { FileTooLargeError, LARGE_FILE_BYTES, VaultIO } from './vault';
 import { EditorBusyError, LocalChangedError, RemoteChangedError } from './engine/errors';
 import { CaseClashes } from './engine/caseClashes';
 import { monotonicNow } from './engine/clock';
@@ -310,6 +310,7 @@ export class SyncEngine {
             app,
             logger.getLogger('vault'),
             scope.pluginDir === null ? null : `${scope.pluginDir}/downloads`,
+            () => this.sizeLimitBytes(),
         );
         this.filter = this.createFilter(settings);
         this.scopeKey = scopeKeyOf(settings);
@@ -597,7 +598,7 @@ export class SyncEngine {
     private async startOnce(client: ProtonDriveClient, rootUid: string): Promise<void> {
         // A new run: passes from before belong to an older generation.
         this.generation++;
-        this.drive = new DriveIO(client, this.logger.getLogger('drive'));
+        this.drive = new DriveIO(client, this.logger.getLogger('drive'), () => this.sizeLimitBytes());
         this.resolver = this.createResolver(this.drive, this.settings.conflictPolicy);
         this.rootUid = rootUid;
         this.running = true;
@@ -1326,7 +1327,17 @@ export class SyncEngine {
         const planned = this.plannedLocal.get(path);
         const known = record?.base ?? (planned && { hash: planned.hash, size: planned.size, localMtime: planned.mtime });
 
-        const local = await this.vault.getState(path, known);
+        let local: LocalState | undefined;
+        try {
+            local = await this.vault.getState(path, known);
+        } catch (error) {
+            if (error instanceof FileTooLargeError) {
+                this.logger.info(`Skipping "${path}": ${megabytes(error.size)} MB exceeds the configured limit`);
+                this.tooLarge.set(path, error.size);
+                return null;
+            }
+            throw error;
+        }
         if (local && local.size > limit) {
             this.logger.info(`Skipping "${path}": ${megabytes(local.size)} MB exceeds the configured limit`);
             this.tooLarge.set(path, local.size);
@@ -3152,6 +3163,7 @@ export class SyncEngine {
             this.scope.configDir,
             this.scope.pluginDir,
             this.folderShared,
+            this.environment.caseInsensitive === true,
         );
     }
 
