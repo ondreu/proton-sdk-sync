@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import type { DataAdapter, SecretStorage } from 'obsidian';
 
 import { Credentials } from '../src/proton/credentials';
+import { LockedError, PinProtectedSlot } from '../src/proton/pinLock';
 import { ObsidianSecretSlot, type SecretSlot } from '../src/proton/secretStore';
 import { Logger } from '../src/util/logger';
 
@@ -120,6 +121,72 @@ describe('Credentials', () => {
         assert.equal(credentials.isLoggedIn(), false);
         assert.equal(slot.value, null);
         assert.equal(notified, true);
+    });
+
+    it('keeps the refreshed tokens in memory, not in the envelope, while the PIN is locked', async () => {
+        const inner = memorySlot(SESSION);
+        const pinSlot = new PinProtectedSlot(inner, 1000);
+        await pinSlot.setPin('482915');
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(pinSlot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+        await credentials.load();
+        assert.equal(credentials.isLoggedIn(), true);
+
+        // What lockNow does, then a token refresh that finishes afterwards.
+        credentials.unload();
+        pinSlot.lock();
+        await credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'refreshed-token', refreshToken: 'refresh-2' });
+
+        const stored = inner.value!;
+        assert.ok(stored.startsWith('{"format":"proton-drive-sync/pin-v1"'), stored);
+        assert.ok(!stored.includes('refreshed-token'), 'the envelope must not be replaced by plaintext');
+        // The update is dropped from the store, not from memory: the plugin
+        // keeps working with the new token until it locks or closes.
+        assert.equal(credentials.accessToken, 'refreshed-token');
+        await assert.rejects(pinSlot.read(), LockedError);
+    });
+
+    it('tells listeners when the session is unloaded for a lock', async () => {
+        const slot = memorySlot(SESSION);
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(slot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+        await credentials.load();
+        let notified = 0;
+        credentials.on('sessionInfoChanged', () => (notified += 1));
+
+        credentials.unload();
+
+        // The account module drops its cached key references on this event; the
+        // keys themselves are erased with the lock, so a kept reference would fail.
+        assert.equal(notified, 1);
+        assert.equal(credentials.isLoggedIn(), false);
+        assert.equal(slot.value, SESSION, 'the stored session stays for the unlock');
+    });
+
+    it('saves token sets in the order they were refreshed, so an older one cannot win', async () => {
+        const writes: (string | null)[] = [];
+        const store = { value: null as string | null };
+        const slot: SecretSlot = {
+            read: async () => store.value,
+            write: async (value: string | null) => {
+                writes.push(value);
+                // The first save takes its time: without a queue it would land
+                // after the second and put the older token set back.
+                await new Promise((resolve) => setTimeout(resolve, writes.length === 1 ? 40 : 5));
+                store.value = value;
+            },
+        };
+        const { adapter } = memoryAdapter();
+        const credentials = new Credentials(slot, { adapter, path: LEGACY, decrypt: () => null }, SILENT);
+
+        const first = credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'one', refreshToken: 'r1' });
+        const second = credentials.setSessionInfo({ uid: 'uid-1', accessToken: 'two', refreshToken: 'r2' });
+        await Promise.all([first, second]);
+
+        assert.equal(writes.length, 2);
+        assert.equal(JSON.parse(writes[0]!).accessToken, 'one');
+        assert.equal(JSON.parse(writes[1]!).accessToken, 'two');
+        assert.equal(JSON.parse(store.value!).accessToken, 'two');
     });
 });
 

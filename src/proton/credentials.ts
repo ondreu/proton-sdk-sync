@@ -3,7 +3,7 @@ import type { DataAdapter } from 'obsidian';
 import type { Logger } from '../util/logger';
 import type { SessionCredentials, SessionInfo } from './account';
 import { newCacheKey } from './persistentCache';
-import type { SecretSlot } from './secretStore';
+import { LockedSlotError, type SecretSlot } from './secretStore';
 
 type StoredSession = {
     version: 1;
@@ -35,6 +35,8 @@ export type LegacySessionFile = {
 export class Credentials implements SessionCredentials {
     private session: StoredSession | null = null;
     private readonly listeners = new Set<() => void>();
+    /** The save queue: each save starts after the one before it has finished. */
+    private pendingSave: Promise<void> = Promise.resolve();
 
     constructor(
         private readonly slot: SecretSlot,
@@ -150,21 +152,68 @@ export class Credentials implements SessionCredentials {
         await this.persist();
     }
 
-    /** Drop the session from memory, leaving it stored; for locking with the PIN. */
+    /**
+     * Drop the session from memory, leaving it stored; for locking with the PIN.
+     *
+     * Listeners are told, as they are for any other change: the account module
+     * caches key references that are erased with the session, and a reference
+     * to a key that no longer exists fails every decrypt that uses it.
+     */
     unload(): void {
         this.session = null;
+        this.emitChanged();
     }
 
     async signOut(): Promise<void> {
         this.session = null;
-        await this.slot.write(null);
+        await this.enqueueSave(null);
         await this.removeLegacyFile();
         this.emitChanged();
     }
 
-    private async persist(): Promise<void> {
-        if (this.session) {
-            await this.slot.write(JSON.stringify(this.session));
+    /**
+     * Save the current session, after every save asked for before it.
+     *
+     * Two saves can overlap - a refresh that lands while the plugin is writing
+     * the session it just changed - and the store takes whichever finishes
+     * last. Each save carries the value it was asked to write, so chaining
+     * them makes the newest token set the one that ends up stored.
+     */
+    private persist(): Promise<void> {
+        if (!this.session) {
+            return Promise.resolve();
+        }
+        return this.enqueueSave(JSON.stringify(this.session));
+    }
+
+    /** Queue one write behind the saves before it. */
+    private enqueueSave(value: string | null): Promise<void> {
+        const save = this.pendingSave.then(() => this.write(value));
+        // One failed save must not stop the ones after it; the caller still
+        // sees the failure on its own promise.
+        this.pendingSave = save.catch(() => undefined);
+        return save;
+    }
+
+    /**
+     * Write one value to the slot.
+     *
+     * A PIN-locked slot refuses a plaintext write, and rightly: the stored
+     * session is the envelope, and replacing it with the tokens would undo the
+     * PIN. The tokens are already in memory, so the write is dropped and the
+     * envelope stays; the next unlock writes the session again.
+     */
+    private async write(value: string | null): Promise<void> {
+        try {
+            await this.slot.write(value);
+        } catch (error) {
+            if (!(error instanceof LockedSlotError)) {
+                throw error;
+            }
+            this.logger.debug('The PIN is locked; keeping the refreshed session in memory only');
+            return;
+        }
+        if (value !== null) {
             // A new session supersedes one an older version left behind.
             await this.removeLegacyFile();
         }

@@ -197,7 +197,7 @@ describe('ApiClient session refresh', () => {
     it('signs out when the refresh token is refused', async () => {
         const credentials = new FakeCredentials();
         const transport = scriptedFetch((request) =>
-            request.url.endsWith('/auth/v4/refresh') ? json({ Code: 10013 }, 400) : json({}, 401),
+            request.url.endsWith('/auth/v4/refresh') ? json({ Code: 10013, Error: 'invalid_grant' }, 400) : json({}, 401),
         );
         const api = new ApiClient({
             baseUrl: 'drive-api.proton.me',

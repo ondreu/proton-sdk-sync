@@ -1,3 +1,4 @@
+import { retryNetworkErrors, SIGN_IN_RETRY_DELAYS_MS } from '../retry';
 import { AccountApi, AccountApiError } from './accountApi';
 import {
     DEFAULT_PROTON_ACCOUNT_URL,
@@ -13,6 +14,16 @@ import { sleepMs } from './sleep';
 import type { Srp } from './srp';
 import { fetchTelemetryEnabled } from './telemetryPreference';
 
+/** How long the browser sign-in waits between looks at the fork. Overridable so a test need not spend real seconds. */
+export type SignInTiming = {
+    /** Wait before the first look, so the user has time to open the page. */
+    initialDelayMs: number;
+    /** Wait between looks while Proton says the sign-in is not approved yet. */
+    pollIntervalMs: number;
+    /** Waits between looks that never got an answer. */
+    retryDelaysMs: readonly number[];
+};
+
 export class Auth {
     constructor(
         private readonly authClientId: string,
@@ -21,6 +32,11 @@ export class Auth {
         private readonly srpModule: Srp,
         private readonly logger: Logger,
         private readonly accountUrl: string = DEFAULT_PROTON_ACCOUNT_URL,
+        private readonly timing: SignInTiming = {
+            initialDelayMs: FORK_INITIAL_DELAY_MS,
+            pollIntervalMs: FORK_POLL_INTERVAL_MS,
+            retryDelaysMs: SIGN_IN_RETRY_DELAYS_MS,
+        },
     ) {}
 
     isLoggedIn(): boolean {
@@ -129,7 +145,7 @@ export class Auth {
 
         await onSignInUrl(signInUrl);
 
-        await sleepMs(FORK_INITIAL_DELAY_MS, signal);
+        await sleepMs(this.timing.initialDelayMs, signal);
 
         const startTime = Date.now();
         while (true) {
@@ -141,13 +157,24 @@ export class Auth {
 
             let response;
             try {
-                response = await this.accountApi.sessionForksStatus(forkResponse.Selector);
+                // LOCAL CHANGE (not upstream): a phone that loses the network
+                // right after the approval ends up here, and the fork is still
+                // waiting for it. The request used to end the whole sign-in;
+                // now it is tried again first (#41). A 422 - Proton saying the
+                // page has not been approved yet - is not a network failure and
+                // is handled below, unchanged.
+                response = await retryNetworkErrors(
+                    () => this.accountApi.sessionForksStatus(forkResponse.Selector),
+                    this.timing.retryDelaysMs,
+                    (error, attempt) =>
+                        this.logger.debug(`Could not reach Proton (try ${attempt}); asking again`, error),
+                );
             } catch (error) {
                 // The API returns 422 if the authentication is not yet ready.
                 if (error instanceof AccountApiError && error.httpCode === 422) {
                     const debug = error.debug as { Error?: string };
                     this.logger.debug(`Authentication not yet ready (${error.code}: ${debug.Error})`);
-                    await sleepMs(FORK_POLL_INTERVAL_MS, signal);
+                    await sleepMs(this.timing.pollIntervalMs, signal);
                     continue;
                 }
 

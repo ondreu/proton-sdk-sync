@@ -32,6 +32,9 @@ try {
         format: 'cjs',
         platform: 'node',
         target: 'node20',
+        // Proton's crypto package imports `openpgp/lightweight`, which its
+        // package.json exports only under the browser condition.
+        conditions: ['browser'],
         outdir: outDir,
         outExtension: { '.js': '.cjs' },
         sourcemap: 'inline',
@@ -44,7 +47,7 @@ try {
         banner: {
             js:
                 'globalThis.window ??= { setTimeout: (...a) => setTimeout(...a), ' +
-                'clearTimeout: (t) => clearTimeout(t) };',
+                'clearTimeout: (t) => clearTimeout(t), crypto: globalThis.crypto };',
         },
     });
 

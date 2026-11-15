@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { LockedError, PinProtectedSlot, RememberedUnlock } from '../src/proton/pinLock';
-import type { SecretSlot } from '../src/proton/secretStore';
+import { LockedError, PinProtectedSlot, PIN_ITERATIONS, RememberedUnlock } from '../src/proton/pinLock';
+import { LockedSlotError, type SecretSlot } from '../src/proton/secretStore';
 
 const SESSION = '{"uid":"u","accessToken":"a","refreshToken":"r","userKeyPassword":"k"}';
+const REFRESHED = '{"uid":"u","accessToken":"refreshed-token","refreshToken":"r2","userKeyPassword":"k"}';
 
 function memory(initial: string | null = null) {
     const slot = {
@@ -15,8 +16,19 @@ function memory(initial: string | null = null) {
     return slot satisfies SecretSlot;
 }
 
+/** A clock the backoff can be moved past, instead of waiting a second per try. */
+function clockAt(start = 1_000_000) {
+    const clock = {
+        now: start,
+        advance(ms: number) {
+            clock.now += ms;
+        },
+    };
+    return clock;
+}
+
 /** Few iterations, so the tests do not spend seconds deriving keys. */
-const protect = (inner: SecretSlot) => new PinProtectedSlot(inner, 1000);
+const protect = (inner: SecretSlot, clock = clockAt()) => new PinProtectedSlot(inner, 1000, () => clock.now);
 
 describe('PinProtectedSlot', () => {
     it('passes a session through untouched while no PIN is set', async () => {
@@ -43,10 +55,12 @@ describe('PinProtectedSlot', () => {
         const inner = memory(SESSION);
         await protect(inner).setPin('482915');
 
-        const restarted = protect(inner);
+        const clock = clockAt();
+        const restarted = protect(inner, clock);
         assert.equal(await restarted.isLocked(), true);
         await assert.rejects(restarted.read(), LockedError);
         assert.equal(await restarted.unlock('000000'), false);
+        clock.advance(1_000);
         assert.equal(await restarted.isLocked(), true);
         assert.equal(await restarted.unlock('482915'), true);
         assert.equal(await restarted.read(), SESSION);
@@ -66,12 +80,14 @@ describe('PinProtectedSlot', () => {
 
     it('changes and removes the PIN', async () => {
         const inner = memory(SESSION);
-        const slot = protect(inner);
+        const clock = clockAt();
+        const slot = protect(inner, clock);
         await slot.setPin('482915');
         assert.equal(await slot.verify('482915'), true);
 
         await slot.setPin('new-pin-123');
         assert.equal(await slot.verify('482915'), false);
+        clock.advance(1_000);
         assert.equal(await slot.verify('new-pin-123'), true);
 
         await slot.removePin();
@@ -110,6 +126,114 @@ describe('PinProtectedSlot', () => {
         envelope.data = `${envelope.data.startsWith('A') ? 'B' : 'A'}${envelope.data.slice(1)}`;
         inner.value = JSON.stringify(envelope);
         assert.equal(await protect(inner).unlock('482915'), false);
+    });
+
+    it('refuses to store plaintext when a refresh lands while the PIN is locked', async () => {
+        const inner = memory(SESSION);
+        const slot = protect(inner);
+        await slot.setPin('482915');
+        slot.lock();
+        const envelope = inner.value!;
+
+        // A token refresh that finished after lockNow: the session is still
+        // good, but what is stored must stay the envelope.
+        await assert.rejects(slot.write(REFRESHED), LockedSlotError);
+
+        assert.equal(inner.value, envelope);
+        assert.ok(inner.value!.startsWith('{"format":"proton-drive-sync/pin-v1"'), inner.value);
+        assert.ok(!inner.value!.includes('refreshed-token'));
+
+        // The stored session is untouched, and only the PIN still opens it.
+        const restarted = protect(inner);
+        await assert.rejects(restarted.read(), LockedError);
+        assert.equal(await restarted.unlock('482915'), true);
+        assert.equal(await restarted.read(), SESSION);
+    });
+});
+
+describe('guessing a PIN', () => {
+    it('derives a new key with a million rounds, and still opens an older envelope', async () => {
+        assert.equal(PIN_ITERATIONS, 1_000_000);
+
+        const inner = memory(SESSION);
+        // The default work factor, not the fast one the other tests use.
+        await new PinProtectedSlot(inner).setPin('482915');
+        assert.equal((JSON.parse(inner.value!) as { iterations: number }).iterations, 1_000_000);
+
+        // An envelope written when the factor was lower records it, and opens.
+        const old = memory(SESSION);
+        await protect(old).setPin('482915');
+        assert.equal((JSON.parse(old.value!) as { iterations: number }).iterations, 1000);
+        const restarted = protect(old);
+        assert.equal(await restarted.unlock('482915'), true);
+        assert.equal(await restarted.read(), SESSION);
+    });
+
+    it('waits longer after each wrong PIN, and keeps the count across a restart', async () => {
+        const inner = memory(SESSION);
+        const clock = clockAt();
+        const slot = protect(inner, clock);
+        await slot.setPin('482915');
+        slot.lock();
+
+        assert.deepEqual(await slot.attemptState(), {
+            failures: 0,
+            lastFailureAt: null,
+            retryAfterMs: 0,
+            retryAt: null,
+        });
+
+        assert.equal(await slot.unlock('000000'), false);
+        const first = await slot.attemptState();
+        assert.equal(first.failures, 1);
+        assert.equal(first.lastFailureAt, clock.now);
+        assert.equal(first.retryAfterMs, 1_000);
+        assert.equal(first.retryAt, clock.now + 1_000);
+
+        // Even the right PIN waits: what the wait limits is how fast tries are made.
+        assert.equal(await slot.unlock('482915'), false);
+
+        // A restart does not hand back a fresh run of guesses.
+        const restarted = protect(inner, clock);
+        assert.equal((await restarted.attemptState()).failures, 1);
+        assert.equal((await restarted.attemptState()).retryAfterMs, 1_000);
+
+        clock.advance(1_000);
+        assert.equal(await restarted.unlock('000000'), false);
+        const second = await restarted.attemptState();
+        assert.equal(second.failures, 2);
+        assert.equal(second.retryAfterMs, 2_000);
+
+        clock.advance(2_000);
+        assert.equal(await restarted.unlock('482915'), true);
+        assert.equal((await restarted.attemptState()).failures, 0);
+    });
+
+    it('doubles the wait up to thirty seconds, and forgets it after the right PIN', async () => {
+        const inner = memory(SESSION);
+        const clock = clockAt();
+        const slot = protect(inner, clock);
+        await slot.setPin('482915');
+        slot.lock();
+
+        for (let failures = 1; failures <= 8; failures++) {
+            assert.equal(await slot.unlock('000000'), false);
+            const state = await slot.attemptState();
+            assert.equal(state.failures, failures);
+            assert.equal(state.retryAfterMs, Math.min(1_000 * 2 ** (failures - 1), 30_000));
+            clock.advance(state.retryAfterMs);
+        }
+
+        assert.equal(await slot.unlock('482915'), true);
+        assert.equal((await slot.attemptState()).failures, 0);
+    });
+
+    it('does not count tries against a session with no PIN', async () => {
+        const inner = memory(SESSION);
+        const slot = protect(inner);
+        assert.equal(await slot.unlock('482915'), false);
+        assert.equal(inner.value, SESSION);
+        assert.equal((await slot.attemptState()).failures, 0);
     });
 });
 

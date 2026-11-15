@@ -5,6 +5,7 @@ import {
     MemoryCache,
     OpenPGPCryptoWithCryptoProxy,
     ProtonDriveClient,
+    type CachedCryptoMaterial,
     type ProtonDriveEntitiesCache,
 } from '@protontech/drive-sdk';
 import type { Logger } from '../util/logger';
@@ -12,6 +13,7 @@ import { ApiClient, initAccount, type Addresses, type Auth, type Srp } from './a
 import type { Credentials } from './credentials';
 import { HTTPClient } from './httpClient';
 import { cacheKeyBytes, EncryptedEntitiesCache, IndexedDbCacheStore, nodeScope } from './persistentCache';
+import { retryNetworkErrors, SIGN_IN_RETRY_DELAYS_MS } from './retry';
 import { revokeSession } from './revoke';
 import { obsidianFetch } from './obsidianFetch';
 import { Telemetry } from './telemetry';
@@ -53,7 +55,11 @@ function initCryptoOnce(): OpenPGPCryptoWithCryptoProxy {
 export type SignInHandle = {
     /** The account.proton.me URL the user has to open to approve the session. */
     url: string;
-    /** Resolves with the signed-in address once the user approves, or rejects. */
+    /**
+     * Resolves with the signed-in address once the user approves, or rejects.
+     * Resolves with an empty string when the session was saved but the address
+     * could not be read yet; see {@link finishSignInSetup}.
+     */
     completion: Promise<string>;
 };
 
@@ -98,6 +104,10 @@ export class ProtonSession {
 
     /** The SDK's metadata cache, saved between sessions; see {@link EncryptedEntitiesCache}. */
     private entitiesCache: EncryptedEntitiesCache | null = null;
+    /** The client's in-memory key cache, kept so locking can empty it. */
+    private cryptoCache: MemoryCache<CachedCryptoMaterial> | null = null;
+    /** Told when Proton ends the session mid-run; the owner stops the engine with it. */
+    private sessionEndedHandler: (() => void) | null = null;
     /** Node uids the vault syncs; see `nodeScope`. Recomputed at most once a minute. */
     private knownNodes: Set<string> = new Set();
     private knownNodesAt = 0;
@@ -138,31 +148,43 @@ export class ProtonSession {
     async init(): Promise<void> {
         const cryptoModule = initCryptoOnce();
 
-        this.apiClient = new ApiClient({
-            baseUrl: DRIVE_API_URL,
-            appVersion: APP_VERSION,
-            credentials: this.credentials,
-            logger: this.logger.getLogger('api'),
-            // Obsidian's renderer is subject to CORS and Proton does not allow
-            // this origin, so every request goes out through Obsidian instead.
-            fetch: obsidianFetch,
-        });
+        if (!this.auth) {
+            // Built once. The account module registers a session listener per
+            // instance, and one that is never removed: a second `init` would
+            // leave a second listener holding caches that no longer exist.
+            const apiClient = new ApiClient({
+                baseUrl: DRIVE_API_URL,
+                appVersion: APP_VERSION,
+                credentials: this.credentials,
+                logger: this.logger.getLogger('api'),
+                // Obsidian's renderer is subject to CORS and Proton does not allow
+                // this origin, so every request goes out through Obsidian instead.
+                fetch: obsidianFetch,
+                onSessionEnded: () => this.sessionEnded(),
+            });
 
-        const account = await initAccount({
-            authClientId: AUTH_CLIENT_ID,
-            apiClient: this.apiClient,
-            credentials: this.credentials,
-            cryptoProxy: CryptoProxy,
-            // Passed in rather than imported by the account module, so both use
-            // the endpoint initialised above.
-            srpApi: { computeKeyPassword, generateKeySalt, getRandomSrpVerifier, getSrp },
-            logger: this.logger.getLogger('account'),
-            accountUrl: ACCOUNT_URL,
-        });
+            const account = await initAccount({
+                authClientId: AUTH_CLIENT_ID,
+                apiClient,
+                credentials: this.credentials,
+                cryptoProxy: CryptoProxy,
+                // Passed in rather than imported by the account module, so both use
+                // the endpoint initialised above.
+                srpApi: { computeKeyPassword, generateKeySalt, getRandomSrpVerifier, getSrp },
+                logger: this.logger.getLogger('account'),
+                accountUrl: ACCOUNT_URL,
+            });
 
-        this.auth = account.auth;
-        this.addresses = account.addresses;
-        this.srp = account.srp;
+            // Only now, so a failure above leaves nothing half-built to reuse.
+            this.apiClient = apiClient;
+            this.auth = account.auth;
+            this.addresses = account.addresses;
+            this.srp = account.srp;
+        } else {
+            // Unlocking after the PIN locked, or signing in again: read what is
+            // stored now, without building the account a second time.
+            await this.auth.loadSession();
+        }
 
         if (this.credentials.isLoggedIn()) {
             await this.buildClient(cryptoModule);
@@ -217,12 +239,22 @@ export class ProtonSession {
             .authViaWeb((signInUrl) => resolveUrl(signInUrl), signal)
             .then(async () => {
                 onApproved?.();
-                await this.buildClient(initCryptoOnce());
-
-                const primary = await this.addresses!.getOwnPrimaryAddress();
-                await this.credentials.setAccountEmail(primary.email);
-                this.logger.info(`Signed in to Proton as ${primary.email}`);
-                return primary.email;
+                // The session is saved by now. What follows only builds the
+                // client and reads the address to show, so a phone that loses
+                // the network at this exact moment keeps the sign-in; see
+                // finishSignInSetup.
+                const email = await finishSignInSetup({
+                    complete: async () => {
+                        await this.buildClient(initCryptoOnce());
+                        const primary = await this.addresses!.getOwnPrimaryAddress();
+                        await this.credentials.setAccountEmail(primary.email);
+                        return primary.email;
+                    },
+                    lastKnownEmail: () => this.credentials.accountEmail,
+                    logger: this.logger,
+                });
+                this.logger.info(email ? `Signed in to Proton as ${email}` : 'Signed in to Proton');
+                return email;
             });
 
         // A failure before the URL is known - the fork request itself being
@@ -245,6 +277,16 @@ export class ProtonSession {
         this.entitiesCache = null;
         this.client = null;
         this.credentials.unload();
+        this.clearKeys();
+    }
+
+    /**
+     * Told when Proton refuses the session while the plugin runs: the refresh
+     * token is dead, so there is nothing left to sync with. The owner stops the
+     * engine; the user signs in again. See {@link sessionEnded}.
+     */
+    setSessionEndedHandler(handler: (() => void) | null): void {
+        this.sessionEndedHandler = handler;
     }
 
     /**
@@ -264,7 +306,44 @@ export class ProtonSession {
         this.entitiesCache = null;
         await this.credentials.signOut();
         this.client = null;
+        this.clearKeys();
         return { revoked };
+    }
+
+    /**
+     * Proton refused the refresh token: the session is gone, and the
+     * credentials have already cleared what they held. Drop what is still
+     * decrypted here and tell the owner, rather than leaving a client that
+     * fails every request it is given.
+     */
+    private sessionEnded(): void {
+        this.entitiesCache = null;
+        this.client = null;
+        this.clearKeys();
+        try {
+            this.sessionEndedHandler?.();
+        } catch (error) {
+            this.logger.warn('Could not stop syncing after the Proton session ended', error);
+        }
+    }
+
+    /**
+     * Drop the decrypted keys.
+     *
+     * The crypto endpoint holds the private keys it imported for this session,
+     * and the client's cache holds the node and share keys it decrypted; both
+     * are readable from the process, and neither belonged in memory once the
+     * PIN locked or the session ended. The session's own password goes with
+     * `credentials.unload`.
+     */
+    private clearKeys(): void {
+        void this.cryptoCache?.clear();
+        this.cryptoCache = null;
+        try {
+            void CryptoProxy.clearKeyStore().catch(() => undefined);
+        } catch {
+            // No crypto endpoint yet: nothing was imported to clear.
+        }
     }
 
     private async revoke(): Promise<boolean> {
@@ -279,6 +358,7 @@ export class ProtonSession {
             throw new Error('Proton session is not initialised');
         }
         const entitiesCache = await this.openEntitiesCache();
+        this.cryptoCache = new MemoryCache();
 
         this.client = new ProtonDriveClient({
             config: { baseUrl: DRIVE_API_URL, clientUid: this.clientUid },
@@ -288,7 +368,7 @@ export class ProtonSession {
             // memory only: rebuilding them costs a few requests, and keys are
             // not something to write to disk even encrypted.
             entitiesCache,
-            cryptoCache: new MemoryCache(),
+            cryptoCache: this.cryptoCache,
             account: this.addresses,
             openPGPCryptoModule: cryptoModule,
             // The account module's SRP wrapper, which already speaks the
@@ -320,5 +400,41 @@ export class ProtonSession {
             this.logger.warn('Could not open the saved Drive cache; keeping it in memory', error);
             return new MemoryCache();
         }
+    }
+}
+
+/**
+ * What is left of a browser sign-in once the session is saved: build the
+ * client and read the address to show.
+ *
+ * This used to fail the whole sign-in when it could not reach Proton. On a
+ * phone the network often drops for a moment right after the approval, and the
+ * user was told signing in failed while a perfectly good session sat in the
+ * store (#41). The steps are retried over a few short waits; if they still
+ * fail the sign-in counts as done, because the session is what makes it work,
+ * and the next sync builds the client and reads the address again.
+ *
+ * Resolves with the address, or with an empty string when it could not be read.
+ */
+export async function finishSignInSetup(options: {
+    complete: () => Promise<string>;
+    lastKnownEmail: () => string | undefined;
+    logger: Logger;
+    /** Test seam: how long to wait between tries. */
+    delaysMs?: readonly number[];
+}): Promise<string> {
+    try {
+        return await retryNetworkErrors(
+            options.complete,
+            options.delaysMs ?? SIGN_IN_RETRY_DELAYS_MS,
+            (error, attempt) =>
+                options.logger.warn(`Could not finish signing in after the approval (try ${attempt}); still trying`, error),
+        );
+    } catch (error) {
+        options.logger.warn(
+            'Signed in, but the client could not be set up yet; the next sync will finish it',
+            error,
+        );
+        return options.lastKnownEmail() ?? '';
     }
 }
