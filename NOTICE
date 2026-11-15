@@ -1,0 +1,15 @@
+Proton-SDK-Sync
+Copyright (C) 2026 ondreu and contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+It contains code from obsidian-proton-sync (https://github.com/MarckFp/obsidian-proton-sync),
+Copyright (C) Marcos, licensed under GPL-3.0-or-later. The original author is
+credited as a contributor to this project.
+
+It also contains parts of Proton's Drive SDK and Proton's OpenPGP.js fork,
+Copyright (C) Proton AG, under their respective licences; see
+src/proton/account/LICENSE.md and the banner at the top of main.js.

@@ -1,659 +1,175 @@
-# Proton Drive Sync for Obsidian
+# Proton-SDK-Sync
 
-Bidirectional sync between an Obsidian vault and a folder in Proton Drive, built
-on Proton's [official Drive SDK](https://github.com/ProtonDriveApps/sdk). Your
-notes are end-to-end encrypted by the SDK before they leave the device, with the
-same implementation Proton's own clients use.
+Two-way sync between an [Obsidian](https://obsidian.md) vault and a folder in
+[Proton Drive](https://proton.me/drive), built on Proton's official
+[Drive SDK](https://github.com/ProtonDriveApps/sdk). Notes, attachments and your
+`.obsidian` settings travel encrypted end to end: the encryption happens on your
+device, with the same SDK Proton's own clients use.
 
-> [!WARNING]
-> **This plugin is vibe-coded.** It was written largely by an AI coding
-> assistant, with a human directing and reviewing the work rather than writing
-> every line. It has automated tests, but it has not been through a security
-> audit or long real-world use, and it syncs, and can delete, the files in your
-> vault. Try it on a copy of a vault first, keep backups, and expect bugs.
-
-> **Status: alpha, and it depends on a pre-release SDK.** Read
-> [Before you rely on this](#before-you-rely-on-this) first. Keep a backup.
+> [!IMPORTANT]
+> This plugin writes to your vault and can delete files in it. It has an
+> automated test suite, but no external security audit. Keep a backup, and try
+> it on a copy of a vault first.
 
 ## What it does
 
-- **Two-way sync** of the whole vault — notes, attachments (images, video,
-  audio, PDFs), folders, and your `.obsidian` settings.
-- **Renames stay renames.** Renaming or moving a note or folder, here or on
-  another device, renames the same file on the other side, keeping its Drive
-  revision history. That holds even for renames made while syncing was paused,
-  locked or on mobile data, or outside Obsidian (in a file manager, with `git
-  mv`): the next full sync recognises the file by its content and moves it on
-  Drive instead of deleting and uploading it again.
+- **Two-way sync** of the whole vault — notes, images, video, audio, PDFs,
+  folders, and `.obsidian` settings if you want them.
+- **Renames stay renames.** Renaming or moving a file here or on another device
+  renames the same file on Drive and keeps its version history. That holds for
+  renames made while syncing was paused, on mobile data, or outside Obsidian
+  (in a file manager, with `git mv`): the next full sync recognises the file by
+  its content and moves it instead of uploading it again.
 - **Three-way conflict detection.** Every synced file records the version both
-  sides last agreed on, so a device that has been offline for a week can tell an
-  edit it missed from an edit it made. Only a genuine double-edit is reported as
-  a conflict.
-- **Conflict remediation**, from keeping both copies (the default — nothing is
-  ever silently overwritten) to a line-level three-way merge that combines edits
-  made to different parts of a note.
-- **Conflict notifications and history.** When a file changed in two places, a
-  notice names it and says how it was settled. Click the file name to open it.
-  Closing the notice loses nothing: every conflict stays listed in **Show sync
-  conflicts**, with the note and its conflict copy one click away.
-- **Side-by-side comparison of conflicts.** See exactly what differs between two
-  versions of a note, as a code review would show it: lines only in one version
-  in red with `-`, lines only in the other in green with `+`, and the changed
-  words highlighted. Then pick which version to keep from the same window.
-- **A preview before the first sync.** When a vault with files meets a Drive
-  folder with files, you see what will be uploaded, downloaded and treated as a
-  conflict before anything moves, and can hold off.
-- **Pause and resume**, from the status bar, the command palette or settings.
-- **A status bar that says what is happening**: files checked in the current
-  pass, the progress of a large upload or download, and how long ago the last
-  sync finished. A dot beside the icon shows whether the note you are looking
-  at is in sync: pulsing green when it is, red when it has changes not synced
-  yet. On mobile the same dot sits in each note's header.
-- **Nothing fails to sync unseen.** The sync panel lists every change not
-  synced yet, and why: waiting for Wi-Fi, retrying after a failure (with the
-  error it got), too large for this device, waiting on a conflict decision.
-- **If the Drive folder goes missing**, moved to the trash, deleted, or no
-  longer shared with you, syncing stops and says so, rather than retrying
-  every note. Your notes in the vault are left as they are. Restore the folder
-  on Proton Drive and syncing picks up again by itself, or choose another
-  folder with **Choose folder** in the sync panel or by clicking the status bar.
-- **Edits arriving while you type are merged in.** A new version of a note you
-  have open is brought into the editor without moving the cursor, and if you
-  have unsaved typing, merged with it rather than written underneath it.
-- **Share a note.** **Copy Proton Drive share link** (command palette, or
-  **Share link** in the sync panel) makes a read-only public link to the note
-  on Drive, optionally with a password and an expiry, and copies it. The same
-  dialog copies an existing link or stops sharing.
-- **Recently deleted.** The sync panel keeps a list of the vault's files in
-  Drive's trash, deleted from any device, and brings one back once you confirm.
-- **See the devices that sync a vault.** Each lists itself with when it last
-  synced, and any of them can pause, resume or remove the others; a removed
-  device signs out.
-- **Shared vaults.** Pick a folder from **Shared with me** to use a vault
-  together: share the folder in Proton Drive with editor access, and everyone it
-  is shared with can sync it into a vault of their own.
-- **Mobile-friendly options**: sync on Wi-Fi only (Android), and leave large
-  files for a computer to sync. Phones and tablets skip making image
-  thumbnails, which only Proton's own apps use.
-- **Event-based updates.** Changes from other devices arrive through Drive's
-  event feed rather than by re-walking the tree, and so does the catch-up when
-  Obsidian opens: a scan of the vault finds what changed here while it was
-  closed, and the event feed what changed on Drive. The whole Drive folder is
-  only walked when that cannot tell the whole story (a first sync, a file
-  renamed or deleted while Obsidian was closed, Drive asking for it) and about
-  once a day, at a quiet moment: after five minutes without changes, or while
-  the window is hidden, never in the middle of use. Changes that fail to apply
-  are retried, also after a restart, waiting longer each time they fail again.
-- **Fewer requests at start-up.** What the Drive SDK knows about your files
-  (names, sizes, revisions) is kept between sessions, encrypted, so the
-  catch-up does not ask Drive for it all again. See
-  [Where your credentials live](#where-your-credentials-live).
+  sides last agreed on, so a device that was offline for a week can tell an
+  edit it missed from an edit it made. Only a genuine double edit is reported.
+- **Conflicts are recoverable.** You choose per conflict — this device, Drive,
+  or both — and the losing side is kept as a conflict copy, so nothing is
+  silently thrown away.
+- **Version history.** Look at earlier versions of a note on Drive, compare
+  them with what you have, and restore one.
+- **Selective sync.** Exclude paths by glob, skip large files, and hold syncing
+  on cellular data on mobile.
+- **A guard against mass deletion.** If a large share of the vault disappears
+  locally at once — an unmounted card, an evicted cloud folder, a vault cleared
+  by something else — the plugin stops and asks before trashing anything on
+  Drive.
+- **Devices see each other.** Each device keeps a small note in the synced
+  folder, so you can see what else syncs this vault and ask another device to
+  re-check or to hand over a folder.
 
-## Before you rely on this
+## Requirements
 
-A few things are worth knowing before you point this at a vault you care about.
-
-**"Almost instant" is one-way.** Local edits upload within about two seconds of
-you stopping typing. Changes made on *another* device take up to the poll
-interval to arrive. The pace follows Proton's own SDK: every 30 seconds for a
-few minutes after anything changes, the **Check Drive every** setting otherwise
-(30 seconds by default), and every 10 minutes after ten quiet minutes or while
-the window is hidden. The Proton Drive API has no push or websocket channel, so
-there is no way to do better than polling, and Proton's
-[usage guidelines](https://github.com/ProtonDriveApps/sdk#operational-requirements)
-ask third-party clients not to poll aggressively: an account that does can be
-rate-limited. The setting cannot go below 30 seconds, Proton's own rate. This
-is a limit of the service, not of this plugin.
-
-**The SDK is not released for third-party use yet.** Proton's README allows
-personal, non-commercial projects like this one and asks that they go through the
-SDK rather than the raw API — which is what this does — but it also says the
-interface may still change, and it describes a **cryptographic model change
-targeted for late 2026 / early 2027** after which clients that have not been
-updated will stop interoperating. If this plugin is not updated by then, it will
-stop working.
-
-**Desktop and mobile.** The plugin runs on Windows, macOS, Linux, Android and
-iOS. Requests go out through Obsidian's `requestUrl` on every platform, and
-sign-in and encryption use only web APIs. Differences on mobile:
-
-- Large attachments are held in memory while they transfer, because streaming
-  to disk needs Node, which mobile does not have. A multi-gigabyte video can
-  exhaust a phone's memory; set **Leave large files for other devices** under
-  **On phones and tablets** in settings. It applies to phones and tablets only,
-  so one vault can have the same setting everywhere.
-- **Sync on Wi-Fi only** holds the sync while on mobile data. Only Android tells
-  apps which kind of connection they are on, so on iOS it has no effect.
-- The OS suspends Obsidian in the background, so nothing syncs while the app is
-  closed. Pending edits are pushed when you leave the app, and Drive is checked
-  as soon as you come back.
-- Sign-in opens Proton in the system browser. Approve the device there, then
-  switch back to Obsidian, where it completes on its own.
-
-Mobile support is new and has had far less testing than desktop.
-
-**Encryption runs on the UI thread.** The SDK encrypts and decrypts in-process,
-so a very large attachment can make Obsidian stutter while it transfers. On
-desktop, files over 32 MB are streamed to and from disk rather than held in memory, so size is
-not a hard limit, but use **Skip files larger than** in settings if the
-stutter bites.
-
-**Requires Obsidian 1.13.7 or later.**
+- A **Proton account** with Drive. The plugin signs in through Proton's web
+  login; your password is never typed into the plugin and never stored by it.
+- Obsidian **1.13.7** or newer. Desktop and mobile.
 
 ## Installing
 
-There is no community-plugin listing. Build it and copy it in:
+Until the plugin is in the community directory, install it by hand:
 
-```bash
-npm install
-npm run build
-```
+1. Download `main.js`, `manifest.json` and `styles.css` from the
+   [latest release](../../releases/latest).
+2. Put them in `<vault>/.obsidian/plugins/proton-sdk-sync/`.
+3. Enable **Proton-SDK-Sync** in *Settings → Community plugins*.
 
-Then copy `main.js`, `manifest.json` and `styles.css` into
-`<your vault>/.obsidian/plugins/proton-drive-sync/`, and enable the plugin in
-**Settings → Community plugins**.
-
-On Android and iOS, put the same three files in that folder of the vault on the
-device, using a file manager, a USB cable, or a plugin installer such as BRAT.
-
-For development, `npm run dev` rebuilds on change; point it at a test vault by
-building into that vault's plugin folder.
+With [BRAT](https://github.com/TfTHacker/obsidian42-brat) you can add
+`ondreu/proton-sdk-sync` instead and let it keep the plugin updated.
 
 ## Setting it up
 
-The first time the plugin loads, a setup window walks you through it. It only
-appears once. To see it again, run **Open setup assistant** from the command
-palette. Everything it sets is also in **Settings → Proton Drive Sync**.
+1. *Settings → Proton-SDK-Sync → **Sign in***. A browser window opens on
+   Proton's own login page; approve the sign-in there and come back.
+2. Choose the Drive folder to sync with, or create one. An empty folder and an
+   empty vault pair up cleanly; a folder that already has files is matched
+   against the vault by content, so matching files are paired instead of copied
+   twice.
+3. Pick what to sync, and let the first pass finish. The status bar shows what
+   it is doing; the panel behind it lists individual transfers.
 
-1. **Sign in.** A Proton page opens in your browser and you approve the device
-   there. The plugin never sees your password, so two-factor, security keys and
-   SSO all keep working.
-2. **Choose a Drive folder.** Give the vault a folder of its own — everything in
-   it is treated as part of the vault.
-3. **Choose whether to sync Obsidian settings** (on by default), then **Start
-   syncing**. Nothing is transferred before that.
+A first sync of a large vault is mostly upload or download. It takes time, and
+it needs Obsidian to stay open, though not in the foreground.
 
-If both the vault and the Drive folder already hold notes, the first sync shows
-a preview first: how many files will be downloaded, uploaded, or are on both
-sides with different content, with the file names one click away. **Start
-syncing** goes ahead; **Not now** pauses syncing until you resume it. A first
-sync never deletes anything on either side. The same preview appears after
-**Rebuild sync state** or a change of Drive folder, which are first syncs too.
+## Conflicts
 
-On each additional device, sign in and pick **the same folder**. The first sync
-pairs up files that already match, byte for byte, without transferring them.
-Settings from Drive take precedence over a new device's defaults, without being
-reported as conflicts. Obsidian only loads its settings, plugins, themes and CSS
-snippets at startup, so a first sync brings the `.obsidian` folder down before
-any note, and a dialog then lists what came down and offers **Reload now**.
-Reloading at that point is quick, since the notes have not arrived yet, and
-safe: if you reload, the notes pick up where they left off afterwards; if you
-choose **Later**, they keep syncing in the meantime. Until you reload, settings changes on that device are not
-uploaded, so the defaults it is still running on cannot replace your settings on
-Drive; changes coming from Drive still arrive. If Drive's list of enabled
-plugins does not include Proton Drive Sync, it is added back, so the reload
-never switches syncing off.
+A conflict is a file edited on two devices since they last agreed on it. The
+plugin does not guess: it keeps both sides and asks.
 
-Joining with a brand-new vault, one that holds nothing but Obsidian's default
-settings, skips the preview described below: there is nothing of yours in it
-for Drive's files to clash with.
+- **This device** keeps the local file and uploads it, so Drive follows.
+- **Drive** brings the Drive version down, so this device follows.
+- **Both** keeps the local file and writes the Drive version beside it as a
+  conflict copy, named `note (conflict from <device> 2026-01-31 12-00-00).md`.
 
-## How conflicts are handled
+The losing side is always kept as a conflict copy when it differs, even if
+conflict copies are turned off for ordinary merges — losing an edit because a
+button was clicked once is not a trade worth making.
 
-A conflict is when a file changed *on both sides* since they last agreed. An edit
-on one side only is not a conflict; it is just a sync.
+Text files changed on both sides are merged line by line when the edits do not
+overlap; the merged result is written and reported as merged. Everything else
+becomes a conflict copy.
 
-| Setting | What happens |
-| --- | --- |
-| **Keep both versions** (default) | This device's version keeps its filename. The other is saved beside it as `note (conflict 2026-09-18 1431 from laptop).md`. Both then sync everywhere. |
-| **Merge the changes** | Combines edits to different parts of a note, down to different words of the same line — the usual shape after a device has been offline. Falls back to keeping both when the edits overlap, when the file is not text, or when the previous version is no longer in Drive's revision history. |
-| **Keep whichever was edited last** | Uses modification times. Falls back to keeping both when they tie, or when Drive has no recorded time for the file. |
-| **Keep this device's / Keep Drive** | The chosen side keeps the filename; the other is kept as a conflict copy unless you turn copies off. |
-| **Ask me each time** | Nothing is written. The file is skipped until you choose, via **Show sync conflicts** in the command palette or the status bar's right-click menu. |
+## Pausing and troubleshooting
 
-### Keeping track of conflicts
-
-**Show sync conflicts** (command palette, status bar menu, or the sync panel's
-**Conflicts** button) lists two things. **Waiting on you** has the files **Ask me
-each time** left for a decision. **History** has every conflict this device has
-seen, newest first, however it was settled: when it happened, what happened, and
-buttons to open the note or compare it with its conflict copy while the copy is
-still there. Remove entries one by one or clear the lot; the most recent 200 are
-kept. The history belongs to each device and is not synced.
-
-### Comparing versions
-
-Under **Ask me each time**, each file in **Show sync conflicts** has a
-**Compare** button. It shows this device's version against the one on Drive as
-a diff: lines only on this device in red with `-`, lines only on Drive in green
-with `+`, a few unchanged lines around each change, and the rest folded away.
-The Markdown is shown as source, so a changed link target or heading level is as
-visible as a changed word. The choices are right underneath, each in the colour
-and sign of the version it keeps: red **− Keep this device's version**, green
-**+ Keep the Drive version**, and a neutral **Keep both**.
-
-Under the other policies, a conflict usually leaves a conflict copy beside the
-note. Open either file and run **Compare with conflict copy** from the command
-palette, or click **Compare** in the conflict notice. From the diff you can keep
-the note and delete the copy (red, **−**), or replace the note with the copy
-(green, **+**). The copy goes
-to Obsidian's trash either way, so a wrong choice can be undone.
-
-Two cases ignore the setting, because there is no second version to choose
-between: if a file was **deleted on one device and edited on the other**, the
-edit always wins. A deletion can be repeated; a lost edit cannot be recovered.
-
-Deletions that *aren't* contested do propagate, and locally a deleted note goes
-wherever you chose under **Settings → Files and links → Deleted files** (system
-trash, the vault's `.trash` folder, or permanently), as if you had deleted it
-yourself. Files in the config folder, which Obsidian does not index, go to the
-system trash. A file is only removed from the vault when Drive
-confirms it was deleted or trashed. A file that is merely missing from the Drive
-folder — moved elsewhere in Drive, or not found because a request failed — is
-kept, and uploaded again if needed.
-
-Files in the `.obsidian` folder never get conflict copies, since Obsidian would
-never read them, and never raise a conflict notice, since there is nothing to
-decide. When a new device joins, Drive's copy wins. Otherwise the most recent
-edit wins.
-
-## Pausing, progress and troubleshooting
-
-Click the status bar item to sync now, or to resume when paused. Right-click it
-for **Pause syncing**, **Show sync conflicts**, the sync panel and the settings.
-
-The **sync panel** shows the same status in the right sidebar: when the vault
-last synced, in green, or in red once that is over an hour ago, which means
-syncing has stopped (paused, offline, failing or waiting for Wi-Fi); the details
-(progress, last error); and its buttons, one to a row and each the full width
-of the panel: **Sync now**, **Pause**/**Resume**, **Share link** for the note
-you are viewing (see below), **Conflicts**, **Versions of** that note,
-**Recently deleted** and **Settings**. Below them are the changes not synced
-yet. A check of Drive that finds nothing new counts as a sync, so a quiet vault
-stays green.
-
-**Versions of** opens the versions of the note you are viewing on Proton Drive:
-up to the last 50, newest first, ten to a page, each with its date and size,
-the current one marked. Choose one to compare it with the note as it is now, in
-the same red and green diff as conflicts, and **Restore this version** to bring
-it back; **All versions** goes back to the list. A restore is written into the
-note and synced as a new version, so the version it replaces stays in the
-history and the restore can itself be undone. The panel lists the versions
-whenever you open a note, and again when it syncs a new version, so the list is
-ready when you open it.
-
-**Recently deleted** opens the vault's files in Drive's trash: up to 50, most
-recently deleted first, ten to a page, from any device. **Restore** asks first,
-then takes the file out of the trash, and the next check brings it back into
-the vault. A file whose folder was deleted too comes back with that folder; a
-folder deleted as a whole, from Proton's apps say, is listed for itself. The
-panel lists the trash once the sync is up and again as often as Drive is
-checked for changes, but not while syncing is paused, offline or waiting for
-Wi-Fi; opening the dialog lists it then. Files deleted from Drive's trash, or
-after it was emptied, are gone.
-
-**Sharing a note.** **Copy Proton Drive share link** opens a dialog for the
-note in view. If it has no link yet, choose an optional password and an expiry
-(never, 1, 7 or 30 days) and **Create and copy link**. Anyone with the link can
-open the note, read-only, as it is on Drive at the time; the key is in the
-part of the link after `#`, which browsers do not send to Proton. If the note
-has a link already, the dialog shows it with **Copy link** and **Stop
-sharing**. A note has to be synced before it can be shared. Open the
-panel with **Open sync panel** from the command palette. The full sync log is in
-the settings, under **Recent activity**.
-
-On mobile, where Obsidian has no status bar, the panel takes its place, out of
-the way of the note until you swipe the right sidebar in. A sync icon in the
-ribbon shows the current state and opens the panel. Every command has an icon,
-so you can also put **Sync now** in the mobile toolbar (Settings → Toolbar), or
-make it the pull-down gesture (Settings → Mobile → Quick action).
-
-While paused, nothing is uploaded, downloaded or polled. Edits made in the
-meantime, on this device or elsewhere, are found by the full sync that runs when
-you resume. The pause is remembered across restarts.
-
-While a sync runs, the status bar shows how many files of the current pass have
-been checked (`Syncing 120/4000`), or the progress of a large transfer
-(`↑ lecture.mp4 45%`). When idle, it says how long ago the last sync finished.
-
-The dot beside the icon is about the note you are looking at: pulsing green
-when it is in sync, pulsing red when it has changes that have not reached Drive
-yet (hover for why), grey when it is excluded from sync. On mobile it appears in
-the note's header instead, turns into a spinning sync icon while that note
-transfers, and opens the sync panel when tapped.
-
-The sync panel's **Not synced yet** list shows every change still waiting, with
-the reason: about to sync, uploading, downloading, being removed after a
-deletion elsewhere, waiting for Wi-Fi, failed and retrying (with when it tries
-next), over this device's size limit, a name clash, or a conflict waiting for
-you. Tap a file to open it.
-
-**Notes open in an editor.** When a new version of a note arrives while it is
-open, it is brought into the editor as an edit, so the cursor stays where it is.
-If you have typing that is not saved yet, the two are merged in the editor
-instead of the file being replaced underneath you; once Obsidian saves, the
-merged note goes up without a conflict copy. Only typing that overlaps the
-incoming change is left for your conflict setting to settle.
-
-If something goes wrong, **Copy sync log** (in the command palette, or under
-**Recent activity** in settings) copies the recent log with the plugin and
-Obsidian versions, ready to paste into a bug report. It includes file names, so
-look it over before sharing it.
+- **Pause** stops all passes, polling and watching. Changes made meanwhile are
+  found by the full sync on resume.
+- **Sync now** runs a full reconciliation immediately.
+- **Copy sync log** in settings puts the recent log on the clipboard, with file
+  names redacted unless you turn that off.
+- If a pass fails on one file — a locked file on Windows, a permission error —
+  that file is recorded as failed and the rest of the pass continues.
 
 ## What is never synced
 
-Regardless of settings: `.obsidian/workspace.json` and the other pane-layout and
-cache files (devices fight over them), this plugin's own folder (its settings
-and sync state belong to each device, and each device updates the plugin itself
-through Obsidian), the device list's `.proton-drive-sync` folder (see
-[Seeing and managing the devices that sync a vault](#seeing-and-managing-the-devices-that-sync-a-vault)),
-`.trash/`, `.git/`, `.DS_Store`, `Thumbs.db`, and editor scratch files.
-`.obsidian` as a whole is excluded if you turn off **Sync Obsidian settings**.
-These are matched however a path is spelled, so `.Obsidian/` or `.obsidian./`,
-which Windows and macOS treat as the same folder, are excluded too.
+- Editor scratch files, `.DS_Store`, `Thumbs.db`, `desktop.ini`.
+- `.git/`, `.trash/`, and Obsidian's own cache folders.
+- Anything you exclude, and `.obsidian/` if you turn config syncing off.
+- Files above your size limit, and on mobile anything above the mobile limit.
 
-Nor is anything on Drive whose name could lead out of the vault: `..`, a name
-made only of dots and spaces, or one containing `/` or `\`. Names on Drive are
-end-to-end encrypted, so Proton cannot check them, and anyone who can write to
-a shared folder could otherwise use them to write files outside the vault.
-Such items are left alone on Drive and named in the sync log.
-
-Add your own exclusions as globs — `Private/`, `**/*.pdf` — in settings. A
-pattern that would not do what it looks like, such as one with a leading `/` or
-Windows `\` separators, is flagged under the field as you type.
+The plugin's own state, logs and cached metadata stay in
+`.obsidian/plugins/proton-sdk-sync/` and never sync.
 
 ## Sharing a vault with other people
 
-A vault can live in a Drive folder shared between Proton accounts. The owner
-shares the folder in Proton Drive with **editor** access; each person accepts
-the invitation there, then picks the folder under **Shared with me** in the
-folder picker. Who can use the vault is whatever Proton Drive's sharing says.
+A folder shared with you on Drive can be the sync target. The device list is
+then disabled: the other people in that folder would see the notes each device
+writes about itself, and that is not theirs to see.
 
-- A folder shared for viewing only cannot be picked: a two-way sync would fail
-  on every upload.
-- Choosing a shared folder turns off syncing of the config folder, so people do
-  not overwrite each other's theme, plugins and hotkeys. It can be turned back
-  on in the settings.
-- Installed plugins (`.obsidian/plugins/`) and the list of enabled ones
-  (`community-plugins.json`) are never synced with a folder other people can
-  write to, even with config sync on: anyone with editor access could otherwise
-  put a plugin into the vault that runs on everyone's computer. This applies as
-  soon as the folder, or a folder above it, is shared with another account,
-  also when it was shared after you chose it. A public link does not count.
-- Plugins that run code from notes, such as Dataview's JavaScript queries or
-  Templater's scripts, run what your collaborators write. Turn those features
-  off in a shared vault unless you trust everyone it is shared with.
-- Notes deleted from a shared vault go to the owner's Drive trash, which only
-  the owner can list and restore from.
-- If the owner stops sharing, syncing stops with an error; the notes in the
-  vault stay where they are.
+## Where your credentials live
 
-## Using several devices at once
+The Proton session — access and refresh tokens, never your password — is stored
+encrypted, in one of two places:
 
-Each device keeps its own record of the last version it agreed on with Drive, so
-devices never need to be online together. What to expect when they are:
+- **Desktop:** a file in the plugin's folder, encrypted with the OS keystore
+  (Electron `safeStorage`: Keychain, DPAPI, libsecret), file mode `0600`.
+- **Mobile:** Obsidian's own secret storage, because the mobile app has no
+  keystore.
 
-- **The same note edited on two devices before either syncs** is a conflict,
-  resolved by your conflict setting. By default both versions are kept.
-- **The same note saved on two devices within seconds of each other.** Drive
-  has no way to reject an upload because another one just landed. So right
-  before uploading, the plugin asks Drive for the note's latest version; if
-  another device's edit is already there, it is handled as a conflict (merged,
-  with "Merge the changes") instead of being uploaded over. If the other edit
-  lands in the moment between that check and the upload, the revision history
-  check after the upload keeps it as a conflict copy. Nothing is lost either
-  way.
-- **A new note with the same name created on two devices** is a conflict too,
-  resolved the same way.
-- **A note deleted on one device while it is edited on another**: the edit
-  wins, as above. The deleting device checks, right before it trashes the note
-  on Drive, that no newer version has arrived, and leaves it alone if one has.
-  Only if the edit lands in the fraction of a second between that check and the
-  trash does it end up in the Drive trash, where you can restore it.
-- **A note saved here while a newer version of it is downloading**: the file is
-  checked again right before the download replaces it, so your edit is not
-  overwritten; the two versions are handled as a conflict instead.
-- **Renames on two devices at once**: the last one to reach Drive wins, and the
-  other device follows it.
-- **"Keep whichever was edited last"** compares modification times from
-  different devices, so it is only as good as their clocks.
-- **Each device names its conflict copies** after itself. On mobile the default
-  name is the platform, such as "iPhone". Give each device a distinct name in
-  the settings if you have two of the same kind.
-- **Changes from other devices arrive** on the next Drive check, 30 seconds by
-  default.
-- **Names that differ only in letter case**, such as `Note.md` and `note.md`, can
-  exist side by side on Drive and Linux, but are one file on Windows, macOS,
-  iOS and usually Android. On a device that can keep them apart, both simply
-  sync. On one that cannot, the plugin settles the clash on Drive: the name
-  that was already synced, or the one in this vault, stays, and the other is
-  renamed to `note (case conflict).md`, so both keep syncing everywhere. The
-  same goes for folders, such as `Notes` and `notes`. Each rename shows up in the
-  conflict notice and history. A pair that cannot be renamed is left unsynced,
-  and you are told.
-- **Names Windows cannot store**, such as `aux.md` (a reserved device name),
-  `Meeting 10:30.md`, or `note.` (Windows drops the trailing dot, so it would
-  land on `note`), are fine on macOS, Linux and Android. When a Windows device
-  meets one, it renames it on Drive, for example to
-  `Meeting 10-30 (renamed for Windows).md`, so every device syncs it under a
-  name all of them can store. A vault no Windows device syncs keeps its names.
-  If the rename fails, the file is not synced on that Windows device, and
-  **Not synced yet** says why.
-- **Names spelled with other Unicode characters** than Obsidian uses, such as
-  `Café.md` with its accent stored as a separate character (as macOS and some
-  Linux tools write it), or a name with a non-breaking space, are renamed on
-  Drive to the spelling Obsidian uses, on every device. Without that, the vault
-  would hold the note under one spelling and Drive under the other, and the two
-  would sync as different files. If a file with that spelling is already on
-  Drive, the other is renamed to `Café (name conflict).md` instead, so both are
-  kept, and the rename shows up in the conflict notice and history.
-- **On Windows, a file open in another program** (a video in a player, say) may
-  be locked, and an update to it waits until the next sync after it is closed.
+You can put a PIN in front of the stored session. With a PIN set it is never
+written in the clear: a token refresh that arrives while the plugin is locked is
+dropped, and the next unlock fetches a fresh one. Wrong PINs back off
+exponentially, and the count survives a restart.
 
-### Seeing and managing the devices that sync a vault
-
-Each device that syncs the vault lists itself, shortly after its first sync:
-its name (the **Device name** setting), platform, plugin version and account,
-how it stands, and when it last synced, updated hourly while it syncs and
-whenever that changes. **Show devices** under **Devices** in the settings, or
-**Show devices syncing this vault** in the command palette, opens the list.
-
-From there you can **Pause**, **Resume** or **Remove** any other device. Each
-acts on it the next time it checks Drive, which for a device that is closed is
-when Obsidian next opens on it; until then the list says it was asked. A paused
-device stops syncing as if it had been paused by hand, and can be resumed from
-the list or on the device itself; while paused it still checks the list every
-two minutes, so a resume or removal reaches it. A removed device stops syncing and signs out,
-and syncs the vault again only once someone signs in on it with the account's
-password. Nothing is deleted, on the device or on Drive. **Forget** takes a
-removed device, or one not heard from in a month, off the list.
-
-The list lives in a hidden `.proton-drive-sync` folder in the Drive folder,
-with one small file per device that only that device writes, and one for the
-requests left for it. Devices on versions from before the list sync that folder
-like any other hidden folder, which does no harm: they never write to it.
-
-It asks devices to cooperate; it cannot make them. Versions from before the
-list, Proton's own apps and anything else signed in to your account neither
-list themselves nor take requests, so the list shows who syncs with this
-plugin, not everyone who can reach the folder. To cut a device off for good,
-change your Proton password, or revoke its session in Proton's account settings
-under **Security**. If a device is reinstalled, or Obsidian's data is cleared
-on it, it lists itself again as a new device; forget the old entry.
-
-The list is off for a vault in someone else's Drive or shared with other
-people, whose devices would otherwise see yours, and could pause or remove
-them.
-
-## How it works
-
-```
-vault events ─┐                                  ┌─ Drive events (polled)
-              ├─→ batched ─→ reconcile() ─→ apply ┤
-sync state ───┘                    │              └─ upload / download
-                                   └─→ conflict ─→ policy ─→ merge / copy
-```
-
-`src/sync/reconcile.ts` is the core: a pure function from
-(last-agreed version, local file, remote node) to one decision. It does all the
-interesting thinking and none of the I/O, which is why the awkward cases have
-tests rather than anecdotes.
-
-| Path | What lives there |
-| --- | --- |
-| `src/sync/reconcile.ts` | The decision table. Pure. |
-| `src/sync/merge.ts` | Line-level three-way merge. Pure. |
-| `src/sync/engine.ts` | Watches both sides and applies decisions. |
-| `src/sync/engine/` | The engine's parts: polling pace, transfer pace, progress, case clashes, rename detection, first-sync plan. |
-| `src/sync/state.ts` | What the last sync agreed on, per path. |
-| `src/proton/` | SDK wiring: transport, session, credentials. |
-| `src/proton/account/` | Vendored from Proton's SDK repo — see its `VENDORED.md`. |
-
-Run the tests with `npm test` and the Obsidian review rules with `npm run lint`;
-CI runs both. `tests/simulation.test.ts` runs three simulated devices through
-random sequences of edits, renames, deletions, restarts and missed events, and
-checks that they always end up with the same notes and that no typed text is
-lost. Set `SIM_SEEDS` and `SIM_STEPS` to run more of them, or `SIM_SEED` to
-replay a failing one. The tests cover the reconciliation table, the merge, the diff,
-path filtering, the state store and the HTTP transport — everything that can be
-exercised without a real vault and a real Proton account.
-
-### Where your credentials live
-
-The Proton session — access token, refresh token, and the password that unlocks
-your keys — is kept in Obsidian's secret storage. That storage belongs to the
-device, not the vault, and uses the platform's keystore where there is one. It
-is never written inside the vault, so it is never synced, and a copied vault
-does not carry your sign-in with it. Each device signs in on its own. Sessions
-saved by version 0.1.0 in `session.json` are moved into secret storage on the
-first launch, and the file is deleted.
-
-The Drive SDK's file metadata cache (decrypted names, sizes and revisions of
-the files it has seen) is kept between sessions in an IndexedDB database of
-Obsidian's, outside the vault, so it is never synced. Each entry is encrypted
-with AES-256-GCM under a key kept inside the stored session, so it is protected
-by the PIN when there is one and useless after signing out, which also deletes
-it. It is saved together with the sync state's position in Drive's event feed,
-and thrown away when the two do not match (a crash between saves, a rebuilt
-sync state, another folder), since a stale cache could hide a change. The SDK's
-other cache, which holds decrypted keys, is only ever kept in memory.
-
-The sync state in `sync-state.json` holds paths, node ids and content hashes. No
-file contents, and no key material. It is saved so that a crash or a killed app
-never leaves only a half-written copy: the new state is written beside it and
-then swapped in, with the previous copy kept as `sync-state.json.bak`. If no
-copy can be read, the plugin says so and pauses, showing what a sync would do
-before anything moves, instead of quietly starting from scratch.
-
-**Signing out ends the session on Proton's side** (`DELETE /auth/v4`) before
-the local copy is deleted, so a copy of it that anyone might have taken stops
-working too. If Proton cannot be reached, the local copy is deleted anyway and
-you are told to revoke the session under account.proton.me → Security →
-Sessions. Signing out also forgets the chosen Drive folder and its sync state,
-since both belong to that account: after signing in again, choose the folder
-anew. Nothing is deleted on Drive or in the vault, and the first sync pairs up
-the files that already match.
-
-### Protecting the sign-in with a PIN
-
-Obsidian's keychain is encrypted by the operating system, which protects it
-while the device is locked, but not from someone using it unlocked: Obsidian's
-own Keychain settings can reveal a stored secret. Without a PIN, that secret is
-a working Proton session, key password included.
-
-An optional **PIN** closes that gap. Set it up in the setup assistant or under
-**Settings → Proton Drive Sync → Account → PIN**. The session is then stored
-encrypted (AES-256-GCM, with a key derived from the PIN by PBKDF2-SHA256 at
-600,000 iterations), and Obsidian asks for the PIN when it starts; nothing syncs
-until it is entered. While locked, the sync icon in the status bar (desktop) and
-the ribbon (mobile) shows a lock. Changing or removing the PIN, and signing out,
-ask for it first. After a few wrong tries each further try waits, longer every
-time. The eye button next to each PIN field shows what you typed.
-
-**Ask for the PIN** sets when it is asked for again: every time Obsidian opens
-(the default), or after 1, 5, 10, 30 or 60 minutes without using Obsidian. With
-a time limit, syncing stops and the PIN is asked for once the time runs out, and
-reopening Obsidian within the limit does not ask. That convenience has a cost:
-to survive a restart, the unlocked key is kept in Obsidian's keychain until the
-limit runs out, and while it is there the sign-in is protected only as well as
-without a PIN. If Obsidian stays closed past the limit, the key stays in the
-keychain until it next runs, when it is deleted. "Every time Obsidian opens"
-never keeps it.
-
-- **The PIN is stored nowhere.** Forget it and it cannot be recovered: **Forgot
-  PIN** in the unlock prompt deletes the locked sign-in from the device, and you
-  sign in again and choose a new PIN. Your notes are not affected, since the PIN
-  only ever protected the sign-in. Revoke the old session in your Proton account
-  if you want it gone before it expires.
-- **Longer is stronger.** Someone who copies the encrypted secret can try PINs
-  on their own machine, where no waiting applies; the key derivation makes each
-  try slow, but a six-digit PIN is still a small space. Letters and numbers both
-  work.
-- **What it does not cover.** Your notes are ordinary files on the device, and
-  once the PIN is entered the session is in memory until Obsidian closes. The
-  PIN protects your Proton account, and everything else in your Drive, from
-  someone who gets at the device while Obsidian is closed or not yet unlocked.
-- Signing out also removes the PIN; the next sign-in can set a new one.
+Signing out ends the session on Proton's side as well, and forgets the folder
+choice and the sync state, because both belong to the account you left.
 
 ## Permissions and disclosures
 
-Obsidian's plugin review flags some of what this plugin does. Here is each one
-and why it is there.
+- **Account:** a Proton account is required. There is no way to use the plugin
+  without one.
+- **Network:** the plugin talks to Proton only — `account.proton.me`,
+  `drive-api.proton.me` and the addresses the SDK resolves from them. It sends
+  the requests a Drive client has to send: authentication, file listing,
+  uploads, downloads, shares and version history. Nothing is sent anywhere else.
+- **Telemetry:** none. The SDK's telemetry interface is wired to the local log
+  and the metrics are dropped; nothing about your files or your usage leaves the
+  device except the Drive requests themselves.
+- **Files outside the vault:** none. Everything the plugin writes goes into the
+  vault, apart from the OS keyring entry used by `safeStorage`.
+- **Ads:** none, and no paid tiers.
 
-- **Network.** The plugin talks to Proton's API (`*.proton.me`) and nothing
-  else, through Obsidian's `requestUrl`. File contents and names are encrypted
-  on the device before they leave it.
-- **Direct filesystem access (desktop only).** Obsidian's plugin page warns that
-  Node's `fs` can read and write any file on the system. This plugin only opens
-  paths inside the vault, resolved through the adapter's own `getFullPath`. On
-  desktop, files over 32 MB are streamed with Node's `fs` and hashed with Node's
-  `crypto` instead of being read whole into memory, and large downloads are
-  written to a temporary file in the plugin's own folder and moved into place
-  once complete; one left unfinished by a crash is cleared at the next start.
-  Obsidian's API has no way to read a file in pieces, so without `fs` a
-  multi-gigabyte video would have to fit in memory whole. On mobile, where there
-  is no Node, everything goes through the adapter and large files are read
-  whole. Everywhere else, notes are written, renamed and deleted through
-  Obsidian's Vault API, and settings files in the config folder, which that API
-  cannot reach, through the adapter.
-- **No telemetry.** The Drive SDK's metrics are dropped, not sent (see
-  `src/proton/telemetry.ts`).
-- **Clipboard.** Write only, and only when you ask: "Copy link" in the sign-in
-  dialog copies the Proton sign-in link, "Copy sync log" copies the recent
-  log, and the share dialog copies a note's share link when you make it or
-  press "Copy link". The plugin never reads the clipboard.
-- **IndexedDB.** The Drive SDK's metadata cache is kept, encrypted, in an
-  IndexedDB database of its own; see
-  [Where your credentials live](#where-your-credentials-live).
-- **Dynamic code (`Function` / `new Function`).** Not in the plugin's own code.
-  It comes from two bundled libraries: `ttag`, the translation library inside
-  Proton's Drive SDK, which compiles plural-form rules, and `core-js`, whose
-  polyfills use it for feature detection (`Function("return this")` and an
-  async-generator probe). None of it runs on file contents or on anything
-  received from the network.
-- **Obsidian's secret storage** holds the Proton session; see
-  [Where your credentials live](#where-your-credentials-live).
+## How it works, briefly
 
-## Licence
+The plugin keeps a state file mapping each vault path to its Drive node and the
+revision both sides last agreed on. On each pass it lists what changed on Drive
+since its cursor, walks the parts of the vault that changed, and reconciles the
+two against that common ancestor. Uploads are debounced; Drive is polled at the
+interval Proton's own clients use. Transfers are streamed through the SDK, so a
+large file does not have to fit in memory.
 
-Copyright (C) 2026 MarckFp.
+## Credits and licence
 
-This program is free software: you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version. It is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.
+GPL-3.0-or-later; see [LICENSE](LICENSE).
 
-GPL-3.0 because the built plugin bundles `@protontech/crypto`, which Proton
-publishes under GPL-3.0, so the `main.js` users install has to be distributed
-under the GPL anyway. Other bundled packages keep their own licences and are
-listed in a header at the top of `main.js`, among them Proton's OpenPGP.js fork
-(LGPL-3.0+) and several MIT and BSD packages, all compatible with the GPL.
+This is a maintained fork of
+[MarckFp/obsidian-proton-sync](https://github.com/MarckFp/obsidian-proton-sync)
+(© Marcos, GPL-3.0), which in turn builds on Proton's SDK and OpenPGP.js. The
+original author is credited as a contributor. The fork exists because the
+upstream project stopped merging fixes; the sync engine, the conflict handling
+and the UI come from that codebase, and the changes here are this fork's own.
 
-`src/proton/account/` is vendored from
-[ProtonDriveApps/sdk](https://github.com/ProtonDriveApps/sdk) and stays under
-its original MIT licence (© Proton AG); see `src/proton/account/LICENSE.md` and
-`src/proton/account/VENDORED.md`.
+Bundled third-party code keeps its own licence; the header of `main.js` lists
+it. Proton's OpenPGP.js fork is MIT (© Proton AG); see
+`src/proton/account/LICENSE.md`.
 
-Not affiliated with or endorsed by Proton AG.
+Proton and Proton Drive are trademarks of Proton AG. Obsidian is a trademark of
+Dynalist Inc. This plugin is not affiliated with either.
