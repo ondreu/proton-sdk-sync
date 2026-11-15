@@ -460,6 +460,21 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                             Number.isFinite(value) && value >= 0 ? undefined : 'Enter zero or more megabytes.',
                     },
                 },
+                {
+                    name: 'Ask before deleting more than',
+                    desc:
+                        'A sync that would remove more files than this from Drive is held, and you are asked first. ' +
+                        'Protects against a vault that lost a folder at once — an unmounted card, a folder a cloud ' +
+                        'client evicted — taking the Drive copies with it. 0 means never ask.',
+                    aliases: ['mass delete', 'safety', 'trash'],
+                    control: {
+                        type: 'number',
+                        key: 'massDeleteThreshold',
+                        min: 0,
+                        validate: (value) =>
+                            Number.isFinite(value) && value >= 0 ? undefined : 'Enter zero or more files.',
+                    },
+                },
             ],
         };
     }

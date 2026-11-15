@@ -32,6 +32,11 @@ export type CaseClashHost = {
     findRemoteFolder(path: string): Promise<string | undefined>;
     findByName(path: string): Promise<RemoteState | undefined>;
     reportConflict(event: ConflictEvent): void;
+    /**
+     * A path whose name could not be settled, so one such failure does not fail
+     * the whole pass; `what` says what was being done, in a sentence.
+     */
+    noteFailure?(path: string, error: unknown, what: string): void;
 };
 
 /**
@@ -184,18 +189,24 @@ export class CaseClashes {
                 // Re-keyed under a folder renamed earlier in this loop, or not synced.
                 continue;
             }
-            const folded = path.toLowerCase();
-            const owner = claimants.get(folded);
-            if (owner === undefined) {
-                claimants.set(folded, path);
-                continue;
-            }
-            if (owner === path) {
-                continue;
-            }
-            const renamed = await this.renameForCase(uid, path, owner, folderUid !== undefined, claimants);
-            if (renamed !== null) {
-                renameInTree(tree, path, renamed);
+            try {
+                const folded = path.toLowerCase();
+                const owner = claimants.get(folded);
+                if (owner === undefined) {
+                    claimants.set(folded, path);
+                    continue;
+                }
+                if (owner === path) {
+                    continue;
+                }
+                const renamed = await this.renameForCase(uid, path, owner, folderUid !== undefined, claimants);
+                if (renamed !== null) {
+                    renameInTree(tree, path, renamed);
+                }
+            } catch (error) {
+                // One name that cannot be settled is not the whole pass's
+                // failure; it is recorded and tried again next time.
+                this.fail(path, error, 'Could not settle the letter case of');
             }
         }
     }
@@ -218,13 +229,17 @@ export class CaseClashes {
             if (uid === undefined || vaultSpelling(name) === name || this.host.filter().isExcludedWithAncestors(path)) {
                 continue;
             }
-            for (const record of this.host.state.entries().filter((entry) => isWithin(entry.path, path))) {
-                this.host.state.delete(record.path);
-            }
-            const renamed = await this.renameForSpelling(uid, path, isFolder, taken);
-            if (renamed !== null) {
-                renameInTree(tree, path, renamed);
-                moved.push([path, renamed]);
+            try {
+                for (const record of this.host.state.entries().filter((entry) => isWithin(entry.path, path))) {
+                    this.host.state.delete(record.path);
+                }
+                const renamed = await this.renameForSpelling(uid, path, isFolder, taken);
+                if (renamed !== null) {
+                    renameInTree(tree, path, renamed);
+                    moved.push([path, renamed]);
+                }
+            } catch (error) {
+                this.fail(path, error, 'Could not settle the spelling of');
             }
         }
     }
@@ -246,12 +261,25 @@ export class CaseClashes {
             if (uid === undefined || windowsName(basename(path)) === null || this.host.filter().isExcludedWithAncestors(path)) {
                 continue;
             }
-            const renamed = await this.renameForWindows(uid, path, taken);
-            if (renamed !== null) {
-                renameInTree(tree, path, renamed);
-                moved.push([path, renamed]);
+            try {
+                const renamed = await this.renameForWindows(uid, path, taken);
+                if (renamed !== null) {
+                    renameInTree(tree, path, renamed);
+                    moved.push([path, renamed]);
+                }
+            } catch (error) {
+                this.fail(path, error, 'Could not settle a name Windows cannot store, for');
             }
         }
+    }
+
+    /** One path that could not be settled: recorded, and the pass goes on with the rest. */
+    private fail(path: string, error: unknown, what: string): void {
+        if (this.host.noteFailure) {
+            this.host.noteFailure(path, error, what);
+            return;
+        }
+        this.host.logger.warn(`${what} "${path}"`, error);
     }
 
     /**

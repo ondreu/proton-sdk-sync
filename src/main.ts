@@ -319,9 +319,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         if (this.conflictNoticeTimer !== null) {
             window.clearTimeout(this.conflictNoticeTimer);
         }
-        // Obsidian does not wait for unload, so there is nothing to hand the
-        // promise to; `stop` cancels timers synchronously before it awaits.
-        void runtime.engine.stop();
+        // Obsidian does not wait for unload, so the ordering is kept here: the
+        // pass in flight is awaited before the state is closed, and nothing of
+        // this instance writes after that. `stop` bumps the generation and
+        // aborts synchronously, so nothing of it lands in the meantime either.
+        void (async () => {
+            await runtime.engine.stop();
+            // Whatever a stale pass left in memory, it must not reach the file
+            // the next instance reads.
+            runtime.state.close();
+        })();
         runtime.devices.open(null);
         void this.rememberUnlock();
     }
@@ -619,9 +626,24 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * Bring the sync up, if there is both a session and a chosen folder.
      *
      * Called on load and again whenever the user signs in or picks a folder, so
-     * the plugin becomes active without a reload.
+     * the plugin becomes active without a reload. Single-flight: two unlock
+     * paths can reach it at once — the remembered unlock and the PIN form — and
+     * both would start the engine, the second sweeping away the downloads the
+     * first pass is writing. The second call waits on the first instead.
      */
-    async connect(): Promise<void> {
+    connect(): Promise<void> {
+        if (this.connecting === null) {
+            this.connecting = this.connectOnce().finally(() => {
+                this.connecting = null;
+            });
+        }
+        return this.connecting;
+    }
+
+    /** A connect is running; see {@link connect}. */
+    private connecting: Promise<void> | null = null;
+
+    private async connectOnce(): Promise<void> {
         try {
             await this.connectSession();
         } catch (error) {

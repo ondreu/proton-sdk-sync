@@ -9,7 +9,13 @@
  * minutes after any change it checks at the fastest of those, since another
  * device is likely active. Pausing, and holding off on mobile data, stop it
  * from outside.
+ *
+ * Elapsed time is read on the monotonic clock, not the wall clock: a device
+ * whose time is corrected backwards would otherwise sit in a "quiet spell" it
+ * never leaves, and stop checking Drive at the pace the user set.
  */
+import { monotonicNow } from './clock';
+
 export const PROTON_FOREGROUND_SECONDS = 30;
 const PROTON_BACKGROUND_SECONDS = 10 * 60;
 const ACTIVE_WINDOW_MS = 3 * 60_000;
@@ -18,7 +24,7 @@ const IDLE_AFTER_MS = 10 * 60_000;
 export class PollScheduler {
     private timer: number | null = null;
     private dueAt = 0;
-    /** Last time anything changed, here or on Drive. 0 for never. */
+    /** Last time anything changed, here or on Drive, on the monotonic clock. 0 for never. */
     private lastActivityAt = 0;
 
     constructor(
@@ -30,8 +36,11 @@ export class PollScheduler {
         },
     ) {}
 
-    /** Seconds until the next check, from the setting and how active things are. */
-    interval(now = Date.now()): number {
+    /**
+     * Seconds until the next check, from the setting and how active things are.
+     * `now` is a reading of the monotonic clock; see {@link monotonicNow}.
+     */
+    interval(now = monotonicNow()): number {
         const base = Math.max(PROTON_FOREGROUND_SECONDS, this.options.baseSeconds());
         const background = Math.max(base, PROTON_BACKGROUND_SECONDS);
         if (this.options.isHidden()) {
@@ -45,7 +54,7 @@ export class PollScheduler {
     }
 
     /** Milliseconds since anything last changed. */
-    quietFor(now = Date.now()): number {
+    quietFor(now = monotonicNow()): number {
         return now - this.lastActivityAt;
     }
 
@@ -53,7 +62,7 @@ export class PollScheduler {
     schedule(): void {
         this.cancel();
         const seconds = this.interval();
-        this.dueAt = Date.now() + seconds * 1000;
+        this.dueAt = monotonicNow() + seconds * 1000;
         this.timer = window.setTimeout(() => {
             this.timer = null;
             this.options.onDue();
@@ -73,8 +82,9 @@ export class PollScheduler {
      * answering.
      */
     noteActivity(): void {
-        this.lastActivityAt = Date.now();
-        if (this.timer !== null && this.dueAt - Date.now() > this.interval() * 1000) {
+        const now = monotonicNow();
+        this.lastActivityAt = now;
+        if (this.timer !== null && this.dueAt - now > this.interval() * 1000) {
             this.schedule();
         }
     }

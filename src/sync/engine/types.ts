@@ -35,6 +35,24 @@ export type TransferProgress = {
     total: number;
 };
 
+/**
+ * Deletions a pass would make on Drive, held until the user decides.
+ *
+ * A vault that lost a whole folder — an unmounted card, a folder evicted by a
+ * cloud client, a directory emptied outside Obsidian — reads as every file in
+ * it being deleted. Following that would trash the Drive copy of each, and
+ * every other device would then delete its own. Above
+ * `massDeleteThreshold`, the pass keeps the files where they are and reports
+ * this instead; see `SyncEngine.approveMassDelete` and
+ * `SyncEngine.denyMassDelete`.
+ */
+export type PendingMassDelete = {
+    /** How many files and folders the pass would have removed from Drive. */
+    count: number;
+    /** Up to fifty of their paths, oldest first, for the dialog. */
+    paths: string[];
+};
+
 export type SyncSummary = {
     status: SyncStatus;
     /**
@@ -56,6 +74,8 @@ export type SyncSummary = {
     progress: { done: number; total: number } | null;
     /** The largest transfer in flight, if any is large enough to report. */
     transfer: TransferProgress | null;
+    /** Deletions a pass held back for a decision, if any; see {@link PendingMassDelete}. */
+    pendingMassDelete?: PendingMassDelete;
 };
 
 /** Why a path is not in sync right now. */

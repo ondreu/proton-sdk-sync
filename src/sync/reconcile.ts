@@ -92,6 +92,18 @@ export function reconcile({ base, local, remote }: ReconcileInput): SyncAction {
 }
 
 /**
+ * Whether an action takes the file off Drive.
+ *
+ * These are the deletions a device cannot recover from its own side: the vault
+ * copy is already gone, so the trashed revision is the only one left. The
+ * engine counts them per pass and holds a pass that would make a great many of
+ * them; see `SyncEngine.pendingMassDelete`.
+ */
+export function removesRemote(action: SyncAction): boolean {
+    return action.type === 'delete-remote';
+}
+
+/**
  * Whether the remote node has changed since the ancestor was recorded.
  *
  * A new revision uid is the authoritative signal — every upload, by any client,

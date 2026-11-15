@@ -1,6 +1,7 @@
 import type { DataAdapter } from 'obsidian';
 
 import type { Logger } from '../util/logger';
+import { monotonicNow } from './engine/clock';
 import { isWithin, replacePrefix } from './paths';
 import type { ConflictInfo, SyncBase, SyncRecord } from './types';
 
@@ -81,6 +82,10 @@ const RETRY_MAX_MS = 60 * 60_000;
  *
  * Writes are coalesced: a full sync touches thousands of records and each one
  * would otherwise rewrite the file.
+ *
+ * Once {@link close} has been called nothing more is written, which is what
+ * keeps a pass that outlived its plugin from replacing the state file the next
+ * instance has already loaded.
  */
 export class SyncState {
     private records = new Map<string, SyncRecord>();
@@ -94,6 +99,15 @@ export class SyncState {
 
     private lost = false;
     private dirty = false;
+    private closed = false;
+    /** Bumped by every change, so a view built from the state can be memoised; see {@link generation}. */
+    private revision = 0;
+    /**
+     * When each retry's wait started, and how long it is, on the monotonic
+     * clock. In memory only: it exists so that a wall clock set backwards
+     * cannot postpone a retry for hours, and a restart makes that moot.
+     */
+    private readonly retryWaits = new Map<string, { at: number; wait: number }>();
     private flushTimer: number | null = null;
     private writing: Promise<void> = Promise.resolve();
 
@@ -103,6 +117,8 @@ export class SyncState {
         private readonly logger: Logger,
         /** Called after each save, so what must agree with the state (the Drive cache) is saved with it. */
         private readonly afterFlush: () => void = () => undefined,
+        /** The monotonic clock elapsed waits are measured on; see {@link retryWaits}. */
+        private readonly clock: () => number = monotonicNow,
     ) {}
 
     /**
@@ -138,11 +154,15 @@ export class SyncState {
         this.unresolvedConflicts.clear();
         this.eventCursors.clear();
         this.retries.clear();
+        this.retryWaits.clear();
         this.lastFullSyncAt = null;
         this.accountEmail = accountTag(accountEmail);
         this.remoteFolderUid = remoteFolderUid;
 
         this.lost = false;
+        // A new session: writes are wanted again, whatever happened before.
+        this.closed = false;
+        this.revision++;
 
         let file: StateFile | null = null;
         let found = false;
@@ -224,6 +244,15 @@ export class SyncState {
         return [...this.records.keys()];
     }
 
+    /**
+     * A number that changes with every change to the state, so that anything
+     * built from it — the sync panel's list of pending changes, say — can be
+     * reused while the state it was built from has not moved.
+     */
+    generation(): number {
+        return this.revision;
+    }
+
     entries(): SyncRecord[] {
         return [...this.records.values()];
     }
@@ -298,6 +327,11 @@ export class SyncState {
         if (retry) {
             this.retries.delete(fromPath);
             this.retries.set(toPath, retry);
+            const wait = this.retryWaits.get(fromPath);
+            if (wait) {
+                this.retryWaits.delete(fromPath);
+                this.retryWaits.set(toPath, wait);
+            }
         }
         this.markDirty();
     }
@@ -327,6 +361,11 @@ export class SyncState {
                 const retry = this.retries.get(path)!;
                 this.retries.delete(path);
                 this.retries.set(replacePrefix(path, fromPath, toPath), retry);
+                const wait = this.retryWaits.get(path);
+                if (wait) {
+                    this.retryWaits.delete(path);
+                    this.retryWaits.set(replacePrefix(path, fromPath, toPath), wait);
+                }
                 this.markDirty();
             }
         }
@@ -351,12 +390,28 @@ export class SyncState {
         // deserves; only a path that keeps failing starts to wait.
         const wait = backoff && attempts > 1 ? Math.min(RETRY_BASE_MS * 2 ** (attempts - 2), RETRY_MAX_MS) : 0;
         this.retries.set(path, { attempts, after: now + wait });
+        this.retryWaits.set(path, { at: this.clock(), wait });
         this.markDirty();
     }
 
     /** Paths whose wait has passed. */
     dueRetries(now = Date.now()): string[] {
-        return [...this.retries].filter(([, retry]) => retry.after <= now).map(([path]) => path);
+        const mono = this.clock();
+        return [...this.retries]
+            .filter(([path, retry]) => retry.after <= now || this.waitedOut(path, mono))
+            .map(([path]) => path);
+    }
+
+    /**
+     * Whether a retry's wait has run out on the monotonic clock.
+     *
+     * `after` is wall time, which a clock set backwards moves into the future.
+     * The wait was fixed when the retry was queued, so measuring from then on a
+     * clock that cannot jump keeps a retry from being postponed by hours.
+     */
+    private waitedOut(path: string, mono: number): boolean {
+        const queued = this.retryWaits.get(path);
+        return queued !== undefined && mono - queued.at >= queued.wait;
     }
 
     /** All queued retries, due or not. */
@@ -371,6 +426,7 @@ export class SyncState {
 
     clearRetry(path: string): void {
         if (this.retries.delete(path)) {
+            this.retryWaits.delete(path);
             this.markDirty();
         }
     }
@@ -379,6 +435,7 @@ export class SyncState {
     clearRetries(): void {
         if (this.retries.size > 0) {
             this.retries.clear();
+            this.retryWaits.clear();
             this.markDirty();
         }
     }
@@ -411,8 +468,10 @@ export class SyncState {
         this.unresolvedConflicts.clear();
         this.eventCursors.clear();
         this.retries.clear();
+        this.retryWaits.clear();
         this.lastFullSyncAt = null;
         this.lost = false;
+        this.revision++;
         this.markDirty();
         await this.flush();
         // A deliberate reset must not come back from the backup if the new
@@ -426,7 +485,26 @@ export class SyncState {
         }
     }
 
+    /**
+     * Stop writing for good: the plugin is unloading.
+     *
+     * Latches, so a pass still running under a stopped engine — or a flush
+     * timer it left behind — cannot replace the file the next instance loads.
+     * A later {@link load} starts a new session and writes again.
+     */
+    close(): void {
+        this.closed = true;
+        this.dirty = false;
+        if (this.flushTimer !== null) {
+            window.clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+    }
+
     async flush(): Promise<void> {
+        if (this.closed) {
+            return;
+        }
         if (this.flushTimer !== null) {
             window.clearTimeout(this.flushTimer);
             this.flushTimer = null;
@@ -480,6 +558,10 @@ export class SyncState {
     }
 
     private markDirty(): void {
+        this.revision++;
+        if (this.closed) {
+            return;
+        }
         this.dirty = true;
         if (this.flushTimer !== null) {
             return;
