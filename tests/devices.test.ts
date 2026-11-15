@@ -213,6 +213,29 @@ describe('the device list’s rules', () => {
         assert.equal(nextRequestAt({ record: record('x', { handled: 950 }), request: null }, 500), 951);
     });
 
+    it('keeps a request from a clock set far ahead within a day of now', () => {
+        const now = 1_700_000_000_000;
+        const day = 24 * 60 * 60 * 1000;
+
+        assert.equal(nextRequestAt({ record: null, request: request('paused', now + 400 * day) }, now), now + day);
+        assert.equal(nextRequestAt({ record: record('x', { handled: now + 400 * day }), request: null }, now), now + day);
+        // Below the cap nothing changes: the ordering the `at` exists for.
+        assert.equal(nextRequestAt({ record: null, request: request('paused', now + 60_000) }, now), now + 60_001);
+    });
+
+    it('reads a request dated far ahead as no further than a day, so it is not locked out', async () => {
+        const drive = new FakeDrive();
+        const registry = registryOn(drive);
+        const day = 24 * 60 * 60 * 1000;
+        await registry.ask('me', request('paused', Date.now() + 400 * day));
+
+        const read = await registry.request('me');
+
+        assert.ok(read !== null);
+        assert.ok(read.at <= Date.now() + day, 'clamped on the way in');
+        assert.ok(read.at > Date.now() + day - 60_000, 'and still in the future, so it reads as a request');
+    });
+
     it('shows a request until the device acts on it, then what it recorded', () => {
         assert.deepEqual(standingOf({ record: record('x', { handled: 5 }), request: request('paused', 6) }), {
             kind: 'asked',

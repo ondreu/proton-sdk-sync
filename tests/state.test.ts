@@ -332,3 +332,98 @@ describe('SyncState — surviving a crash mid-write (issue #7)', () => {
         assert.equal(reloaded.get('note.md'), undefined);
     });
 });
+
+describe('SyncState — after close', () => {
+    it('drops a flush that comes after close, so a stale pass cannot write', async () => {
+        const { state, files } = await loadedState();
+        state.setSynced('note.md', 'node-1', 'file', base('hash-a'));
+        await state.flush();
+        const written = files.get(FILE);
+        assert.ok(written, 'the first write landed');
+
+        // The plugin unloads, and a pass it stopped keeps going for a moment.
+        state.close();
+        state.setSynced('stale.md', 'node-2', 'file', base('hash-b'));
+        await state.flush();
+
+        assert.equal(files.get(FILE), written, 'the file is as close left it');
+        assert.equal(files.get(`${FILE}.tmp`), undefined, 'and no temporary copy was written');
+    });
+
+    it('writes again after a load, which starts a new session', async () => {
+        const { state, files } = await loadedState();
+        state.close();
+
+        await state.load('a@b.c', 'folder-1');
+        state.setSynced('note.md', 'node-1', 'file', base('hash-a'));
+        await state.flush();
+
+        assert.match(files.get(FILE) ?? '', /note\.md/);
+    });
+
+    it('moves its generation on with every change, so a memoised view knows to rebuild', async () => {
+        const { state } = await loadedState();
+        const first = state.generation();
+
+        state.setSynced('note.md', 'node-1', 'file', base('hash-a'));
+        const second = state.generation();
+        assert.ok(second > first);
+
+        state.setConflict('note.md', { detectedAt: 1, reason: 'both-modified' });
+        assert.ok(state.generation() > second);
+    });
+});
+
+describe('SyncState — retries measured on a clock that cannot move back', () => {
+    /** A state whose monotonic clock the test drives; `clock()` reads {@link mono}. */
+    function clockedState() {
+        const { adapter } = memoryAdapter();
+        const clock = { mono: 1_000 };
+        const state = new SyncState(adapter, FILE, SILENT, undefined, () => clock.mono);
+        return { state, clock };
+    }
+
+    /** Two retries of one path: the first immediate, the second waiting 30 s. */
+    function queued(state: SyncState, wallNow: number): void {
+        state.retry('note.md', {}, wallNow);
+        state.retry('note.md', {}, wallNow + 1);
+    }
+
+    it('lets a retry through once its wait has really passed, whatever the wall clock says', async () => {
+        const { state, clock } = clockedState();
+        await state.load('a@b.c', 'folder-1');
+        const wall = 1_700_000_000_000;
+        queued(state, wall);
+
+        clock.mono += 60_000;
+
+        // The wall clock is then set an hour back, which the stored `after`
+        // still reads as an hour in the future.
+        assert.deepEqual(state.dueRetries(wall - 3_600_000), ['note.md']);
+    });
+
+    it('still holds a retry whose wait has not run out', async () => {
+        const { state, clock } = clockedState();
+        await state.load('a@b.c', 'folder-1');
+        const wall = 1_700_000_000_000;
+        queued(state, wall);
+
+        clock.mono += 1_000;
+
+        assert.deepEqual(state.dueRetries(wall - 3_600_000), []);
+    });
+
+    it('forgets the monotonic wait when the retry is cleared or renamed', async () => {
+        const { state, clock } = clockedState();
+        await state.load('a@b.c', 'folder-1');
+        const wall = 1_700_000_000_000;
+        state.setSynced('note.md', 'node-1', 'file', base('hash-a'));
+        queued(state, wall);
+
+        state.rename('note.md', 'renamed.md');
+        state.clearRetry('renamed.md');
+        clock.mono += 60_000;
+
+        assert.deepEqual(state.dueRetries(wall - 3_600_000), []);
+    });
+});

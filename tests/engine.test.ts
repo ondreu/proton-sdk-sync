@@ -3,10 +3,19 @@ import { afterEach, describe, it } from 'node:test';
 
 import { DriveEventType, type ProtonDriveClient } from '@protontech/drive-sdk';
 
+import type { App, DataAdapter } from 'obsidian';
+
 import { DEFAULT_SETTINGS, DEVICES_FOLDER, type PluginSettings } from '../src/settings';
 import { DeviceRegistry } from '../src/sync/devices';
 import { DriveIO } from '../src/sync/drive';
-import { SyncEngine, type ConflictEvent, type EngineEnvironment, type PendingChange } from '../src/sync/engine';
+import {
+    SyncEngine,
+    type ConflictEvent,
+    type EngineEnvironment,
+    type PendingChange,
+    type SyncSummary,
+} from '../src/sync/engine';
+import { monotonicNow } from '../src/sync/engine/clock';
 import { SyncState } from '../src/sync/state';
 import { sha1Hex } from '../src/util/hash';
 import { Logger } from '../src/util/logger';
@@ -30,6 +39,7 @@ async function setup(
         start?: boolean;
         onSettingsAdopted?: (paths: string[]) => void;
         onDevicesChanged?: () => void;
+        onChange?: (summary: SyncSummary) => void;
     } = {},
 ) {
     const vault = options.vault ?? new MemoryVault();
@@ -51,7 +61,7 @@ async function setup(
         settings,
         SILENT,
         {
-            onChange: () => undefined,
+            onChange: (summary) => options.onChange?.(summary),
             onConflict: (event) => conflicts.push(event),
             onSettingsAdopted: (paths) => {
                 adopted.push(...paths);
@@ -75,6 +85,72 @@ async function setup(
         }
     };
     return { vault, drive, state, engine, conflicts, adopted, settled, settings };
+}
+
+/**
+ * A vault that can be made awkward on purpose: a read held open, so a pass can
+ * be caught mid-flight; a rename that fails once, as a file another program has
+ * open makes them fail on Windows; and a count of the folders listed, which is
+ * what a walk of the config folder costs.
+ */
+class ScriptedVault extends MemoryVault {
+    /** Folders listed through the adapter, by path, in order. */
+    readonly listed: string[] = [];
+    /** A path whose rename fails once, with the error a locked file gives. */
+    failRename: string | null = null;
+    private held: { path: string; entered: () => void; wait: Promise<void> } | null = null;
+
+    /** Hold the next read of `path` open, so a pass can be stopped while it is hashing that file. */
+    holdRead(path: string): { entered: Promise<void>; release: () => void } {
+        let entered!: () => void;
+        let release!: () => void;
+        const started = new Promise<void>((resolve) => (entered = resolve));
+        const wait = new Promise<void>((resolve) => (release = resolve));
+        this.held = { path, entered, wait };
+        return { entered: started, release };
+    }
+
+    override adapter(): DataAdapter {
+        const adapter = super.adapter();
+        const readBinary = adapter.readBinary.bind(adapter);
+        const list = adapter.list.bind(adapter);
+        const rename = adapter.rename.bind(adapter);
+        adapter.readBinary = async (path: string) => {
+            const held = this.held;
+            if (held !== null && held.path === path) {
+                this.held = null;
+                held.entered();
+                await held.wait;
+            }
+            return readBinary(path);
+        };
+        adapter.list = async (folder: string) => {
+            this.listed.push(folder);
+            return list(folder);
+        };
+        adapter.rename = async (from: string, to: string) => {
+            this.failRenameOnce(from);
+            return rename(from, to);
+        };
+        return adapter;
+    }
+
+    override app(): App {
+        const app = super.app();
+        const rename = app.vault.rename.bind(app.vault);
+        app.vault.rename = (async (file: { path: string }, to: string) => {
+            this.failRenameOnce(file.path);
+            return rename(file as never, to);
+        }) as typeof app.vault.rename;
+        return app;
+    }
+
+    private failRenameOnce(path: string): void {
+        if (this.failRename !== null && this.failRename === path) {
+            this.failRename = null;
+            throw new Error('EBUSY: resource busy or locked');
+        }
+    }
 }
 
 describe('SyncEngine — renaming a new note', () => {
@@ -1430,18 +1506,18 @@ describe('SyncEngine — adapting how often Drive is checked', () => {
             environment: { isMobile: false, isMetered: () => false, isHidden: () => hidden },
         });
         // Just opened: the active pace, then the setting, then the background pace.
-        assert.equal(engine.pollIntervalSeconds(Date.now()), 30);
-        assert.equal(engine.pollIntervalSeconds(Date.now() + 5 * 60_000), 60);
-        assert.equal(engine.pollIntervalSeconds(Date.now() + 11 * 60_000), 600);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow()), 30);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow() + 5 * 60_000), 60);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow() + 11 * 60_000), 600);
 
         vault.write('note.md', 'typed');
         engine.onVaultChange('note.md');
-        assert.equal(engine.pollIntervalSeconds(Date.now()), 30);
-        assert.equal(engine.pollIntervalSeconds(Date.now() + 5 * 60_000), 60);
-        assert.equal(engine.pollIntervalSeconds(Date.now() + 11 * 60_000), 600);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow()), 30);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow() + 5 * 60_000), 60);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow() + 11 * 60_000), 600);
 
         hidden = true;
-        assert.equal(engine.pollIntervalSeconds(Date.now()), 600);
+        assert.equal(engine.pollIntervalSeconds(monotonicNow()), 600);
     });
 
     it('never goes faster than Proton’s 30 seconds, whatever the setting', async () => {
@@ -1449,7 +1525,7 @@ describe('SyncEngine — adapting how often Drive is checked', () => {
         fast.vault.write('note.md', 'x');
         fast.engine.onVaultChange('note.md');
         assert.equal(fast.engine.pollIntervalSeconds(), 30);
-        assert.equal(fast.engine.pollIntervalSeconds(Date.now() + 5 * 60_000), 30);
+        assert.equal(fast.engine.pollIntervalSeconds(monotonicNow() + 5 * 60_000), 30);
     });
 });
 
@@ -2200,5 +2276,321 @@ describe('SyncEngine — recently deleted', () => {
             items.map((item) => [item.path, item.isFolder]),
             [['archive', true]],
         );
+    });
+});
+
+describe('SyncEngine — a mass deletion on Drive', () => {
+    const trashed = (drive: FakeDrive) => [...drive.nodes.values()].filter((node) => node.trashed).length;
+
+    it('holds the deletes above the threshold, and runs them once approved', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 300; i++) {
+            vault.write(`notes/note-${String(i).padStart(3, '0')}.md`, `note ${i}`);
+        }
+        const { drive, engine } = await setup({ vault });
+        assert.equal(drive.notePaths().length, 300);
+
+        // A folder that vanished outside Obsidian: an unmounted card, say.
+        for (let i = 0; i < 200; i++) {
+            vault.remove(`notes/note-${String(i).padStart(3, '0')}.md`);
+        }
+        await engine.syncNow();
+
+        assert.equal(trashed(drive), 0, 'nothing was removed from Drive');
+        const held = engine.getSummary().pendingMassDelete;
+        assert.equal(held?.count, 200);
+        assert.equal(held?.paths.length, 50, 'the list of paths stops at fifty');
+        assert.equal(held?.paths[0], 'notes/note-000.md');
+
+        // Not asked again by the next pass, which changes nothing.
+        await engine.syncNow();
+        assert.deepEqual(engine.getSummary().pendingMassDelete, held);
+        assert.equal(trashed(drive), 0);
+
+        await engine.approveMassDelete();
+
+        assert.equal(trashed(drive), 200);
+        assert.equal(drive.notePaths().length, 100);
+        assert.equal(engine.getSummary().pendingMassDelete, undefined);
+    });
+
+    it('deletes as before when the guard is off', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 40; i++) {
+            vault.write(`note-${i}.md`, `note ${i}`);
+        }
+        const { drive, engine } = await setup({ vault, settings: { massDeleteThreshold: 0 } });
+        for (let i = 0; i < 30; i++) {
+            vault.remove(`note-${i}.md`);
+        }
+
+        await engine.syncNow();
+
+        assert.equal(trashed(drive), 30);
+        assert.equal(drive.notePaths().length, 10);
+        assert.equal(engine.getSummary().pendingMassDelete, undefined);
+    });
+
+    it('holds a batch of deletions reported as vault events, not as a walk', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 40; i++) {
+            vault.write(`note-${i}.md`, `note ${i}`);
+        }
+        const { drive, engine, settled } = await setup({ vault });
+
+        // The card is gone and Obsidian reports each note as deleted, all in
+        // one tick.
+        for (let i = 0; i < 30; i++) {
+            vault.remove(`note-${i}.md`);
+            engine.onVaultChange(`note-${i}.md`);
+        }
+        await settled();
+
+        assert.equal(trashed(drive), 0, 'no batch of deletes went through unasked');
+        assert.equal(engine.getSummary().pendingMassDelete?.count, 30);
+    });
+
+    it('brings the held files back instead, when told to keep them on Drive', async () => {
+        const vault = new MemoryVault();
+        for (let i = 0; i < 40; i++) {
+            vault.write(`note-${i}.md`, `note ${i}`);
+        }
+        const { drive, engine } = await setup({ vault });
+        for (let i = 0; i < 30; i++) {
+            vault.remove(`note-${i}.md`);
+        }
+        await engine.syncNow();
+        assert.equal(engine.getSummary().pendingMassDelete?.count, 30);
+
+        await engine.denyMassDelete();
+
+        assert.equal(trashed(drive), 0);
+        assert.equal(vault.notePaths().length, 40, 'every note is back in the vault');
+        assert.equal(vault.read('note-7.md'), 'note 7');
+
+        await engine.syncNow();
+        assert.equal(trashed(drive), 0, 'and the next pass removes nothing');
+        assert.equal(engine.getSummary().pendingMassDelete, undefined);
+    });
+});
+
+describe('SyncEngine — stopping', () => {
+    it('aborts the pass of the moment, and drops the state write it would have made', async () => {
+        const vault = new ScriptedVault();
+        vault.write('a.md', 'one');
+        const { drive, engine, state } = await setup({ vault });
+        assert.equal(drive.text('a.md'), 'one');
+
+        // Count the flushes, not the writes: a flush that is skipped is the fix,
+        // and the two would otherwise coalesce into the same single write.
+        const flushes: string[] = [];
+        const flushing = state.flush.bind(state);
+        state.flush = () => {
+            flushes.push('flush');
+            return flushing();
+        };
+
+        vault.write('a.md', 'two');
+        const gate = vault.holdRead('a.md');
+        const pass = engine.syncNow();
+        await gate.entered;
+        assert.equal(engine.getSummary().status, 'syncing');
+
+        const stopping = engine.stop();
+        gate.release();
+        await Promise.all([pass, stopping]);
+
+        assert.equal(flushes.length, 1, 'only stop wrote the state; the pass it stopped did not');
+        assert.equal(engine.isConnected(), false);
+
+        // Nothing is still running behind the stop.
+        const writes = drive.uploadLog.length;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.equal(drive.uploadLog.length, writes);
+        assert.equal(flushes.length, 1);
+    });
+
+    it('keeps the abort signal alive, so transfers started later see it', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { engine } = await setup({ vault });
+
+        await engine.stop();
+
+        const signal = (engine as unknown as { abortController: AbortController | null }).abortController?.signal;
+        assert.ok(signal, 'the controller is still there');
+        assert.equal(signal.aborted, true);
+    });
+});
+
+describe('SyncEngine — a folder deleted on Drive', () => {
+    it('confirms each child is gone before deleting it here', async () => {
+        const vault = new MemoryVault();
+        vault.write('Old/a.md', 'a');
+        vault.write('Old/b.md', 'b');
+        const { drive, engine, state } = await setup({ vault });
+
+        // b.md was moved out of the folder a moment before the folder went to
+        // the trash; only the folder's own event arrives.
+        const folder = drive.at('Old')!;
+        drive.at('Old/b.md')!.parentUid = SYNC_ROOT;
+        drive.trash('Old', 5_000);
+        drive.emit(folder, DriveEventType.NodeDeleted);
+
+        engine.pollNow();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        assert.equal(vault.read('Old/a.md'), undefined, 'the file the trash took is gone here too');
+        assert.equal(vault.read('Old/b.md'), 'b', 'the file that was moved out is kept');
+        assert.equal(state.get('Old/b.md')?.nodeUid, drive.at('b.md')?.uid, 'and its record still points at it');
+    });
+});
+
+describe('SyncEngine — a listed file with no revision to read', () => {
+    it('keeps it, rather than taking it for a remote delete', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { drive, engine } = await setup({ vault });
+
+        // An upload that never finished: Drive lists the node, and serves no
+        // revision of it.
+        drive.at('note.md')!.revision = undefined;
+
+        await engine.syncNow();
+
+        assert.equal(vault.read('note.md'), 'text');
+        assert.deepEqual(drive.notePaths(), ['note.md']);
+    });
+});
+
+describe('SyncEngine — one item failing', () => {
+    it('records the file it could not rename here, and syncs the rest', async () => {
+        const vault = new ScriptedVault();
+        vault.write('a.md', 'a');
+        vault.write('b.md', 'b');
+        const { drive, engine, state } = await setup({ vault });
+
+        drive.at('a.md')!.name = 'a2.md';
+        drive.at('b.md')!.name = 'b2.md';
+        // The first rename fails as a locked file does on Windows.
+        vault.failRename = 'a.md';
+
+        await engine.syncNow();
+
+        assert.equal(engine.getSummary().status, 'idle', 'the pass finished');
+        assert.deepEqual(vault.notePaths(), ['a2.md', 'b2.md'], 'the file after the failure was still followed');
+        assert.ok(state.pendingRetries().includes('a.md'), 'and the one that failed is queued for a retry');
+    });
+});
+
+describe('SyncEngine — starting twice', () => {
+    it('joins the start already under way', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { drive, engine } = await setup({ vault, start: false });
+        const client = drive.client() as unknown as ProtonDriveClient;
+
+        const first = engine.start(client, SYNC_ROOT);
+        const second = engine.start(client, SYNC_ROOT);
+        assert.equal(second, first, 'the second start is the first one, not another');
+
+        await Promise.all([first, second]);
+
+        assert.equal(drive.uploadLog.filter((name) => name === 'note.md').length, 1, 'uploaded once');
+        assert.equal(engine.getSummary().status, 'idle');
+    });
+});
+
+describe('SyncEngine — what the panel is asked for', () => {
+    it('reuses the pending list until the state behind it changes', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { engine, state } = await setup({ vault });
+
+        const first = engine.pendingChanges();
+        assert.equal(engine.pendingChanges(), first, 'the same list, not a copy of it');
+
+        state.setConflict('note.md', { detectedAt: Date.now(), reason: 'both-modified' });
+        const next = engine.pendingChanges();
+
+        assert.notEqual(next, first);
+        assert.deepEqual(
+            next.map((change) => [change.path, change.reason]),
+            [['note.md', 'conflict']],
+        );
+    });
+
+    it('does not report a state it has already reported', async () => {
+        const vault = new MemoryVault();
+        const reported: SyncSummary[] = [];
+        const { drive, engine, settled } = await setup({ vault, onChange: (summary) => reported.push(summary) });
+        await engine.syncNow();
+
+        // The synced folder goes to the trash: every check finds it missing.
+        drive.trash('', 1_000);
+        drive.nodes.get(SYNC_ROOT)!.trashed = true;
+        await engine.syncNow();
+        assert.equal(engine.getSummary().status, 'folder-missing');
+
+        reported.length = 0;
+        engine.pollNow();
+        await settled();
+        engine.pollNow();
+        await settled();
+
+        assert.deepEqual(reported, [], 'nothing changed, so nothing was re-rendered');
+    });
+
+    it('does not walk the config folder on every check', async () => {
+        const vault = new ScriptedVault();
+        vault.write('.obsidian/app.json', '{}');
+        const { engine, settled } = await setup({ vault });
+        await settled();
+
+        const walks = () => vault.listed.filter((folder) => folder === '.obsidian').length;
+        const before = walks();
+        engine.pollNow();
+        await settled();
+        const afterOne = walks();
+        engine.pollNow();
+        await settled();
+
+        assert.ok(afterOne >= before, 'the first check may look');
+        assert.equal(walks(), afterOne, 'the next one does not, since nothing changed');
+    });
+});
+
+describe('SyncEngine — a file moved on Drive into an excluded path', () => {
+    it('takes the vault copy with it, instead of uploading it again', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { drive, engine } = await setup({ vault, settings: { excludePatterns: ['Private/note.md'] } });
+        assert.equal(drive.text('note.md'), 'text');
+
+        // Another device moves it where this one does not sync.
+        drive.at('note.md')!.parentUid = drive.ensureFolderPath('Private');
+
+        await engine.syncNow();
+
+        assert.deepEqual(vault.notePaths(), [], 'the vault copy is gone');
+        assert.equal(drive.text('Private/note.md'), 'text', 'and it is still on Drive, where it was moved');
+
+        await engine.syncNow();
+        assert.deepEqual(drive.notePaths(), ['Private/note.md'], 'the old name does not come back');
+    });
+
+    it('keeps a local edit of a file moved into an excluded path, since nowhere else has it', async () => {
+        const vault = new MemoryVault();
+        vault.write('note.md', 'text');
+        const { drive, engine } = await setup({ vault, settings: { excludePatterns: ['Private/note.md'] } });
+
+        vault.write('note.md', 'text, edited here');
+        drive.at('note.md')!.parentUid = drive.ensureFolderPath('Private');
+
+        await engine.syncNow();
+
+        assert.equal(vault.read('note.md'), 'text, edited here', 'the edit stays in the vault');
+        await engine.syncNow();
+        assert.equal(drive.text('note.md'), 'text, edited here', 'and goes up as a file of its own');
     });
 });

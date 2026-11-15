@@ -110,13 +110,25 @@ export function recordDue(last: DeviceRecord | null, next: DeviceRecord, now = D
 }
 
 /**
+ * How far ahead of this device's clock a request may be dated.
+ *
+ * `at` is written by the device that asked, so a clock set years ahead would
+ * otherwise make every later request for this device read as older than that
+ * one, and be ignored for good. A day is far more skew than any device has,
+ * and enough for the ordering the `at` exists for.
+ */
+const REQUEST_AHEAD_MS = 24 * 60 * 60 * 1000;
+
+/**
  * The `at` for a new request to a device: now, or just after the last request
  * left for it or handled by it, when a clock somewhere is ahead. Without that,
  * a resume asked from a device whose clock is behind would read as older than
- * the pause it answers, and never be acted on.
+ * the pause it answers, and never be acted on. Never further ahead than
+ * {@link REQUEST_AHEAD_MS}, so one wild clock cannot freeze a device's list.
  */
 export function nextRequestAt(entry: Pick<DeviceEntry, 'record' | 'request'>, now = Date.now()): number {
-    return Math.max(now, (entry.request?.at ?? 0) + 1, (entry.record?.handled ?? 0) + 1);
+    const after = Math.max(now, (entry.request?.at ?? 0) + 1, (entry.record?.handled ?? 0) + 1);
+    return Math.min(after, now + REQUEST_AHEAD_MS);
 }
 
 /** How a device stands on the list: a request it has not picked up yet, or what it last recorded. */
@@ -618,7 +630,11 @@ function parseRequest(value: unknown): DeviceRequest | null {
     if (!isObject(value) || typeof value.at !== 'number' || !STATES.includes(value.state as DeviceState)) {
         return null;
     }
-    return { state: value.state as DeviceState, at: value.at, by: text(value.by), byName: text(value.byName) };
+    // Clamped on the way in as well as on the way out: a device that already
+    // wrote a date far in the future, from a clock set wrong, must not lock
+    // this one out of every later request. See {@link nextRequestAt}.
+    const at = Math.min(value.at, Date.now() + REQUEST_AHEAD_MS);
+    return { state: value.state as DeviceState, at, by: text(value.by), byName: text(value.byName) };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

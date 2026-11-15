@@ -58,6 +58,16 @@ export type PluginSettings = {
     excludePatterns: string[];
     /** Sync `.obsidian/` — appearance, plugins, hotkeys — alongside the notes. */
     syncObsidianConfig: boolean;
+    /**
+     * A pass that would remove more files than this from Drive is held instead,
+     * and the user is asked; 0 turns the guard off.
+     *
+     * The case it exists for is a vault that lost a whole folder at once: an
+     * unmounted card, a folder a cloud client evicted, a directory deleted
+     * outside Obsidian. Deleting the Drive copies then propagates the loss to
+     * every device. See `SyncEngine.pendingMassDelete`.
+     */
+    massDeleteThreshold: number;
 
     /** Names the device in conflict copies and in the sync log. */
     deviceName: string;
@@ -160,6 +170,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     wifiOnly: false,
     excludePatterns: [],
     syncObsidianConfig: true,
+    massDeleteThreshold: 25,
 
     deviceName: '',
     logLevel: 'info',

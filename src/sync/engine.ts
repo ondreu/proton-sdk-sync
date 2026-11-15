@@ -28,12 +28,13 @@ import {
     splitExtension,
     vaultSpelling,
 } from './paths';
-import { reconcile } from './reconcile';
+import { reconcile, removesRemote } from './reconcile';
 import type { SyncState } from './state';
 import type { ConflictPolicy, ConflictReason, LocalState, RemoteState, SyncAction } from './types';
 import { LARGE_FILE_BYTES, VaultIO } from './vault';
 import { EditorBusyError, LocalChangedError, RemoteChangedError } from './engine/errors';
 import { CaseClashes } from './engine/caseClashes';
+import { monotonicNow } from './engine/clock';
 import { followLocalRenames, type LocalRenameHost } from './engine/localRenames';
 import { planFirstSync } from './engine/planning';
 import { PollScheduler } from './engine/pollScheduler';
@@ -62,6 +63,7 @@ import {
     type NoteVersion,
     type OpenEditor,
     type PendingChange,
+    type PendingMassDelete,
     type PendingReason,
     type SyncPlan,
     type SyncStatus,
@@ -75,6 +77,24 @@ const MAX_DELETED_LISTED = 50;
 
 /** Versions of a note listed in its history, at most. */
 const MAX_NOTE_VERSIONS = 50;
+
+/** Paths listed in a held mass deletion, at most; the count says how many there really are. */
+const MAX_MASS_DELETE_LISTED = 50;
+
+/** The config folder is walked this often at most, and no more often than twice the last quiet gap. */
+const CONFIG_SCAN_MIN_MS = 2 * 60_000;
+const CONFIG_SCAN_MAX_MS = 5 * 60_000;
+
+/** The "Not synced yet" list is rebuilt at most once per this, while nothing it is built from changes. */
+const PENDING_REFRESH_MS = 10_000;
+
+/** Deletions a pass holds, and whether the user let them through; see {@link SyncEngine.holdMassDelete}. */
+type MassDeleteHold = {
+    /** Every path the pass would have removed from Drive. */
+    paths: string[];
+    /** Set once the user said to go ahead: the next pass carries them out. */
+    approved: boolean;
+};
 
 type PendingRename = { from: string; to: string; isFolder: boolean };
 
@@ -222,7 +242,32 @@ export class SyncEngine {
     private queue: Promise<void> = Promise.resolve();
     /** A poll is queued or running; only one at a time. */
     private polling = false;
+    /**
+     * The signal every transfer of this run reads; aborted by {@link stop}.
+     *
+     * Kept after the abort: a pass already under way keeps checking it, and it
+     * must read "aborted", not "no signal at all", for the rest of the run.
+     */
     private abortController: AbortController | null = null;
+    /**
+     * Bumped by every start and stop. A pass that began under an older one has
+     * outlived its engine and must not write the state or the status of the
+     * current one; see {@link stale}.
+     */
+    private generation = 0;
+    /** The start under way, so two unlock paths cannot start the engine twice; see {@link start}. */
+    private starting: Promise<void> | null = null;
+    /** Deletions held for a decision; see {@link holdMassDelete}. */
+    private massDelete: MassDeleteHold | null = null;
+    /** The last summary reported through `onChange`, so an unchanged one is not reported again. */
+    private reported: string | null = null;
+    /** The last "Not synced yet" list, and what it was built from; see {@link pendingChanges}. */
+    private pendingCache: { signature: string; value: PendingChange[] } | null = null;
+    /** When a full sync finished, on the monotonic clock; see {@link dailyWalkDue}. */
+    private lastFullSyncMono: number | null = null;
+    /** When the config folder was last walked, on the monotonic clock, and how long to wait before the next; see {@link pollConfigFolder}. */
+    private configScanAt: number | null = null;
+    private configScanGap = CONFIG_SCAN_MIN_MS;
 
     /** Renames seen in the current tick, applied together; see {@link onVaultRename}. */
     private pendingRenames: PendingRename[] = [];
@@ -237,6 +282,8 @@ export class SyncEngine {
      * just queued.
      */
     private readonly heldForRetry = new Set<string>();
+    /** Paths that failed one at a time during the pass; see {@link noteItemFailure}. */
+    private readonly itemFailures = new Set<string>();
 
     /**
      * Paths that differ from another path only in letter case, found by the
@@ -266,7 +313,7 @@ export class SyncEngine {
         );
         this.filter = this.createFilter(settings);
         this.scopeKey = scopeKeyOf(settings);
-        this.progress = new PassProgress(() => this.hooks.onChange(this.getSummary()));
+        this.progress = new PassProgress(() => this.report());
         this.cases = new CaseClashes({
             state,
             filter: () => this.filter,
@@ -278,6 +325,7 @@ export class SyncEngine {
             findRemoteFolder: (path) => this.findRemoteFolder(path),
             findByName: (path) => this.findByName(path, new Map()),
             reportConflict: (event) => this.reportConflict(event),
+            noteFailure: (path, error, what) => this.noteItemFailure(path, error, what),
         });
         this.pace = new TransferPace(() => this.settings.transferConcurrency, logger);
         this.polls = new PollScheduler({
@@ -291,6 +339,7 @@ export class SyncEngine {
     }
 
     getSummary(): SyncSummary {
+        const pendingMassDelete = this.pendingMassDelete();
         return {
             status: this.status,
             lastSyncedAt: this.lastSyncedAt,
@@ -300,7 +349,93 @@ export class SyncEngine {
             progressFraction: this.progress.fraction(),
             transfer: this.progress.largestTransfer(),
             pending: this.pendingChanges().length,
+            ...(pendingMassDelete !== undefined && { pendingMassDelete }),
         };
+    }
+
+    /**
+     * Deletions a pass held back, for the dialog that asks about them. Absent
+     * when there is nothing held, and while the deletes it asked about run.
+     */
+    pendingMassDelete(): PendingMassDelete | undefined {
+        const held = this.massDelete;
+        if (held === null || held.approved) {
+            return undefined;
+        }
+        return { count: held.paths.length, paths: held.paths.slice(0, MAX_MASS_DELETE_LISTED) };
+    }
+
+    /**
+     * Carry out the deletions a pass held back.
+     *
+     * Another full pass, with the guard open for this decision, so every path
+     * is decided again before it is deleted: a file that came back in the
+     * meantime is uploaded, not trashed.
+     */
+    async approveMassDelete(): Promise<void> {
+        const held = this.massDelete;
+        if (held === null || held.approved) {
+            return;
+        }
+        held.approved = true;
+        this.report();
+        try {
+            await this.syncNow();
+        } finally {
+            if (this.massDelete === held) {
+                this.massDelete = null;
+            }
+            this.report();
+        }
+    }
+
+    /**
+     * Keep the held files on Drive, and bring them back into the vault.
+     *
+     * The other answer, and the one that recovers an unmounted card or a folder
+     * emptied outside Obsidian: Drive still has the files, so they are
+     * downloaded again and their records reset to what comes down.
+     */
+    async denyMassDelete(): Promise<void> {
+        const held = this.massDelete;
+        if (held === null) {
+            return;
+        }
+        this.massDelete = null;
+        this.report();
+        if (!this.drive || !this.rootUid) {
+            return;
+        }
+        await this.enqueue(async () => {
+            const generation = this.generation;
+            const listed = new Map<string, Map<string, NodeEntity>>();
+            for (const path of held.paths) {
+                if (generation !== this.generation) {
+                    return;
+                }
+                try {
+                    const record = this.state.get(path);
+                    if (record?.type === 'folder') {
+                        // A folder held for deletion: it is still on Drive, so
+                        // it is simply kept here too.
+                        await this.vault.ensureFolder(path);
+                        this.state.setSynced(path, record.nodeUid, 'folder');
+                        continue;
+                    }
+                    const remote = await this.findByName(path, listed);
+                    if (remote === undefined) {
+                        // Gone from Drive as well; nothing to bring back.
+                        this.state.delete(path);
+                        continue;
+                    }
+                    await this.download(path, remote.nodeUid, remote.revisionUid, remote, undefined);
+                } catch (error) {
+                    this.noteItemFailure(path, error, 'Could not bring back');
+                }
+            }
+            await this.state.flush();
+            this.report();
+        });
     }
 
     /**
@@ -308,8 +443,38 @@ export class SyncEngine {
      * under "Not synced yet", so that nothing fails to sync without the user
      * being able to see it. A path is listed once, under the most immediate
      * reason.
+     *
+     * Memoised: the panel and the current-note indicator ask for this on every
+     * progress tick and every vault event, and it is built from a walk over
+     * every record, retry and clash. The result is reused while nothing it is
+     * built from has changed — the state's generation, the transfers in
+     * flight, the batch waiting out its debounce — and for a few seconds while
+     * the only thing that moves is a retry's countdown.
      */
     pendingChanges(now = Date.now()): PendingChange[] {
+        const signature = this.pendingSignature(now);
+        if (this.pendingCache !== null && this.pendingCache.signature === signature) {
+            return this.pendingCache.value;
+        }
+        const value = this.buildPendingChanges(now);
+        this.pendingCache = { signature, value };
+        return value;
+    }
+
+    /** Everything {@link pendingChanges} is built from, cheap enough to compute on every call. */
+    private pendingSignature(now: number): string {
+        return JSON.stringify([
+            this.state.generation(),
+            Math.floor(now / PENDING_REFRESH_MS),
+            this.networkHeld(),
+            [...this.inFlight],
+            this.batcher.pendingPaths(),
+            [...this.tooLarge],
+            [...this.caseCollisions],
+        ]);
+    }
+
+    private buildPendingChanges(now: number): PendingChange[] {
         const found = new Map<string, PendingChange>();
         const add = (path: string, reason: PendingReason, detail?: string) => {
             if (!found.has(path)) {
@@ -410,13 +575,40 @@ export class SyncEngine {
         }
     }
 
-    async start(client: ProtonDriveClient, rootUid: string): Promise<void> {
+    /**
+     * Start syncing with `client` and `rootUid`.
+     *
+     * Single-flight: two unlock paths can fire at once — the remembered unlock
+     * and the PIN form — and a second start would build a second Drive client
+     * under a pass already running, and sweep away the downloads that pass is
+     * writing. Both callers join the start already under way.
+     */
+    start(client: ProtonDriveClient, rootUid: string): Promise<void> {
+        if (this.starting !== null) {
+            this.logger.debug('A start is already under way; joining it');
+            return this.starting;
+        }
+        this.starting = this.startOnce(client, rootUid).finally(() => {
+            this.starting = null;
+        });
+        return this.starting;
+    }
+
+    private async startOnce(client: ProtonDriveClient, rootUid: string): Promise<void> {
+        // A new run: passes from before belong to an older generation.
+        this.generation++;
         this.drive = new DriveIO(client, this.logger.getLogger('drive'));
         this.resolver = this.createResolver(this.drive, this.settings.conflictPolicy);
         this.rootUid = rootUid;
         this.running = true;
         this.folderMissing = null;
         this.failureReasons.clear();
+        this.massDelete = null;
+        // A new session: nothing has been walked, in the terms this session
+        // measures time in.
+        this.lastFullSyncMono = null;
+        this.configScanAt = null;
+        this.configScanGap = CONFIG_SCAN_MIN_MS;
         this.paused = this.settings.paused;
         this.abortController = new AbortController();
         // Opening Obsidian is activity: check at the active pace for a while.
@@ -442,8 +634,19 @@ export class SyncEngine {
         this.scheduleRemotePoll();
     }
 
+    /**
+     * Stop, and let the pass of the moment finish.
+     *
+     * The abort signal is not dropped: a transfer already under way keeps
+     * reading it, and must read "aborted" for the rest of this run, not "no
+     * signal". The generation is bumped first, so the pass that was running
+     * when the plugin unloaded cannot write its state over the next instance's
+     * — and the queue is awaited before the state is flushed, so nothing is
+     * still writing when this resolves.
+     */
     async stop(): Promise<void> {
         this.running = false;
+        this.generation++;
         this.batcher.cancel();
         this.polls.cancel();
         if (this.renameTimer !== null) {
@@ -456,7 +659,6 @@ export class SyncEngine {
         this.plannedLocal.clear();
         this.deferredFullSync = false;
         this.abortController?.abort();
-        this.abortController = null;
         await this.queue.catch(() => undefined);
         await this.state.flush();
     }
@@ -626,6 +828,7 @@ export class SyncEngine {
      * got to the end: false when it failed, was stopped, or could not start.
      */
     private async fullSync(): Promise<boolean> {
+        const generation = this.generation;
         const drive = this.drive;
         const rootUid = this.rootUid;
         if (!drive || !rootUid) {
@@ -677,7 +880,11 @@ export class SyncEngine {
             // a note renamed on another device has to be renamed here first,
             // or it reads as one file deleted and an unrelated one created.
             await this.followRemoteMoves(tree);
+            const unreadable = this.unreadablePaths(tree);
             const { skip, goneFolders } = await this.verifyMissingNodes(tree);
+            for (const path of unreadable) {
+                skip.add(path);
+            }
 
             const local = await this.vault.list((path) => !this.filter.isExcluded(path));
             await this.vault.removeLegacyPartialDownloads(local.files);
@@ -707,6 +914,14 @@ export class SyncEngine {
             }
 
             this.caseCollisions = (await this.cases.isCaseInsensitive()) ? this.cases.findCollisions(paths) : new Set();
+            // A pass that would remove a great many files from Drive is held
+            // instead, and the user asked; see holdMassDelete. The paths it
+            // holds are left out of this pass entirely.
+            const localFiles = new Set(local.files);
+            const held = await this.holdMassDelete(paths, tree.files, locallyDeletedFolders, (path) => !localFiles.has(path));
+            for (const path of held) {
+                paths.delete(path);
+            }
             const failed: string[] = [];
             if (this.adoptingSettings) {
                 // A first sync settles the config folder before anything
@@ -725,20 +940,28 @@ export class SyncEngine {
                 }
             }
             failed.push(...(await this.reconcileAll(paths, tree.files, skip)));
-            await this.cleanUpDeletedFolders(goneFolders, locallyDeletedFolders);
+            await this.cleanUpDeletedFolders(goneFolders, locallyDeletedFolders, held);
             this.plannedLocal.clear();
+
+            // A stale pass has outlived its engine: nothing it settled may be
+            // written over the state of the one that replaced it.
+            if (this.stale(generation)) {
+                return false;
+            }
 
             // A full pass settles everything earlier polls could not, so only
             // what failed in it, or could not be established, stays queued.
+            const itemFailures = [...this.itemFailures];
             this.state.clearRetries();
             for (const path of [...this.failureReasons.keys()]) {
-                if (!failed.includes(path)) {
+                if (!failed.includes(path) && !itemFailures.includes(path)) {
                     this.failureReasons.delete(path);
                 }
             }
-            for (const path of [...failed, ...skip]) {
+            for (const path of [...failed, ...skip, ...itemFailures]) {
                 this.state.retry(path);
             }
+            this.itemFailures.clear();
             // Queued during this pass without failing, a Drive revision that
             // moved under it, say: still to be retried.
             for (const path of this.heldForRetry) {
@@ -746,17 +969,24 @@ export class SyncEngine {
             }
             this.heldForRetry.clear();
             this.state.setLastFullSync(Date.now());
+            this.lastFullSyncMono = monotonicNow();
+            this.configScanGap = CONFIG_SCAN_MIN_MS;
 
             this.lastSyncedAt = Date.now();
             this.lastError = null;
             this.setStatus('idle');
             return true;
         } catch (error) {
+            if (this.stale(generation)) {
+                return false;
+            }
             this.reportFailure('Full sync failed', error);
             return false;
         } finally {
             this.adoptingSettings = null;
-            await this.state.flush();
+            if (!this.stale(generation)) {
+                await this.state.flush();
+            }
         }
     }
 
@@ -876,10 +1106,16 @@ export class SyncEngine {
      * node rather than by listing the tree, which is what keeps steady-state
      * syncing down to a couple of requests per changed file.
      */
-    private async processPaths(paths: Set<string>, confirmedAbsent: Set<string> = new Set()): Promise<void> {
+    private async processPaths(
+        paths: Set<string>,
+        confirmedAbsent: Set<string> = new Set(),
+        /** Paths whose Drive side could not be established, and is not inferred; see {@link RemoteView.skip}. */
+        unconfirmed: Set<string> = new Set(),
+    ): Promise<void> {
         if (!this.drive || !this.rootUid || !this.running) {
             return;
         }
+        const generation = this.generation;
         if (this.folderMissing !== null) {
             // The full sync that runs once the folder is back covers these.
             return;
@@ -902,9 +1138,16 @@ export class SyncEngine {
                 ),
             );
             const view = await this.lookupRemote(files, confirmedAbsent);
-            const failed = new Set(await this.reconcileAll(view.paths, view.states, view.skip));
+            const skip = new Set([...view.skip, ...unconfirmed]);
+            // A batch that would remove a great many files from Drive is held,
+            // as in a full pass: an unmounted card produces its deletions as
+            // events, not as a walk.
+            for (const path of await this.holdMassDelete(view.paths, view.states)) {
+                view.paths.delete(path);
+            }
+            const failed = new Set(await this.reconcileAll(view.paths, view.states, skip));
             for (const path of new Set([...paths, ...view.paths])) {
-                if (failed.has(path) || view.skip.has(path)) {
+                if (failed.has(path) || skip.has(path)) {
                     this.state.retry(path);
                 } else if (!this.heldForRetry.has(path)) {
                     this.state.clearRetry(path);
@@ -914,17 +1157,25 @@ export class SyncEngine {
             this.heldForRetry.clear();
             await this.applyLocalFolderDeletes();
 
+            if (this.stale(generation)) {
+                return;
+            }
             this.lastSyncedAt = Date.now();
             this.lastError = null;
             this.setStatus('idle');
         } catch (error) {
+            if (this.stale(generation)) {
+                return;
+            }
             for (const path of paths) {
                 this.state.retry(path);
                 this.failureReasons.set(path, errorMessage(error));
             }
             this.reportFailure('Sync failed', error);
         } finally {
-            await this.state.flush();
+            if (!this.stale(generation)) {
+                await this.state.flush();
+            }
         }
     }
 
@@ -1762,19 +2013,30 @@ export class SyncEngine {
                 remotePath !== record.path &&
                 !this.filter.isExcludedWithAncestors(record.path)
             ) {
-                await this.followRemoteMove(record.path, remotePath, 'folder');
+                try {
+                    await this.followRemoteMove(record.path, remotePath, 'folder');
+                } catch (error) {
+                    // One folder that cannot be moved here — a handle held open
+                    // on Windows — is recorded and the pass goes on.
+                    this.noteItemFailure(record.path, error, 'Could not follow the rename of');
+                }
             }
         }
 
         for (const record of this.state.entries()) {
             const remotePath = tree.nodePaths.get(record.nodeUid);
             if (
-                record.type === 'file' &&
-                remotePath !== undefined &&
-                remotePath !== record.path &&
-                !this.filter.isExcludedWithAncestors(record.path)
+                record.type !== 'file' ||
+                remotePath === undefined ||
+                remotePath === record.path ||
+                this.filter.isExcludedWithAncestors(record.path)
             ) {
+                continue;
+            }
+            try {
                 await this.followRemoteMove(record.path, remotePath, 'file');
+            } catch (error) {
+                this.noteItemFailure(record.path, error, 'Could not follow the rename of');
             }
         }
     }
@@ -1789,9 +2051,12 @@ export class SyncEngine {
      */
     private async followRemoteMove(fromPath: string, toPath: string, type: 'file' | 'folder'): Promise<boolean> {
         if (this.filter.isExcludedWithAncestors(toPath)) {
-            // Moved somewhere this device does not sync. Keep the local copy.
+            // Moved somewhere this device does not sync. The file has left the
+            // vault as far as the sync is concerned, so the local copy goes
+            // with it: keeping it would upload it again under its old name on
+            // the next pass, putting it back on Drive beside the move.
             if (type === 'file') {
-                this.state.delete(fromPath);
+                await this.detachExcluded(fromPath);
             }
             return false;
         }
@@ -1822,6 +2087,58 @@ export class SyncEngine {
         }
         this.logger.info(`Renamed "${fromPath}" to "${toPath}", as on another device`);
         return true;
+    }
+
+    /**
+     * Files Drive listed but cannot serve a revision of.
+     *
+     * `listTree` leaves a file out of its `files` map when the node has no
+     * active revision — an upload that never finished, or metadata that could
+     * not be decrypted — but keeps its path in `nodePaths`. Compared by path
+     * alone, such a file looks deleted on Drive, and the vault copy would be
+     * removed. It is there, so it is left alone until Drive can say what it
+     * holds.
+     */
+    private unreadablePaths(tree: RemoteTree): Set<string> {
+        const unreadable = new Set<string>();
+        for (const record of this.state.entries()) {
+            const listed = tree.nodePaths.get(record.nodeUid);
+            if (record.type === 'file' && listed === record.path && !tree.files.has(record.path)) {
+                this.logger.debug(`Leaving "${record.path}" alone: Drive lists it without a revision this device can read`);
+                unreadable.add(record.path);
+            }
+        }
+        return unreadable;
+    }
+
+    /**
+     * Drop a file that moved on Drive into a path this device does not sync.
+     *
+     * Nothing is lost: the file is on Drive, in the excluded place, and every
+     * device that does not exclude it keeps it. What is removed here is this
+     * device's copy and its record, since leaving either behind would upload
+     * the file again under the name it no longer has.
+     *
+     * Unless it was edited here since the last sync: that edit is nowhere else,
+     * so the file stays and goes up again as a new one — which is what the
+     * local copy is for.
+     */
+    private async detachExcluded(path: string): Promise<void> {
+        const base = this.state.get(path)?.base;
+        const local = base === undefined ? undefined : await this.vault.getState(path, base);
+        this.state.delete(path);
+        if (base !== undefined && local !== undefined && local.hash !== base.hash) {
+            this.logger.info(`Kept "${path}": it was moved on Drive to a path this device does not sync, and has edits here`);
+            return;
+        }
+        try {
+            if (await this.vault.exists(path)) {
+                await this.vault.trash(path);
+                this.logger.info(`Removed "${path}": it was moved on Drive to a path this device does not sync`);
+            }
+        } catch (error) {
+            this.noteItemFailure(path, error, 'Could not remove');
+        }
     }
 
     /**
@@ -1878,6 +2195,17 @@ export class SyncEngine {
                 case 'outside':
                     this.logger.info(`"${record.path}" was moved out of the synced Drive folder; uploading it again`);
                     this.state.delete(record.path);
+                    break;
+                case 'at':
+                    if (!this.filter.isExcludedWithAncestors(location.path)) {
+                        // In the synced tree but not in the listing: a gap in
+                        // the listing, left for the next walk to settle.
+                        skip.add(record.path);
+                        break;
+                    }
+                    // Moved into a path this device does not sync; see
+                    // {@link detachExcluded}.
+                    await this.detachExcluded(record.path);
                     break;
                 default:
                     // In a folder that could not be read, or the lookup failed.
@@ -1937,7 +2265,13 @@ export class SyncEngine {
                 // the files inside it have been reconciled.
                 continue;
             }
-            await this.ensureRemoteFolder(path);
+            try {
+                await this.ensureRemoteFolder(path);
+            } catch (error) {
+                // One folder that cannot be made on Drive does not fail the
+                // pass; its files fail on their own if it is really needed.
+                this.noteItemFailure(path, error, 'Could not create the folder');
+            }
         }
 
         const locallyDeleted = new Map<string, string>();
@@ -1958,10 +2292,84 @@ export class SyncEngine {
                 locallyDeleted.set(path, uid);
                 continue;
             }
-            await this.vault.ensureFolder(path);
-            this.state.setSynced(path, uid, 'folder');
+            try {
+                await this.vault.ensureFolder(path);
+                this.state.setSynced(path, uid, 'folder');
+            } catch (error) {
+                // A name this filesystem refuses, say: recorded for a retry
+                // rather than stopping the rest of the folders.
+                this.noteItemFailure(path, error, 'Could not create the folder');
+            }
         }
         return locallyDeleted;
+    }
+
+    /**
+     * Decide whether this pass may delete, and hold it back when it would
+     * remove a great many files at once.
+     *
+     * The case is a vault that lost a folder whole: an unmounted SD card, a
+     * folder a cloud client evicted, a directory emptied outside Obsidian.
+     * Every file in it reads as deleted, and following that trashes the Drive
+     * copies, which every other device then copies. Above
+     * `massDeleteThreshold` the deletions are kept for a decision instead; the
+     * paths are returned so the pass can leave them alone.
+     *
+     * The count is made with the same rules the pass uses, on the same inputs,
+     * so what it holds is what would have happened. A hold already in force is
+     * recomputed rather than added to: the user sees the decision again only if
+     * the state behind it changed, and once approved the pass runs with the
+     * guard open.
+     *
+     * `absent` answers whether the vault still has the file. A full pass knows
+     * that from its listing; an incremental one asks the filesystem, which is
+     * a handful of stats for a batch of changed paths.
+     */
+    private async holdMassDelete(
+        paths: Iterable<string>,
+        remote: Map<string, RemoteState | undefined>,
+        deletedFolders: Map<string, string> = new Map(),
+        absent: (path: string) => boolean | Promise<boolean> = async (path) => !(await this.vault.exists(path)),
+    ): Promise<Set<string>> {
+        const threshold = this.settings.massDeleteThreshold;
+        if (threshold <= 0) {
+            this.massDelete = null;
+            return new Set();
+        }
+        if (this.massDelete?.approved) {
+            return new Set();
+        }
+
+        const files: string[] = [];
+        for (const path of paths) {
+            const record = this.state.get(path);
+            const remoteState = remote.get(path);
+            if (record?.base === undefined || remoteState === undefined) {
+                continue;
+            }
+            if (await absent(path)) {
+                if (removesRemote(reconcile({ path, base: record.base, remote: remoteState }))) {
+                    files.push(path);
+                }
+            }
+        }
+        // Every folder in `deletedFolders` is one the listing has and the
+        // vault has not: `syncFolders` only puts those there.
+        const folders = [...deletedFolders.keys()];
+        const count = files.length + folders.length;
+        if (count <= threshold) {
+            // Nothing to hold, and a hold from an earlier pass no longer
+            // describes this state, so it goes with it.
+            this.massDelete = null;
+            return new Set();
+        }
+
+        this.massDelete = { paths: [...files, ...folders], approved: false };
+        this.logger.warn(
+            `Holding ${count} deletion(s): more than the ${threshold} a pass removes without asking. ` +
+                'Approve them in the sync panel, or keep the files on Drive.',
+        );
+        return new Set(this.massDelete.paths);
     }
 
     /**
@@ -1970,14 +2378,22 @@ export class SyncEngine {
      * Only an emptied folder is removed. Anything still inside a folder that
      * was deleted on the other side is an edit the deletion would have
      * discarded; the reconcile has already restored it, and the folder stays
-     * with it.
+     * with it. A folder the mass-delete guard holds is left where it is; see
+     * {@link holdMassDelete}.
      */
-    private async cleanUpDeletedFolders(goneFolders: Set<string>, locallyDeleted: Map<string, string>): Promise<void> {
+    private async cleanUpDeletedFolders(
+        goneFolders: Set<string>,
+        locallyDeleted: Map<string, string>,
+        held: Set<string> = new Set(),
+    ): Promise<void> {
         for (const path of [...goneFolders].sort((a, b) => byDepth(b, a))) {
             await this.removeLocalFolderIfEmpty(path);
         }
 
         for (const [path, uid] of [...locallyDeleted].sort(([a], [b]) => byDepth(b, a))) {
+            if (held.has(path)) {
+                continue;
+            }
             try {
                 if (await this.vault.exists(path)) {
                     continue;
@@ -2308,17 +2724,30 @@ export class SyncEngine {
      * Whether the daily walk of the whole Drive folder is due now: a day since
      * the last one, and a quiet moment to run it in, so it never holds up a
      * sync the user is waiting for.
+     *
+     * Elapsed time is measured on the monotonic clock once this session has run
+     * a walk of its own: `lastFullSyncAt` is wall time, and a clock set back a
+     * day would otherwise hide the walk for a day longer. `now` is wall time
+     * only for the case where this session has never walked.
      */
-    private dailyWalkDue(now = Date.now()): boolean {
+    private dailyWalkDue(now = Date.now(), mono = monotonicNow()): boolean {
         const last = this.state.getLastFullSync();
-        if (last === null || now - last <= FULL_SYNC_INTERVAL_MS) {
+        if (last === null) {
             return false;
         }
-        return this.polls.quietFor(now) > IDLE_WALK_AFTER_MS || (this.environment.isHidden?.() ?? false);
+        const lastMono = this.lastFullSyncMono;
+        // Whichever clock says longer: a clock set back cannot hide a walk that
+        // is due, and a walk this session ran cannot be undone by a state file
+        // written earlier.
+        const since = lastMono === null ? now - last : Math.max(now - last, mono - lastMono);
+        if (since <= FULL_SYNC_INTERVAL_MS) {
+            return false;
+        }
+        return this.polls.quietFor(mono) > IDLE_WALK_AFTER_MS || (this.environment.isHidden?.() ?? false);
     }
 
     /** Seconds until the next check of Drive; see {@link PollScheduler}. */
-    pollIntervalSeconds(now = Date.now()): number {
+    pollIntervalSeconds(now = monotonicNow()): number {
         return this.polls.interval(now);
     }
 
@@ -2351,6 +2780,7 @@ export class SyncEngine {
         if (!drive || !this.running || !this.settings.autoSync) {
             return;
         }
+        const generation = this.generation;
         if (this.folderMissing !== null && !this.networkHeld()) {
             await this.recheckMissingFolder();
             return;
@@ -2413,6 +2843,11 @@ export class SyncEngine {
         // up, is not settled until it has run: the cursor stays where it was,
         // so the next poll reads the same events again, even after a restart.
         const settled = needsFullSync ? await this.fullSync() : await this.applyRemoteEvents(events);
+        if (this.stale(generation)) {
+            // Stopped while this ran: its cursor and its state belong to a run
+            // that is over.
+            return;
+        }
         // Only now: a cursor saved before its events were handled would skip
         // them for good if the app closed in between.
         if (lastEventId !== null && settled) {
@@ -2425,7 +2860,7 @@ export class SyncEngine {
             // when nothing changed. Without this a quiet vault would read as
             // not synced for hours, however often Drive is checked.
             this.lastSyncedAt = Date.now();
-            this.hooks.onChange(this.getSummary());
+            this.report();
         }
         await this.state.flush();
     }
@@ -2437,6 +2872,8 @@ export class SyncEngine {
     private async applyRemoteEvents(changes: NodeChange[]): Promise<boolean> {
         const paths = new Set(this.state.dueRetries());
         const confirmedAbsent = new Set<string>();
+        /** Files whose fate could not be established: left alone, and retried. */
+        const skip = new Set<string>();
         const goneFolders: string[] = [];
         let settled = true;
 
@@ -2455,7 +2892,7 @@ export class SyncEngine {
             .sort((a, b) => byDepth(a!.path, b!.path))
             .map((record) => record!.nodeUid);
         for (const uid of folderEvents) {
-            await this.followRemoteFolder(uid, paths, confirmedAbsent, goneFolders);
+            await this.followRemoteFolder(uid, paths, confirmedAbsent, skip, goneFolders);
         }
 
         for (const event of events) {
@@ -2475,7 +2912,7 @@ export class SyncEngine {
         if (paths.size > 0) {
             this.logger.debug(`${paths.size} path(s) changed on Drive`);
             this.polls.noteActivity();
-            await this.processPaths(paths, confirmedAbsent);
+            await this.processPaths(paths, confirmedAbsent, skip);
         }
         for (const path of goneFolders.sort((a, b) => byDepth(b, a))) {
             await this.removeLocalFolderIfEmpty(path);
@@ -2488,6 +2925,7 @@ export class SyncEngine {
         uid: string,
         paths: Set<string>,
         confirmedAbsent: Set<string>,
+        skip: Set<string>,
         goneFolders: string[],
     ): Promise<void> {
         const record = this.state.getByNodeUid(uid);
@@ -2500,8 +2938,12 @@ export class SyncEngine {
         const location = await this.tryLocate(uid);
         switch (location?.kind) {
             case 'deleted':
-                for (const file of filesWithin(record.path)) {
-                    confirmedAbsent.add(file.path);
+                for (const file of await this.childrenGoneWith(record.nodeUid, record.path, filesWithin(record.path))) {
+                    if (file.gone) {
+                        confirmedAbsent.add(file.path);
+                    } else {
+                        skip.add(file.path);
+                    }
                     paths.add(file.path);
                 }
                 this.forgetFolder(record.path);
@@ -2532,6 +2974,45 @@ export class SyncEngine {
                     this.state.retry(file.path);
                 }
         }
+    }
+
+    /**
+     * Which of a trashed folder's recorded files went to the trash with it.
+     *
+     * The trash takes a folder's contents, but not always all of them: a file
+     * moved out a moment before the folder was trashed is still there, under
+     * another folder, and is not this device's to delete. One batched lookup
+     * settles it — a child still under the trashed folder, or itself in the
+     * trash, is gone; one that has moved elsewhere is not, and is left alone
+     * until its own event says what happened. A lookup that fails settles
+     * nothing: absence is never inferred from it.
+     */
+    private async childrenGoneWith(
+        folderUid: string,
+        folderPath: string,
+        children: { path: string; nodeUid: string }[],
+    ): Promise<{ path: string; gone: boolean }[]> {
+        if (children.length === 0) {
+            return [];
+        }
+        let found: Map<string, NodeEntity | null>;
+        try {
+            found = await this.drive!.lookupNodes(children.map((child) => child.nodeUid));
+        } catch (error) {
+            this.logger.warn(`Could not check what the trash took with "${folderPath}"`, error);
+            return children.map((child) => ({ path: child.path, gone: false }));
+        }
+        return children.map((child) => {
+            if (!found.has(child.nodeUid)) {
+                // Not answered for, which is not the same as gone.
+                return { path: child.path, gone: false };
+            }
+            const node = found.get(child.nodeUid) ?? null;
+            // Gone for good, in the trash itself, or still under the folder
+            // that took it there.
+            const gone = node === null || node.trashTime !== undefined || node.parentUid === folderUid;
+            return { path: child.path, gone };
+        });
     }
 
     /**
@@ -2605,12 +3086,24 @@ export class SyncEngine {
      * theme or a newly installed plugin would otherwise wait for the next full
      * sync. Cheap: only size and mtime are compared against the last sync,
      * and nothing is read unless one of them moved.
+     *
+     * Not on every poll, though. Walking `.obsidian` means listing every
+     * folder under it, plugins included, and a poll comes every thirty
+     * seconds; on a phone that is the most expensive thing the sync does in a
+     * quiet vault. A walk that found nothing doubles the wait before the next,
+     * up to {@link CONFIG_SCAN_MAX_MS}, and any change puts it back to
+     * {@link CONFIG_SCAN_MIN_MS}.
      */
     private async pollConfigFolder(): Promise<void> {
         const { configDir } = this.scope;
         if (!this.running || !this.settings.autoSync || this.filter.isExcludedWithAncestors(configDir)) {
             return;
         }
+        const now = monotonicNow();
+        if (this.configScanAt !== null && now - this.configScanAt < this.configScanGap) {
+            return;
+        }
+        this.configScanAt = now;
 
         const changed = new Set<string>();
         try {
@@ -2642,6 +3135,8 @@ export class SyncEngine {
             return;
         }
 
+        this.configScanGap =
+            changed.size > 0 ? CONFIG_SCAN_MIN_MS : Math.min(this.configScanGap * 2, CONFIG_SCAN_MAX_MS);
         if (changed.size > 0) {
             this.logger.debug(`${changed.size} config file(s) changed`);
             await this.processPaths(changed);
@@ -2884,7 +3379,45 @@ export class SyncEngine {
             status = 'folder-missing';
         }
         this.status = status === 'idle' && this.paused ? 'paused' : status;
-        this.hooks.onChange(this.getSummary());
+        this.report();
+    }
+
+    /**
+     * Report the summary, unless it is the one already reported.
+     *
+     * The panel rebuilds on every report, and the engine reports on every
+     * progress tick. Skipping the ones that would render exactly what is
+     * already there keeps that work off the UI thread, which is what the panel
+     * and the note indicators cost on a phone.
+     */
+    private report(): void {
+        const summary = this.getSummary();
+        const key = JSON.stringify(summary);
+        if (key === this.reported) {
+            return;
+        }
+        this.reported = key;
+        this.hooks.onChange(summary);
+    }
+
+    /** Whether a pass that captured `generation` has outlived its engine; see {@link generation}. */
+    private stale(generation: number): boolean {
+        return generation !== this.generation;
+    }
+
+    /**
+     * Note that one path failed this pass, without failing the rest of it.
+     *
+     * A file locked by another program on Windows — EBUSY on a rename — used to
+     * fail the whole full sync at the same point on every attempt, leaving
+     * everything after it unsynced. Now it is recorded for a retry and the pass
+     * goes on; see {@link itemFailures}.
+     */
+    private noteItemFailure(path: string, error: unknown, what: string): void {
+        this.logger.warn(`${what} "${path}"`, error);
+        this.failureReasons.set(path, errorMessage(error));
+        this.itemFailures.add(path);
+        this.state.retry(path);
     }
 
     // -- read-only views for the UI ----------------------------------------
