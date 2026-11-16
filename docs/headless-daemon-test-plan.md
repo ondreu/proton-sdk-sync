@@ -61,12 +61,16 @@ uploaded as "delete". Reproduce: `remount,ro`, touch remote file, one
 pass → assert zero local changes, zero remote deletes, alert logged.
 Data-loss if read failure ever reads as "file gone". Owner: Daemon probe
 + VaultIO classifies EROFS/EACCES as hold, never delete.
-7. Two daemons, one vault. Double-started container: second instance exits
-on `flock(2)` of `<vault>/.proton-sync/daemon.lock`, never runs a pass.
-Reproduce: stagger two starts 1 s → assert one holder, loser logs
-`already-running`, exits 0, zero state/Drive touches. Data-loss (two
+7. Two daemons, one vault. Double-started container: the second instance
+fails on the dual `O_EXCL` locks (`<dataDir>/daemon.lock` AND
+`<vault>/.proton-sync/daemon.lock` — two containers can mount different data
+dirs over one vault, so the vault-side file is the one that collides), exits
+5 (`already-running`, held to a clean stop, never restarted), and never runs
+a pass. Reproduce: stagger two starts 1 s → assert one holder, loser logs
+`already-running`, exits 5, zero state/Drive touches. Data-loss (two
 writers interleave temp files and flushes). Owner: Daemon — engine
-assumes a single writer.
+assumes a single writer. Pid-namespace caveat: across containers a
+live-but-foreign holder must read as HELD, never stale (see design doc §4).
 8. Daemon + GUI plugin, same note. Laptop Obsidian and NAS daemon edit one
 path in one poll window: ordinary three-way conflict, loser kept via
 `conflictCopyPath`, never overwritten. Reproduce: append A locally, B
@@ -132,11 +136,12 @@ schedule; 5xx never means "remote gone". Reproduce: 429 every third call
 zero `delete` calls in fake log during the 500 window. Data-loss if
 failed reads become deletes. Owner: Engine retry map + daemon pacing
 (keep `transferConcurrency` 3; raising it re-runs gate 6).
-18. SDK drift (0.23 pre-release). Pin exact SDK in `package-lock.json` (no
-floating `^0.23`); weekly CI builds latest SDK tag + runs fake-Drive
-suite, failing loudly on drift. Reproduce: `npm install
-@protontech/drive-sdk@latest` in CI → assert green matrix or filed
-incompatibility. Annoyance now, data-loss later. Owner: Daemon CI.
+18. SDK drift (0.23 pre-release). Exact pins (`"0.23.0"`, no `^`) in both
+`package.json` files with the lockfile; the weekly `sdk-drift` CI job
+installs `@protontech/drive-sdk@latest` over the pins (`--no-save`) and runs
+the headless plus plugin suites, failing loudly on drift. Reproduce:
+`npm install @protontech/drive-sdk@latest` in CI → assert green matrix or
+filed incompatibility. Annoyance now, data-loss later. Owner: Daemon CI.
 
 **Names, config, host quirks**
 
@@ -199,7 +204,7 @@ scripted per-call responses (partial listings that omit-then-reveal,
 by dropping the engine mid-`await` and rebuilding over the same dir),
 #8, #11–15, #17, #19–20, #23–24, and all of §3. Proves logic under
 faults. Cannot prove real crash durability (fdatasync/rename), real
-Proton behavior, real inotify. Command: `npm run test:daemon` (new) —
+Proton behavior, real inotify. Command: `npm --workspace headless test` —
 `npm test` + it both green pre-merge.
 
 **C — real-Drive E2E in a canary folder** (e.g. Drive
@@ -283,7 +288,9 @@ forced refresh per run. Evidence: nightly CI links.
 8. No silent stalls: wedge a pass in staging, observe the heartbeat /
 cursor-lag page. Evidence: alert log line, not a description.
 9. Rollback rehearsed: seeded-bad-sync drill to restored vault + paused
-daemon in ≤30 min from the runbook alone. Evidence: timed drill log.
+daemon in ≤30 min from the runbook alone (`docs/headless-daemon.md` §9;
+nightly archives from `scripts/backup-daemon-state.sh`). Evidence: timed
+drill log.
 
 ## 5. Anti-patterns and false alarms
 
