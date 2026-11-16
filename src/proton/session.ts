@@ -12,7 +12,7 @@ import type { Logger } from '../util/logger';
 import { ApiClient, initAccount, type Addresses, type Auth, type Srp } from './account';
 import type { Credentials } from './credentials';
 import { HTTPClient } from './httpClient';
-import { cacheKeyBytes, EncryptedEntitiesCache, IndexedDbCacheStore, nodeScope } from './persistentCache';
+import { cacheKeyBytes, EncryptedEntitiesCache, IndexedDbCacheStore, nodeScope, type CacheStore } from './persistentCache';
 import { retryNetworkErrors, SIGN_IN_RETRY_DELAYS_MS } from './retry';
 import { revokeSession } from './revoke';
 import { obsidianFetch } from './obsidianFetch';
@@ -51,6 +51,22 @@ function initCryptoOnce(): OpenPGPCryptoWithCryptoProxy {
     }
     return new OpenPGPCryptoWithCryptoProxy(CryptoProxy);
 }
+
+/**
+ * Headless seams for {@link ProtonSession}. Both are absent in the plugin, so
+ * leaving them out changes nothing there.
+ *
+ * - `cacheStore` persists the encrypted Drive metadata cache somewhere other
+ *   than IndexedDB (a file on a NAS, which has no IndexedDB). When absent the
+ *   session keeps the IndexedDB store, or memory where there is none.
+ * - `fetchImpl` replaces Obsidian's `requestUrl`-backed transport with plain
+ *   `fetch`. Outside Obsidian there is no CORS to escape, and `requestUrl`
+ *   does not exist.
+ */
+export type SessionDeps = {
+    cacheStore?: CacheStore | null;
+    fetchImpl?: typeof fetch;
+};
 
 export type SignInHandle = {
     /** The account.proton.me URL the user has to open to approve the session. */
@@ -120,6 +136,8 @@ export class ProtonSession {
         private readonly logger: Logger,
         /** The event position the sync state stands at, recorded with each save of the cache. */
         private readonly cacheMarker: () => string = () => '',
+        /** Headless persistence and transport; see {@link SessionDeps}. Absent means the plugin's own. */
+        private readonly deps: SessionDeps = {},
     ) {
         this.telemetry = new Telemetry(logger);
     }
@@ -159,7 +177,8 @@ export class ProtonSession {
                 logger: this.logger.getLogger('api'),
                 // Obsidian's renderer is subject to CORS and Proton does not allow
                 // this origin, so every request goes out through Obsidian instead.
-                fetch: obsidianFetch,
+                // Headless passes plain fetch; there is no CORS server-side.
+                fetch: this.deps.fetchImpl ?? obsidianFetch,
                 onSessionEnded: () => this.sessionEnded(),
             });
 
@@ -384,16 +403,18 @@ export class ProtonSession {
 
     /**
      * The saved metadata cache, or an in-memory one where it cannot be kept:
-     * no IndexedDB, or no session key to encrypt it with.
+     * no store, or no session key to encrypt it with. Headless supplies the
+     * store (a file, via {@link SessionDeps}); the plugin uses IndexedDB.
      */
     private async openEntitiesCache(): Promise<ProtonDriveEntitiesCache> {
         const key = await this.credentials.cacheKey();
-        if (!key || !IndexedDbCacheStore.available()) {
+        const store = this.deps.cacheStore ?? (IndexedDbCacheStore.available() ? new IndexedDbCacheStore(`proton-sdk-sync-cache-${this.clientUid}`) : null);
+        if (!key || !store) {
             return new MemoryCache();
         }
         try {
             this.entitiesCache = await EncryptedEntitiesCache.open(
-                new IndexedDbCacheStore(`proton-sdk-sync-cache-${this.clientUid}`),
+                store,
                 cacheKeyBytes(key),
                 this.cacheMarker,
                 this.logger.getLogger('cache'),
