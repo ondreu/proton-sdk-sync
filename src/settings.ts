@@ -124,6 +124,7 @@ export const DEVICES_FOLDER = '.proton-drive-sync';
  */
 export const ALWAYS_EXCLUDED = [
     `${DEVICES_FOLDER}/`,
+    '.proton-sync/',
     '.trash/**',
     '.git/**',
     '.DS_Store',
