@@ -150,6 +150,28 @@ choice and the sync state, because both belong to the account you left.
   on the device.
 - **Ads:** none, and no paid tiers.
 
+### What the directory review reports, and why
+
+The automated review lists a few capabilities with a warning or a
+recommendation. Each one is real, and each has a reason:
+
+- **Direct filesystem access (desktop only).** Node's `fs` is reached lazily,
+  behind a desktop check, and only through paths that have already been checked
+  to stay inside the vault. It is used for two things the vault API cannot do:
+  streaming a large upload in chunks instead of holding the whole file in
+  memory, and hashing files larger than a few megabytes without a second full
+  copy. On mobile there is no Node at all, and everything goes through the vault
+  adapter.
+- **Vault enumeration.** A sync plugin has to know every path in the vault; that
+  is what it is comparing against Drive. Paths outside the synced folder are
+  skipped before anything is read.
+- **Clipboard.** Only when you press **Copy sync log**. Nothing is read from the
+  clipboard, ever.
+- **Dynamic code execution.** The bundle contains one `new Function`, inside
+  `ttag`'s plural-form helper, which Proton's OpenPGP.js bundles for its
+  translated messages. The plugin itself never evaluates generated code, and
+  nothing from a note, a file name or the network reaches that helper.
+
 ## How it works, briefly
 
 The plugin keeps a state file mapping each vault path to its Drive node and the
