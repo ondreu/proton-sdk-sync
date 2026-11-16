@@ -8,8 +8,8 @@ device, with the same SDK Proton's own clients use.
 
 > [!IMPORTANT]
 > This plugin writes to your vault and can delete files in it. It has an
-> automated test suite, but no external security audit. Keep a backup, and try
-> it on a copy of a vault first.
+> automated test suite, but no external audit. Keep a backup you can restore
+> from, as you would with any sync tool.
 
 ## What it does
 
@@ -49,7 +49,7 @@ device, with the same SDK Proton's own clients use.
 Until the plugin is in the community directory, install it by hand:
 
 1. Download `main.js`, `manifest.json` and `styles.css` from the
-   [latest release](../../releases/latest).
+   [latest release](https://github.com/ondreu/proton-sdk-sync/releases/latest).
 2. Put them in `<vault>/.obsidian/plugins/proton-sdk-sync/`.
 3. Enable **Proton-SDK-Sync** in *Settings → Community plugins*.
 
@@ -80,9 +80,8 @@ plugin does not guess: it keeps both sides and asks.
 - **Both** keeps the local file and writes the Drive version beside it as a
   conflict copy, named `note (conflict from <device> 2026-01-31 12-00-00).md`.
 
-The losing side is always kept as a conflict copy when it differs, even if
-conflict copies are turned off for ordinary merges — losing an edit because a
-button was clicked once is not a trade worth making.
+The losing side is always kept as a conflict copy when the two differ. Nothing
+is dropped because a button was pressed once.
 
 Text files changed on both sides are merged line by line when the edits do not
 overlap; the merged result is written and reported as merged. Everything else
@@ -105,8 +104,9 @@ becomes a conflict copy.
 - Anything you exclude, and `.obsidian/` if you turn config syncing off.
 - Files above your size limit, and on mobile anything above the mobile limit.
 
-The plugin's own state, logs and cached metadata stay in
-`.obsidian/plugins/proton-sdk-sync/` and never sync.
+The plugin's own state and logs stay in
+`.obsidian/plugins/proton-sdk-sync/`, and its Drive metadata cache in
+IndexedDB; none of it syncs.
 
 ## Sharing a vault with other people
 
@@ -120,14 +120,15 @@ The Proton session — access and refresh tokens, never your password — is sto
 encrypted, in one of two places:
 
 - **Desktop:** a file in the plugin's folder, encrypted with the OS keystore
-  (Electron `safeStorage`: Keychain, DPAPI, libsecret), file mode `0600`.
+  (Electron `safeStorage`: Keychain, DPAPI, libsecret), file mode `0600`. Where
+  no keystore is available, it goes to Obsidian's secret storage instead.
 - **Mobile:** Obsidian's own secret storage, because the mobile app has no
   keystore.
 
 You can put a PIN in front of the stored session. With a PIN set it is never
-written in the clear: a token refresh that arrives while the plugin is locked is
-dropped, and the next unlock fetches a fresh one. Wrong PINs back off
-exponentially, and the count survives a restart.
+written in the clear: a token refresh that arrives while the plugin is locked
+waits in memory and is written, encrypted, at the next unlock. Wrong PINs back
+off exponentially, and the count survives a restart.
 
 Signing out ends the session on Proton's side as well, and forgets the folder
 choice and the sync state, because both belong to the account you left.
@@ -137,9 +138,11 @@ choice and the sync state, because both belong to the account you left.
 - **Account:** a Proton account is required. There is no way to use the plugin
   without one.
 - **Network:** the plugin talks to Proton only — `account.proton.me`,
-  `drive-api.proton.me` and the addresses the SDK resolves from them. It sends
-  the requests a Drive client has to send: authentication, file listing,
-  uploads, downloads, shares and version history. Nothing is sent anywhere else.
+  `drive-api.proton.me`, and the regional block-storage host the Drive API hands
+  out (`<region>-storage.proton.me`). It sends the requests a Drive client has
+  to send: authentication, file listing, uploads, downloads, shares and version
+  history. Nothing is sent anywhere else, and a request to any other host is
+  refused.
 - **Telemetry:** none. The SDK's telemetry interface is wired to the local log
   and the metrics are dropped; nothing about your files or your usage leaves the
   device except the Drive requests themselves.
@@ -161,7 +164,8 @@ recommendation. Each one is real, and each has a reason:
   streaming a large upload in chunks instead of holding the whole file in
   memory, and hashing files larger than a few megabytes without a second full
   copy. On mobile there is no Node at all, and everything goes through the vault
-  adapter.
+  adapter and WebCrypto. That is why `isDesktopOnly` is `false`: the plugin
+  runs on mobile, it just takes the slower path there.
 - **Vault enumeration.** A sync plugin has to know every path in the vault; that
   is what it is comparing against Drive. Paths outside the synced folder are
   skipped before anything is read.
@@ -180,6 +184,13 @@ since its cursor, walks the parts of the vault that changed, and reconciles the
 two against that common ancestor. Uploads are debounced; Drive is polled at the
 interval Proton's own clients use. Transfers are streamed through the SDK, so a
 large file does not have to fit in memory.
+
+## Support
+
+Bugs and questions go to
+[the issue tracker](https://github.com/ondreu/proton-sdk-sync/issues). For
+anything that could put someone's data at risk, say so in the title and keep the
+details out of the first message.
 
 ## Credits and licence
 
