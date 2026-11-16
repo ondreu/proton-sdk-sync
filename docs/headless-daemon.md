@@ -141,9 +141,19 @@ daemon: the state is a per-device merge base, and two writers corrupt the
   `.proton-drive-sync/` (`DEVICES_FOLDER`, `settings.ts:116`, via
   `DeviceRegistry`, `devices.ts:177`) is the rendezvous — the daemon registers
   as `platform: 'linux-headless'` — not a lock.
-- Same-machine double start is prevented by an `flock` held on
-  `<data-dir>/daemon.lock` for the process lifetime; a second start for the
-  same vault path exits 5 naming the lock holder's PID.
+- Same-machine double start is prevented by TWO `O_EXCL` locks held for the
+  process lifetime (`headless/src/lock.ts` — this corrects the earlier
+  single-flock description): `<dataDir>/daemon.lock` and
+`<vault>/.proton-sync/daemon.lock`. Two containers can bind-mount different
+data dirs over the same vault, and only the vault-side file collides then.
+A second start for the same vault path exits 5 naming the lock holder's PID.
+Takeover of a stale lock is always logged with the reason (dead pid, or boot
+id from before this boot). Pid-namespace caveat: liveness is `kill(pid, 0)`
+plus the Linux boot id, so across containers a live-but-foreign holder reads
+as ESRCH on the same boot id — treat that as HELD (fail closed), heartbeat
+the lock file, or run with `--pid=host`; see SECURITY.md. Heartbeat-based
+takeover (take over only when the file is older than N× the interval AND the
+pid check fails) is the planned hardening.
 
 ## 5. Unattended policy
 
@@ -180,6 +190,7 @@ Exclusions are the plugin's, unchanged:
 | `ALWAYS_EXCLUDED` (`:125`) | `.trash/`, `.git/`, `*.tmp`, OS droppings — never sync. |
 | `configExclusions` (`:150`) | `workspace.json`, `workspace*`, `cache`, and the whole `<pluginDir>/` (state, session) — never sync even with config sync on. |
 | `codeExclusions` (`:169`) | `<configDir>/plugins/**`, `community-plugins.json` — never synced to a shared vault, so a collaborator cannot ship code to every machine. `keepSelfEnabled` (`engine.ts:1693`) keeps the local install entry intact. |
+| `.proton-sync/` (daemon lock dir) | `daemon.lock` lives at `<vault>/.proton-sync/daemon.lock` and must never sync: add `.proton-sync/**` to `ALWAYS_EXCLUDED` (security review P1-1) and assert zero transfers for it — otherwise the lock is uploaded to Proton, fanned out to every device on the folder, and re-uploaded each pass. |
 
 ## 6. CLI surface and config
 
@@ -203,66 +214,119 @@ type DaemonConfig = {
     remoteFolderUid: string | null;
     conflictPolicy: ConflictPolicy; // default "keep-both"; "manual" rejected
     massDeleteThreshold: number;  // default 25, from DEFAULT_SETTINGS
-    remotePollSeconds: number;    // default 30; floor MIN_POLL_SECONDS (settings.ts:216)
+    remotePollSeconds: number;    // default 60; floor MIN_POLL_SECONDS (settings.ts:216)
     transferConcurrency: number;  // default 3
     pairing?: 'adopt-drive' | 'adopt-vault' | 'merge';
     logLevel: 'debug' | 'info' | 'warn' | 'error'; // default "info"
+    metadataCache: 'file' | 'memory'; // default "file" — honoured, not advisory
 };
 ```
 
-Exit codes: `0` clean (for `once`: in sync); `1` config/usage error; `2`
+`metadataCache: 'file'` (default) keeps the encrypted Drive node cache in
+`drive-cache.bin` between starts, keyed by the session's per-device cache key
+and validated against `state.cursorsFingerprint()` exactly as the plugin does
+— a marker mismatch clears the cache and refetches, it never serves stale
+bytes. `'memory'` skips persistence for less encrypted-at-rest surface at the
+cost of a full listing on every boot. Either way the marker plumbing must be
+wired (`setCacheMarker` once state exists) and `rememberCacheParents` ported,
+or every start silently pays a full refetch (correctness review P1-5).
+
+Exit codes: `0` clean (for `once`: in sync — but see the known limitation on
+SIGTERM-interrupted `once` below); `1` config/usage error; `2`
 sync finished with item failures (paths listed in `status.json`); `3`
-mass-delete held; `4` signed out / session revoked; `5` already running
-(lock held). Logging is JSONL to stdout (`{ts, level, module, msg, ...}` via
-the existing `Logger`, `src/util/logger.ts`), names redacted unless
-`logShowsNames` is set. `status.json` in the data dir carries
-`SyncSummary` (`types.ts:56`) plus `updatedAt` for a watchdog. SIGTERM/SIGINT
+mass-delete held; `4` signed out / session revoked (supervisor must NOT
+restart — needs a browser re-login); `5` already running
+(lock held, no restart); `6` sync state lost — `wasLost()` gate, zero Drive
+writes, engine never starts (no restart: needs a restore from backup, §9);
+`7` config invalid (including boot-time `ConfigError`: unreadable key file,
+missing vault, read-only mount).
+Logging is JSONL to stdout (`{ts, level, module, msg, ...}` via
+the existing `Logger`, `src/util/logger.ts`). Note-name redaction is the
+contract but not yet the behaviour: until `jsonLog`/`status.json` pass
+through `redactNames` with an explicit `--show-names` opt-in (security
+review P1-2), treat stdout and `status.json` as carrying plaintext note
+names, conflict/copy paths and error strings — Docker logs keep them
+indefinitely, so keep `max-size`/`max-file` rotation and do not forward to
+third-party aggregation. `status.json` in the data dir carries
+`SyncSummary` (`types.ts:56`) plus `updatedAt` for the watchdog; it must be
+`0600` (security review P1-3). SIGTERM/SIGINT
 calls `engine.stop()` (`engine.ts:684` — drains the queue, flushes state)
 then exits 0; a second signal within 30 s forces exit 1.
 
 ## 7. Deployment
 
+The committed artifacts are the contract — `Dockerfile`, `compose.yml`,
+`headless/docker-entrypoint.sh` and `scripts/backup-daemon-state.sh`
+(security review P1-8: until these exist, user ids, memory limits and the
+healthcheck are unverified claims). `headless/tests/deploy.test.ts` lints
+their key properties on every CI run.
+
 ```dockerfile
 FROM node:24-slim
-COPY headless/dist/pss-daemon /usr/local/bin/pss-daemon
+COPY --chmod=755 headless/dist/pss-daemon.cjs /usr/local/bin/pss-daemon
+COPY --chmod=755 headless/docker-entrypoint.sh /usr/local/bin/pss-daemon-entrypoint
 USER 65532:65532
-ENTRYPOINT ["pss-daemon", "watch"]
+ENTRYPOINT ["pss-daemon-entrypoint"]
+CMD ["watch"]
 ```
+
+Build context is the repo root (`docker build -t pss-daemon .` after
+`npm --workspace headless run build`). The final image has no build tools —
+it copies the prebuilt bundle; the root filesystem can be mounted read-only
+(`read_only: true` + a 64 MB `/tmp` tmpfs in compose.yml). First start as
+uid 65532 against root-owned Synology mounts fails closed (lock creation
+throws before any pass); fix once over SSH as admin —
+`chown -R 65532:65532` on both the vault and the data-dir hosts — or
+override `user:` so one uid owns both mounts.
 
 ```yaml
 services:
   pss-daemon:
     build: .
+    user: "65532:65532"
     command: ["watch"]
     volumes:
       - /volume1/vault:/vault:rw
-      - pss-data:/data/pss-daemon:rw
+      - pss-data:/data:rw
     environment:
       PSS_CONFIG: /data/pss-daemon/daemon.json
-      PSS_KEY_FILE: /run/secrets/pss_key
+      PSS_KEY_FILE: /run/secrets/pss_key   # value never in env, only the path
     secrets: [pss_key]
     mem_limit: 768m
     cpus: 1.0
-    restart: unless-stopped
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    restart: "on-failure:5"   # bounded; exits 4/5/6 are held to a clean stop
     healthcheck:
-      test: ["CMD", "pss-daemon", "status"]
-      interval: 60s  # checks status.json freshness, not just process liveness
+      test: ["CMD", "pss-daemon", "status"]  # freshness, not just liveness
+      interval: 60s
+      start_period: 15m  # covers the 134 MB reference first sync
 ```
 
-A systemd unit is the same shape (`ExecStart=... watch`,
-`EnvironmentFile`, `Restart=on-failure`, no restart on exit 4). Volume
-layout: vault mounted at the configured `vaultPath`; the data dir persists
-`daemon.json`, `session.bin`, `sync-state.json`, `status.json` and the cache.
-Resource limits: 1 CPU / 768 MB is ample — transfers are block-chunked and the
-full sync is stat-bound; raise `transferConcurrency` only if Proton
-rate-limits stay quiet. Verification: `pss-daemon verify` re-hashes both
+Restart policy (correctness review P2-12, security review P1-5): `restart`
+is `on-failure` with an explicit bound — never `unless-stopped`/`always`,
+which would hot-loop exits 4 (revoked session, needs a human re-login) and
+6 (torn state, needs a restore) and even 0. The entrypoint wrapper maps
+4/5/6 to a logged clean stop; everything else restarts up to 5 times, then
+the container stays stopped and a human runs `docker compose up -d`
+after reading the logs. A systemd unit is the same shape
+(`ExecStart=... watch`, `EnvironmentFile`, `Restart=on-failure`, no restart
+on exits 4/5/6).
+Volume layout: vault mounted at the configured `vaultPath`; the data dir
+persists `daemon.json`, `session.bin`, `sync-state.json`, `status.json` and
+the cache, and must be host-local — never share one data dir between hosts
+(temp names are pid-only, `device-id` is last-writer-wins). Resource limits:
+1 CPU / 768 MB is ample — transfers are block-chunked and the full sync is
+stat-bound; raise `transferConcurrency` only if Proton rate-limits stay
+quiet. Verification: `pss-daemon verify` re-hashes both
 sides against state records (`ContentStamp`, `types.ts:2`) and reports
 divergence; a byte-level check is `find /vault -type f | sort | xargs sha1sum`
 compared before cutover and after. The nightly tar backup coexists by reading
-only: it must include the vault but exclude nothing the daemon needs; torn
-state copies self-heal via `.bak` (`state.ts:75-81`), and scheduling the tar
-right after `once` (or reading `status.json:idle`) avoids catching a partial
-pass. Never back up `session.bin` off the NAS.
+only: it must include the vault AND the data dir (`sync-state.json` is the
+merge base — losing it forces a re-baseline that resurrects deletes) but
+exclude `session.bin` and `drive-cache.bin` (never back up secrets), and it
+must refuse while `status.json` says a pass is in flight — see
+`scripts/backup-daemon-state.sh` and the §9 runbook. Torn
+copies self-heal via `.bak` (`state.ts:75-81`).
 
 ## 8. Phased implementation plan
 
@@ -297,14 +361,102 @@ daemon never deletes without an explicit approval, so the worst case is
 re-uploads. Keep the last Obsidian Sync snapshot until `verify` is clean for
 seven days.
 
-## 10. Open questions
+### Restore and rollback runbook (test-plan gate 9)
 
-1. Does Proton tolerate a long-lived third-party session polling every 30 s
-   from a datacenter-adjacent IP, or should the default interval be higher?
-2. Should the Drive metadata cache be skipped entirely on the NAS (MemoryCache
-   only) to reduce encrypted-at-rest surface, at the cost of slower starts?
-3. Who holds the encryption key on a Synology — DSM key manager, a USB-stored
-   file, or interactive entry at container start?
+Backups: `scripts/backup-daemon-state.sh` runs nightly (03:00) and archives
+the vault plus the data dir while excluding `session.bin`, `drive-cache.bin`,
+locks and tmp debris; it refuses while `status.json` reports `syncing`
+unless `--allow-active`, verifies with `tar -t`, asserts no secret file is
+inside, and keeps the newest `PSS_BACKUP_KEEP` (default 7) archives.
+
+Restore (vault corruption, bad sync, or exit 6 state-lost):
+
+1. `docker compose stop pss-daemon` (locks released; nothing may write).
+2. Pick the newest pre-incident archive; prove it first:
+   `tar -tzf <archive> | grep -E 'session\.bin|drive-cache\.bin'` must print
+   nothing, then extract to scratch and `diff -r` against live to see exactly
+   what the restore will change.
+3. Restore over the live paths (vault + data dir), then
+   `chown -R 65532:65532` both mounts and `chmod 700` the data dir.
+4. `docker compose up -d pss-daemon`; prove service is back:
+   `docker compose ps` healthy, `pss-daemon status` exit 0 with a fresh
+   `updatedAt`, then `pss-daemon verify` clean and a `sha1sum` walk matching
+   the restored tree. A first-sync `--pairing` flag in `daemon.json` left
+   over from provisioning must NOT auto-resolve the gate after a data-dir
+   loss — confirm the pairing decision is fresh before any `once`.
+
+Rollback (abandon the daemon, keep the data): stop the daemon, re-enable the
+official Obsidian Sync headless client on the same vault; Drive keeps every
+revision, and the daemon never deleted without an explicit approval, so the
+worst case is re-uploads.
+
+Timed drill (rehearse before cutover, log the output as gate-9 evidence):
+seed a bad sync on the pilot vault (e.g. delete 30 tracked files remotely so
+the hold fires, then approve — a deliberate wrong decision), run steps 1–4
+above against the pilot from the last nightly archive, and confirm `verify`
+clean plus `status` fresh. Budget: ≤30 min from this runbook alone, no
+outside help; record the wall-clock time, the archive name, the pre/post
+`sha1sum` walks, and the `verify` output in the drill log.
+
+## 10. Open questions (status after both reviews)
+
+1. Does Proton tolerate a long-lived third-party session polling every
+   60 s (default; floor `MIN_POLL_SECONDS` = 30) from a datacenter-adjacent
+   IP? Default raised 30 → 60; watch 429s in the soak before lowering.
+2. Answered: `metadataCache: 'file' | 'memory'` (default `file`) — encrypted
+   node cache persisted between starts vs slower starts with less
+   encrypted-at-rest surface. Must be honoured, not advisory (§6).
+3. Answered in SECURITY.md (headless section): key file as a Docker secret,
+   mode `0600`, backed up off the NAS separately; rotation is sign-out +
+   fresh login, never silent overwrite.
+
+## 11. Known limitations (from both adversarial reviews)
+
+Engine-stream fixes land in `headless/src` / `src`; ops/doc-stream fixes are
+this document's artifacts. Until each item below is closed, it is a
+documented constraint, not a silent behaviour:
+
+- Symlinks are followed out of the vault (adapter, watcher and `VaultIO`
+  all `stat` through links; `staysInVault` is string-based). An outside
+  directory linked into the vault is uploaded under vault names, and a
+  download over a file symlink replaces the link. Rule: no symlinks in the
+  synced tree; the fix is `lstat` everywhere + refuse-or-skip with a test.
+- `EACCES`/`EPERM` currently reads as "file gone": a `chmod 000` subtree
+  silently drops from the local view and reconcile can return
+  `delete-remote` under the mass-delete threshold with no hold. The daemon
+  must rethrow non-`ENOENT` from `stat`/`exists`/`list` (or pre-pass walk
+  every tracked path) — until then, verify mount/ACL health out of band.
+- Watch-mode heartbeat rewrites `updatedAt` unconditionally, so a wedged
+  engine still passes the `status` freshness check. Fix: bump only when the
+  summary advanced, else emit `stalled` after 2× the poll interval.
+- `once` interrupted by SIGTERM exits 0 ("in sync" is then a lie); it must
+  return a distinct non-zero so wrappers can tell "synced" from "stopped
+  mid-pass". Watch-mode SIGTERM → 0 is correct.
+- No directory fsync after rename in either adapter: a crash between rename
+  and directory durability can lose a file the state calls synced (next pass
+  reads local-missing → `delete-remote`). Fix: fsync the directory fd.
+- `verify` hashes whole files with one `readFile` — a 300 MB skipped-large
+  file is fully buffered; stream the hash.
+- Key material lives in a `Buffer` for the process lifetime, never zeroed.
+- `DataDirAdapter.write` skips fsync-before-rename; `runLogin --pairing`
+  rewrites `daemon.json` non-atomically (use tmp+rename); `logFile` is in
+  `DaemonPaths` but never written (wire it or delete it before any backup
+  script trusts it).
+- Boot-time `ConfigError` (missing key file, read-only mount) currently
+  surfaces as exit 1, not 7 — the runbook keys off 7, so name read-only
+  mounts in the message when mapping `runCommand`/`runDaemon` codes.
+- `--pairing` is silently dropped by approve/deny, and a stale `pairing` in
+  `daemon.json` auto-resolves the first-sync gate after a data-dir loss.
+  Warn when the gate is satisfied by a non-fresh config value, and pass
+  `--pairing` through to `runMassDecision`.
+- The watcher walks and `fs.watch`es excluded trees (`.git/`, `.trash/`,
+  `.obsidian/`); prune `ALWAYS_EXCLUDED` + config/plugin dirs, or one
+  inotify-exhausted directory silently degrades to warn-only.
+- Rename pairing can misfire on inode reuse inside the 1000 ms window, and
+  rescan pairing is first-wins — self-heals via content hash, but spurious
+  Drive node moves are possible.
+- Exit 6 (`StateLost`) and the data dir are host-local: never share one data
+  dir between machines, and never restart on 6 without a human + backup.
 
 Refuse to ship without: `verify` clean on the 134 MB reference vault;
 kill -9 mid-sync followed by a clean start with no `wasLost()` surprise;

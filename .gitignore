@@ -6,3 +6,6 @@ main.js.map
 
 # headless daemon build output
 headless/dist/
+
+# daemon key material (compose secret source) — never commit
+pss_key.bin
