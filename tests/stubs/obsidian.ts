@@ -50,13 +50,22 @@ export function setIcon(): void {}
 export function setTooltip(): void {}
 
 /**
- * The tests run under Node, which is what a desktop app has too, so the stub
- * reports desktop. Mutable so a test can pretend to be mobile.
+ * The tests run under Node, which is what a headless Linux daemon has too,
+ * so the stub reports a Linux desktop. Mutable so a test can pretend to be
+ * mobile. Every field of the real `Platform` is present: engine code reads
+ * `isWin` (path rules) and headless code must not find it undefined.
  */
 export const Platform = {
-    isDesktopApp: true,
+    isDesktop: true,
     isMobile: false,
+    isDesktopApp: true,
+    isMobileApp: false,
     isIosApp: false,
     isAndroidApp: false,
+    isPhone: false,
     isTablet: false,
+    isMacOS: false,
+    isWin: false,
+    isLinux: true,
+    isSafari: false,
 };
