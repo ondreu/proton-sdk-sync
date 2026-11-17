@@ -184,7 +184,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     remoteFolderPath: null,
     remoteFolderSharedBy: null,
 
-    conflictPolicy: 'keep-both',
+    conflictPolicy: 'merge',
     keepConflictCopies: true,
 
     paused: false,

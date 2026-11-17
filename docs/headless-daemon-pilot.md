@@ -25,7 +25,7 @@ paused for the copy only).
   "vaultPath": "/volume1/obsidian-pilot/vault",
   "dataDir": "/volume1/docker/pss-daemon-pilot",
   "remoteFolderUid": "<canary uid>",
-  "conflictPolicy": "keep-both",
+  "conflictPolicy": "merge",
   "remotePollSeconds": 60,
   "logLevel": "info"
 }

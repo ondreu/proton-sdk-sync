@@ -15,7 +15,7 @@ Non-goals are at the bottom. Line references are against this repo.
 | 2 | Package layout | New npm workspace `headless/` with its own esbuild node build importing `../src`; plugin build untouched (section 2). |
 | 3 | Auth | Device/web flow (`ProtonSession.beginWebSignIn`), session in a `SecretSlot` encrypted with a key from the environment, file `0600` (section 3). |
 | 4 | State | Per-device files in the daemon data dir, same `StateFile` v1 format as the plugin; GUI state is imported once by copy, never shared live (section 4). |
-| 5 | Unattended policy | Default `keep-both`; `manual` is refused. Mass delete is held and never auto-approved (section 5). |
+| 5 | Unattended policy | Default `merge` (line-level, keep-both only for truly overlapping edits); `manual` is refused. Mass delete is held and never auto-approved (section 5). |
 | 6 | New dependencies | None. Only Node 24 builtins plus the existing `drive-sdk`/`crypto` (section 2). |
 
 ## 1. Running the engine unchanged
@@ -161,8 +161,8 @@ truncate-in-place), so concurrent starters see whole files only, and
 Conflict resolution without a human: the daemon accepts every
 `ConflictPolicy` (`types.ts:113`) except `manual`, which records a conflict
 and waits for a user who will never come — config validation rejects it at
-startup and suggests `keep-both`. Default is `keep-both` (the plugin default,
-`settings.ts:186`); `merge` falls back to `keep-both` on unmergeable files by
+startup and suggests `merge`. Default is `merge` (the plugin default too,
+`settings.ts:187`); it falls back to `keep-both` on unmergeable files by
 construction. Every outcome is already reported through
 `onConflict`/`ConflictEvent` (`types.ts:209`), which the daemon logs as JSON
 with both paths.
@@ -213,7 +213,7 @@ type DaemonConfig = {
     configDir: string;            // default ".obsidian"
     dataDir: string;              // default "/data/pss-daemon"
     remoteFolderUid: string | null;
-    conflictPolicy: ConflictPolicy; // default "keep-both"; "manual" rejected
+    conflictPolicy: ConflictPolicy; // default "merge"; "manual" rejected
     massDeleteThreshold: number;  // default 25, from DEFAULT_SETTINGS
     remotePollSeconds: number;    // default 60; floor MIN_POLL_SECONDS (settings.ts:216)
     transferConcurrency: number;  // default 3
