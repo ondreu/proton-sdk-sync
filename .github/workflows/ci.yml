@@ -7,6 +7,9 @@ on:
   pull_request:
     branches:
       - main
+  # Weekly pre-release SDK drift check (the sdk-drift job runs only here).
+  schedule:
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -100,3 +103,94 @@ jobs:
             echo "main.js requires a Node built-in at load time; it would fail on mobile." >&2
             exit 1
           fi
+
+  headless:
+    name: Headless daemon
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check the daemon
+        run: npm --workspace headless run check-types
+
+      - name: Run the daemon tests
+        run: npm --workspace headless test
+
+      - name: Build the daemon bundle
+        run: npm --workspace headless run build
+
+      # The daemon shares src/sync and src/proton with the plugin; the plugin
+      # suite proves the engine is still shared, not forked.
+      - name: Run the plugin tests against the shared engine
+        run: npm test
+
+      - name: Lint the deployment artifacts
+        run: |
+          bash -n scripts/backup-daemon-state.sh
+          bash -n headless/docker-entrypoint.sh
+
+      - name: Drill the backup script against scratch dirs
+        run: |
+          T="$(mktemp -d)"
+          mkdir -p "$T/vault" "$T/data" "$T/backups"
+          echo note > "$T/vault/note.md"
+          echo SECRET > "$T/data/session.bin"
+          echo CACHE > "$T/data/drive-cache.bin"
+          echo '{}' > "$T/data/sync-state.json"
+          printf '{"updatedAt":"%s","state":"idle"}' "$(date -u +%FT%TZ)" > "$T/data/status.json"
+          PSS_VAULT="$T/vault" PSS_DATA_DIR="$T/data" PSS_BACKUP_DIR="$T/backups" PSS_BACKUP_KEEP=2 \
+            scripts/backup-daemon-state.sh
+          test -n "$(ls "$T/backups"/pss-backup-*.tar.gz)"
+          tar -tzf "$T/backups"/pss-backup-*.tar.gz | grep -E 'session\.bin|drive-cache\.bin' && { echo "secret leaked into backup" >&2; exit 1; }
+          printf '{"state":"syncing"}' > "$T/data/status.json"
+          if PSS_VAULT="$T/vault" PSS_DATA_DIR="$T/data" PSS_BACKUP_DIR="$T/backups" scripts/backup-daemon-state.sh; then
+            echo "backup ran mid-pass without --allow-active" >&2
+            exit 1
+          fi
+          rm -rf "$T"
+
+      - name: Build the container image
+        run: docker build -t pss-daemon:ci .
+
+  sdk-drift:
+    name: SDK drift (latest, weekly)
+    # Pre-release SDK check from the test plan (#18): install the latest SDK
+    # over the pins and run both suites. Red here means upstream moved under
+    # us — file an incompatibility, never bump the pins to silence it.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the latest SDK over the pins (no-save, check only)
+        run: |
+          npm install --no-save @protontech/drive-sdk@latest
+          npm ls @protontech/drive-sdk @protontech/crypto
+
+      - name: Run the daemon tests against the latest SDK
+        run: npm --workspace headless test
+
+      - name: Run the plugin tests against the latest SDK
+        run: npm test

@@ -215,8 +215,16 @@ export class CaseClashes {
      * On every device, rename on Drive every name in the tree not spelled as
      * the vault spells names (see `vaultSpelling`), folders first so their
      * files move with them. A sync record under the old spelling is forgotten
-     * first: the vault only has the other spelling, which may be another file
-     * altogether, and following the rename would move that one.
+     * first on a vault that spells every name the one way (Obsidian, which
+     * normalises to NFC): the vault only has the other spelling, which may be
+     * another file altogether, and following the rename would move that one.
+     *
+     * A vault that keeps spellings apart (Linux ext4 holds NFD and NFC as two
+     * files, and the headless daemon reads the disk raw) distinctly holds the
+     * old spelling: there the local file is the renamed node itself, so it
+     * follows the rename instead. Otherwise it uploads again under its old
+     * name on every pass, growing a numbered "(name conflict)" copy per pass,
+     * forever.
      */
     private async settleSpellings(tree: RemoteTree, local: { files: string[]; folders: string[] }): Promise<void> {
         const taken = this.claimants([...local.folders, ...local.files, ...tree.folders.keys(), ...tree.files.keys()]);
@@ -230,24 +238,35 @@ export class CaseClashes {
                 continue;
             }
             // The record of a name under the old spelling cannot be followed to
+            // the new one where the vault cannot hold this spelling apart from
             // the new one: the vault may hold a different file there. It is
             // dropped only for as long as the rename takes, and put back if the
             // rename does not happen — otherwise the file would go up again as
             // a second copy, unrecorded.
             const forgotten = this.host.state.entries().filter((entry) => isWithin(entry.path, path));
+            const followsLocally = await this.holdsSpellingApart(path);
             try {
-                for (const record of forgotten) {
-                    this.host.state.delete(record.path);
+                if (!followsLocally) {
+                    for (const record of forgotten) {
+                        this.host.state.delete(record.path);
+                    }
                 }
                 const renamed = await this.renameForSpelling(uid, path, isFolder, taken);
                 if (renamed === null) {
-                    this.restoreRecords(forgotten);
+                    if (!followsLocally) {
+                        this.restoreRecords(forgotten);
+                    }
                     continue;
                 }
                 renameInTree(tree, path, renamed);
                 moved.push([path, renamed]);
+                if (followsLocally) {
+                    await this.followSpellingLocally(path, renamed, isFolder);
+                }
             } catch (error) {
-                this.restoreRecords(forgotten);
+                if (!followsLocally) {
+                    this.restoreRecords(forgotten);
+                }
                 this.fail(path, error, 'Could not settle the spelling of');
             }
         }
@@ -295,6 +314,49 @@ export class CaseClashes {
     private restoreRecords(records: SyncRecord[]): void {
         for (const record of records) {
             this.host.state.set(record);
+        }
+    }
+
+    /**
+     * Whether the vault holds `path` as a name of its own, apart from its
+     * vault spelling: on a filesystem that keeps NFD and NFC apart the exact
+     * listing holds the decomposed name, while on a vault that normalises
+     * (Obsidian, and the MemoryVault the unit tests drive) the listing only
+     * ever holds the composed one. A vault that cannot be asked reads as
+     * normalising, which keeps the old behaviour.
+     */
+    private async holdsSpellingApart(path: string): Promise<boolean> {
+        try {
+            return await this.host.vault.existsExactly(path);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Bring the vault file the spelling settlement renamed on Drive in line
+     * with its node, the way a rename made on another device is followed.
+     * The destination was free when the settlement picked it; where something
+     * has appeared there since, the old behaviour (records dropped, both
+     * copies survive) wins over replacing a file that may be another note.
+     */
+    private async followSpellingLocally(from: string, to: string, isFolder: boolean): Promise<void> {
+        if ((await this.host.vault.exists(to)) || this.host.state.get(to) !== undefined) {
+            for (const record of this.host.state.entries().filter((entry) => isWithin(entry.path, from))) {
+                this.host.state.delete(record.path);
+            }
+            this.host.logger.warn(
+                `"${from}" was settled to "${to}" on Drive, but "${to}" is taken here; keeping both`,
+            );
+            return;
+        }
+        if (await this.host.vault.exists(from)) {
+            await this.host.vault.rename(from, to);
+        }
+        if (isFolder) {
+            this.host.state.renameFolder(from, to);
+        } else {
+            this.host.state.rename(from, to);
         }
     }
 

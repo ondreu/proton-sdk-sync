@@ -3,3 +3,9 @@ main.js
 main.js.map
 *.tsbuildinfo
 .DS_Store
+
+# headless daemon build output
+headless/dist/
+
+# daemon key material (compose secret source) — never commit
+pss_key.bin

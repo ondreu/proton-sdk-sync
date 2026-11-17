@@ -1,9 +1,9 @@
 {
     "id": "proton-sdk-sync",
     "name": "Proton-SDK-Sync",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "minAppVersion": "1.13.7",
-    "description": "Two-way, end-to-end encrypted sync between your vault and Proton Drive, built on Proton's official Drive SDK.",
+    "description": "End-to-end encrypted two-way sync between an Obsidian vault and Proton Drive, with three-way conflict detection. Includes a headless daemon for Linux servers.",
     "author": "ondreu",
     "authorUrl": "https://github.com/ondreu",
     "isDesktopOnly": false

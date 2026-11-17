@@ -4,6 +4,34 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
+## [1.1.0] — 2026-11-17
+
+### Added
+
+- **Headless daemon** (`headless/`): the same engine runs on a Linux server,
+  without Obsidian. `login`/`status`/`once`/`watch`/`verify`, a Dockerfile and
+  compose file, one-process-per-vault locks, redacted logs, encrypted session at
+  rest. See the README section and `docs/headless-daemon.md`.
+- `resolve-folder` command, which also creates the sync folder with the SDK's
+  own ids (a folder made by the Proton CLI cannot be read by this SDK).
+
+### Changed
+
+- **Merge is the default conflict policy.** Concurrent edits of a note are
+  combined line by line; a conflict copy appears only when both sides changed
+  the same lines, and `keep-both` remains available in settings. In the
+  headless daemon the default is the same.
+
+### Fixed
+
+- Sign-in no longer fails with "Destination file already exists!" on a device
+  that already holds a session file (shipped as 1.0.1).
+- `verify` compares the tree the engine actually syncs: `.git` is not reported
+  as untracked, and the device registry files are not reported as remote
+  divergence.
+- The headless daemon no longer reports a stall while it is idle with nothing
+  queued.
+
 ## [1.0.0]
 
 First release under the new name. The plugin id changes to `proton-sdk-sync`, so

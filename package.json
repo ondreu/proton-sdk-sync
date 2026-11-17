@@ -1,9 +1,12 @@
 {
     "name": "proton-sdk-sync",
-    "version": "1.0.1",
-    "description": "Two-way, end-to-end encrypted sync between an Obsidian vault and Proton Drive, built on the official Proton Drive SDK.",
+    "version": "1.1.0",
+    "description": "End-to-end encrypted two-way sync between an Obsidian vault and Proton Drive, with three-way conflict detection. Includes a headless daemon for Linux servers.",
     "main": "main.js",
     "private": true,
+    "workspaces": [
+        "headless"
+    ],
     "license": "GPL-3.0-or-later",
     "scripts": {
         "dev": "node esbuild.config.mjs",
@@ -14,8 +17,8 @@
         "check:manifest": "node scripts/check-manifest.mjs"
     },
     "dependencies": {
-        "@protontech/crypto": "^2.2.0",
-        "@protontech/drive-sdk": "^0.23.0",
+        "@protontech/crypto": "2.2.0",
+        "@protontech/drive-sdk": "0.23.0",
         "core-js": "^3.51.0"
     },
     "devDependencies": {
