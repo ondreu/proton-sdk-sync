@@ -6,6 +6,15 @@ Entries here describe this fork.
 
 ## [Unreleased]
 
+### Added
+
+- **Headless daemon** (`headless/`): the same engine runs on a Linux server,
+  without Obsidian. `login`/`status`/`once`/`watch`/`verify`, a Dockerfile and
+  compose file, one-process-per-vault locks, redacted logs, encrypted session at
+  rest. See the README section and `docs/headless-daemon.md`.
+- `resolve-folder` command, which also creates the sync folder with the SDK's
+  own ids (a folder made by the Proton CLI cannot be read by this SDK).
+
 ### Changed
 
 - **Merge is the default conflict policy.** Concurrent edits of a note are

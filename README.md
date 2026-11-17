@@ -59,6 +59,45 @@ a conflict fix is fixed once, for both the plugin and the daemon.
   folder, so you can see what else syncs this vault and ask another device to
   re-check or to hand over a folder.
 
+## Headless daemon (Linux server)
+
+The same sync engine runs without Obsidian, so a vault can stay in sync on a
+NAS or any Linux box — no desktop running, and no Obsidian Sync. This is part
+of this fork; upstream has no such mode.
+
+```sh
+npm --workspace headless run build        # -> headless/dist/pss-daemon.cjs
+PSS_CONFIG=/data/pss-daemon/daemon.json \
+PSS_KEY_FILE=/data/pss-daemon/key \
+  node headless/dist/pss-daemon.cjs login   # prints a Proton approval URL
+```
+
+Commands: `login`, `status`, `once`, `watch`, `verify`,
+`approve-mass-delete`, `deny-mass-delete`, `sign-out`, `resolve-folder`.
+
+It behaves like the plugin, not like a backup script: three-way state, the same
+conflict policy and exclusions, renames kept as renames. Safety is the same
+too — a large batch of deletions is held for an explicit decision, there is one
+process per vault (a lock in the data dir *and* in the vault), logs and
+`status.json` redact note names unless `--show-names` is given, and the session
+is stored encrypted with the key from `PSS_KEY_FILE` (0600). Sign-in is a
+device flow; the password never touches the server. `metadataCache` is `memory`
+by default: a persisted node cache is only as fresh as the last event feed the
+process consumed, and a `once` pass does not drain events first.
+
+Deployment: `Dockerfile` and `compose.yml` at the repo root (non-root, health
+check with a start period, log rotation, restart policy that does not hot-loop
+the exits that need a human). Provision the sync folder with
+`resolve-folder <path> --create` — a folder created by the Proton CLI has an id
+this SDK cannot read. Runbook: [docs/headless-daemon-pilot.md](docs/headless-daemon-pilot.md);
+design and reviews in [docs/headless-daemon.md](docs/headless-daemon.md),
+[docs/review-correctness.md](docs/review-correctness.md) and
+[docs/review-security-ops.md](docs/review-security-ops.md).
+
+Tests: `npm --workspace headless test` (unit), `... run test:integration`
+(20 fake-Drive scenarios), `... run chaos -- --minutes 10 --seed 11` (token
+coverage over concurrent writers).
+
 ## Requirements
 
 - A **Proton account** with Drive. The plugin signs in through Proton's web
