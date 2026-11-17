@@ -12,8 +12,8 @@ import { SignInModal } from './signInModal';
 import { getRuntime } from '../runtime';
 
 export const CONFLICT_POLICIES: Record<ConflictPolicy, string> = {
-    'keep-both': 'Keep both versions (recommended)',
-    merge: 'Merge the changes, keep both if they overlap',
+    'keep-both': 'Keep both versions',
+    merge: 'Merge the changes, keep both if they overlap (recommended)',
     'prefer-newest': 'Keep whichever was edited last',
     'prefer-local': 'Keep this device’s version',
     'prefer-remote': 'Keep the Drive version',
@@ -489,8 +489,12 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     private exportGroup(): SettingDefinitionItem {
         return {
             type: 'group',
-            heading: 'PDF export',
+            heading: 'PDF export and sharing',
             items: [
+                {
+                    name: 'How sharing works',
+                    desc: 'Exporting a note renders it to PDF in the export folder below and gives that PDF a public, view-only link with the expiry you pick in the dialog. The link can be copied from the result dialog or later under “Manage shared files”. When the link expires, the PDF is moved to the trash and the link is removed. Files you share directly (images, PDFs and other attachments) keep their bytes: only the link expires, and deleting the file removes its link.',
+                },
                 {
                     name: 'Export folder',
                     desc: 'Exported PDFs are written here. Changing it leaves earlier exports where they are.',
@@ -511,9 +515,15 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                 },
                 {
                     name: 'Delete expired exports',
-                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched. Use the command “Manage shared PDFs” to stop sharing one early.',
+                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched.',
                     aliases: ['cleanup', 'pdf'],
                     control: { type: 'toggle', key: 'autoDeleteExpiredExports' },
+                },
+                {
+                    name: 'Manage shared files',
+                    desc: 'See every PDF export and shared attachment with its link and expiry; copy a link, stop sharing, or delete an export early.',
+                    aliases: ['links', 'sharing', 'pdf'],
+                    action: () => this.plugin.openSharedPdfsModal(),
                 },
             ],
         };

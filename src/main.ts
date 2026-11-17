@@ -53,6 +53,7 @@ import {
     resolveExportPath,
     sanitizeExportedShares,
     sanitizeExportHtml,
+    selectExpiredShares,
     selectJanitorDeletions,
     shareExpiration,
     upsertExportedShare,
@@ -163,6 +164,23 @@ function pdfWebviewReady(webview: PdfWebview): Promise<void> {
 
 
 
+
+/** Reject instead of waiting forever on an Electron/SDK call that never settles. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error(message)), ms);
+        promise.then(
+            (value) => {
+                window.clearTimeout(timer);
+                resolve(value);
+            },
+            (error: unknown) => {
+                window.clearTimeout(timer);
+                reject(error instanceof Error ? error : new Error(String(error)));
+            },
+        );
+    });
+}
 
 export default class ProtonDriveSyncPlugin extends Plugin {
     // Obsidian declares `settings?: unknown` on Plugin; this narrows it.
@@ -1378,6 +1396,29 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             callback: () => this.openSharedPdfsModal(),
         });
 
+        // A file deleted by hand takes its link with it; do not wait for expiry.
+        this.registerEvent(
+            this.app.vault.on('delete', (file) => {
+                void this.forgetDeletedShare(file.path);
+            }),
+        );
+
+        this.addCommand({
+            id: 'share-file',
+            icon: 'share',
+            name: 'Share file with a Proton link',
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.extension === 'md' || !this.isConfigured() || this.locked) {
+                    return false;
+                }
+                if (!checking) {
+                    this.openShareFileModal(file);
+                }
+                return true;
+            },
+        });
+
         // The same export from a note's context menu.
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
@@ -1394,6 +1435,18 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                             .setTitle('Export note to PDF and share')
                             .setIcon('link')
                             .onClick(() => this.openExportModal(file)),
+                    );
+                } else if (
+                    file instanceof TFile &&
+                    file.extension !== 'md' &&
+                    this.isConfigured() &&
+                    !this.locked
+                ) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle('Share file with a Proton link')
+                            .setIcon('share')
+                            .onClick(() => this.openShareFileModal(file)),
                     );
                 }
             }),
@@ -1493,6 +1546,108 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
+    /** Share any vault file (an image, a PDF, a zip) with a view-only link. */
+    openShareFileModal(file: TFile): void {
+        new ExportPdfModal(this.app, {
+            noteName: file.name,
+            defaultDays: this.settings.shareExpiryDays,
+            title: 'Share file with a link',
+            intro: `“${file.name}” will get a view-only public link. The file stays in the vault and on Drive; only the link expires.`,
+            confirmText: 'Create link',
+            onConfirm: (days) => void this.shareFileWithLink(file.path, days),
+        }).open();
+    }
+
+    async shareFileWithLink(sourcePath: string, expiryDays: number | null): Promise<void> {
+        const file = this.app.vault.getAbstractFileByPath(sourcePath);
+        if (!(file instanceof TFile)) {
+            new Notice('That file is not in the vault any more.');
+            return;
+        }
+        if (!this.isConfigured() || this.locked || !runtime.engine.isConnected()) {
+            new Notice('Sign in and wait for the sync to connect before sharing.');
+            return;
+        }
+        try {
+            new Notice('Waiting for the file to reach Drive…');
+            const nodeUid = await this.waitForExportNodeUid(sourcePath);
+            const expiration = shareExpiration(expiryDays === null ? 0 : expiryDays);
+            new Notice('Creating the share link…');
+            const link = await withTimeout(
+                runtime.engine.createNoteShareLink(sourcePath, expiration ? { expiration } : {}),
+                30000,
+                'creating the share link timed out',
+            );
+            if (link.hasPassword) {
+                new Notice('That file already has a password-protected link; remove the password on Drive first.');
+                return;
+            }
+            this.settings.exportedShares = upsertExportedShare(
+                this.settings.exportedShares,
+                buildExportedShare(sourcePath, link, runtime.engine.nodeUidFor(sourcePath) ?? nodeUid, 'attachment'),
+            );
+            await this.saveSettings();
+            new ShareLinkModal(this.app, {
+                url: link.url,
+                filePath: sourcePath,
+                expiresAt: link.expiration?.getTime() ?? null,
+            }).open();
+        } catch (error) {
+            new Notice(`Could not share this file: ${errorMessage(error)}`);
+        }
+    }
+
+    /** Drop the registry entry (and best-effort link) when its file is deleted. */
+    private async forgetDeletedShare(path: string): Promise<void> {
+        const entry = this.settings.exportedShares.find((item) => item.path === path);
+        if (entry === undefined) {
+            return;
+        }
+        try {
+            await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+        } catch {
+            // The node is gone on Drive too, so the link is dead either way.
+        }
+        this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+        try {
+            await this.saveSettings();
+        } catch (error) {
+            runtime.logger.warn('Could not save the registry after a file was deleted.', error);
+        }
+    }
+
+    /** At expiry an attachment keeps its bytes: only the link goes. */
+    private async expireAttachmentShares(): Promise<void> {
+        const now = Date.now();
+        const due = selectExpiredShares(sanitizeExportedShares(this.settings.exportedShares, () => undefined), now).filter(
+            (entry) => (entry.kind ?? 'export') === 'attachment',
+        );
+        if (due.length === 0) {
+            return;
+        }
+        const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
+        let changed = false;
+        for (const entry of due) {
+            if (connected) {
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                } catch (error) {
+                    runtime.logger.warn('Could not remove an expired attachment link; it is kept for the next run.', error);
+                    continue;
+                }
+            }
+            this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+            changed = true;
+        }
+        if (changed) {
+            try {
+                await this.saveSettings();
+            } catch (error) {
+                runtime.logger.warn('Could not save the registry after expiring attachment links.', error);
+            }
+        }
+    }
+
     async exportNoteToPdfAndShare(sourcePath?: string, expiryDays: number | null | undefined = undefined): Promise<void> {
         if (!Platform.isDesktop || !Platform.isDesktopApp) {
             new Notice('Exporting a note to PDF needs the desktop app.');
@@ -1511,6 +1666,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             return;
         }
         try {
+            new Notice('Rendering the note to PDF…');
             const markdown = await this.app.vault.read(file);
             const exportPath = resolveExportPath(
                 this.settings.exportFolder,
@@ -1526,7 +1682,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 new Notice(refusal);
                 return;
             }
-            const pdf = await this.renderNoteToPdf(file, markdown);
+            const pdf = await withTimeout(this.renderNoteToPdf(file, markdown), 45000, 'rendering the PDF timed out');
             const data = copyToArrayBuffer(pdf);
             const previous = this.app.vault.getAbstractFileByPath(exportPath);
             if (previous instanceof TFile) {
@@ -1534,6 +1690,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             } else {
                 await this.app.vault.createBinary(exportPath, data);
             }
+            new Notice('Uploading the PDF…');
             // The engine uploads the new PDF on its own; wait until its sync
             // record names the Drive node, then share exactly that node.
             let nodeUid: string;
@@ -1564,16 +1721,25 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             // settings instead of reusing a stale one. The returned access is
             // the link's actual state — the registry, the notice and the
             // clipboard all use it, never a computed date.
+            new Notice('Creating the share link…');
             let link: Awaited<ReturnType<typeof runtime.engine.createNoteShareLink>>;
             try {
-                link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+                link = await withTimeout(
+                    runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {}),
+                    30000,
+                    'creating the share link timed out',
+                );
             } catch (error) {
                 // A link created by the old Proton sharing model cannot be
                 // updated in place. Remove it and make one from scratch, once;
                 // if that fails too, report it rather than leaving a half state.
                 try {
                     await runtime.engine.removeNoteShareLink(exportPath);
-                    link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+                    link = await withTimeout(
+                        runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {}),
+                        30000,
+                        'creating the share link timed out',
+                    );
                 } catch {
                     new Notice(`Could not share the PDF: ${error instanceof Error ? error.message : String(error)}`);
                     return;
@@ -1598,7 +1764,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             const sharedUid = runtime.engine.nodeUidFor(exportPath) ?? nodeUid;
             this.settings.exportedShares = upsertExportedShare(
                 this.settings.exportedShares,
-                buildExportedShare(exportPath, link, sharedUid),
+                buildExportedShare(exportPath, link, sharedUid, 'export'),
             );
             try {
                 await this.saveSettings();
@@ -1719,6 +1885,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * to Drive, where the link dies with the file.
      */
     async runExportJanitor(): Promise<void> {
+        await this.expireAttachmentShares();
         if (!this.settings.autoDeleteExpiredExports) {
             return;
         }

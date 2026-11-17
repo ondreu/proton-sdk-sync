@@ -1,7 +1,24 @@
-import { App, Modal, Notice, Setting, TextComponent } from 'obsidian';
+import { App, Modal, Notice, Platform, Setting, TextComponent } from 'obsidian';
 import type { ExportedShare } from '../sync/pdfShare';
 
 const PRESETS = [7, 30, 90];
+
+/** Electron's clipboard works without a permission prompt; the web API does not always. */
+export function copyText(text: string): Promise<void> {
+    if (Platform.isDesktopApp) {
+        try {
+            const electron = (window as unknown as { require?: (module: string) => { clipboard?: { writeText: (value: string) => void } } })
+                .require?.('electron');
+            if (electron?.clipboard) {
+                electron.clipboard.writeText(text);
+                return Promise.resolve();
+            }
+        } catch {
+            // Fall through to the web API.
+        }
+    }
+    return navigator.clipboard.writeText(text);
+}
 
 /**
  * Ask for the link lifetime before doing any work, so the export cannot
@@ -20,6 +37,9 @@ export class ExportPdfModal extends Modal {
             noteName: string;
             defaultDays: number;
             onConfirm: (days: number | null) => void;
+            title?: string;
+            intro?: string;
+            confirmText?: string;
         },
     ) {
         super(app);
@@ -28,9 +48,11 @@ export class ExportPdfModal extends Modal {
 
     override onOpen(): void {
         const { contentEl } = this;
-        contentEl.createEl('h3', { text: 'Export to PDF and share' });
+        contentEl.createEl('h3', { text: this.options.title ?? 'Export to PDF and share' });
         contentEl.createEl('p', {
-            text: `“${this.options.noteName}” will be exported to the export folder and shared with a view-only link. The PDF is deleted when the link expires.`,
+            text:
+                this.options.intro ??
+                `“${this.options.noteName}” will be exported to the export folder and shared with a view-only link. The PDF is deleted when the link expires.`,
         });
 
         this.customRow = contentEl.createDiv();
@@ -80,7 +102,7 @@ export class ExportPdfModal extends Modal {
             )
             .addButton((button) =>
                 button
-                    .setButtonText('Export and share')
+                    .setButtonText(this.options.confirmText ?? 'Export and share')
                     .setCta()
                     .onClick(() => {
                         if (this.mode === 'custom') {
@@ -138,6 +160,12 @@ export class ShareLinkModal extends Modal {
         field.inputEl.readOnly = true;
         field.inputEl.addClass('proton-sdk-sync-share-link');
         field.inputEl.addEventListener('focus', () => field.inputEl.select());
+        field.inputEl.addEventListener('click', () => {
+            void copyText(this.options.url).then(
+                () => new Notice('Link copied.'),
+                () => new Notice('Could not copy; select the link and copy it manually.'),
+            );
+        });
 
         contentEl.createEl('p', {
             text:
@@ -149,7 +177,7 @@ export class ShareLinkModal extends Modal {
         new Setting(contentEl)
             .addButton((button) =>
                 button.setButtonText('Copy link').setCta().onClick(() => {
-                    void navigator.clipboard.writeText(this.options.url).then(
+                    void copyText(this.options.url).then(
                         () => new Notice('Link copied.'),
                         () => new Notice('Could not copy; select the link and copy it manually.'),
                     );
@@ -207,14 +235,15 @@ export class SharedPdfsModal extends Modal {
             return;
         }
         for (const entry of this.entries) {
-            const setting = new Setting(contentEl).setName(entry.path).setDesc(
-                entry.expiresAt === null
-                    ? 'Never expires'
-                    : `Expires ${new Date(entry.expiresAt).toLocaleString()}`,
-            );
+            const kind = entry.kind ?? 'export';
+            const expiry =
+                entry.expiresAt === null ? 'Never expires' : `Expires ${new Date(entry.expiresAt).toLocaleString()}`;
+            const setting = new Setting(contentEl)
+                .setName(entry.path)
+                .setDesc(kind === 'attachment' ? `Attachment · ${expiry}` : `PDF export · ${expiry}`);
             setting.addButton((button) =>
                 button.setButtonText('Copy link').onClick(() => {
-                    void navigator.clipboard.writeText(entry.url).then(
+                    void copyText(entry.url).then(
                         () => new Notice('Link copied.'),
                         () => new Notice('Could not copy the link.'),
                     );
@@ -225,14 +254,16 @@ export class SharedPdfsModal extends Modal {
                     void this.act(entry, this.options.onStopSharing);
                 }),
             );
-            setting.addButton((button) =>
-                button
-                    .setButtonText('Delete')
-                    .setDestructive()
-                    .onClick(() => {
-                        void this.act(entry, this.options.onDelete);
-                    }),
-            );
+            if (kind === 'export') {
+                setting.addButton((button) =>
+                    button
+                        .setButtonText('Delete')
+                        .setDestructive()
+                        .onClick(() => {
+                            void this.act(entry, this.options.onDelete);
+                        }),
+                );
+            }
         }
         new Setting(contentEl).addButton((button) =>
             button.setButtonText('Close').onClick(() => this.close()),

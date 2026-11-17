@@ -9,7 +9,9 @@ import type { ShareLink } from './drive';
 
 /** One exported PDF and the public link made for it, kept in the settings. */
 export type ExportedShare = {
-    /** Vault-relative path of the exported PDF. */
+    /** `export` is a PDF this plugin produced (deleted at expiry); `attachment` is a file the user shared and keeps. */
+    kind?: 'export' | 'attachment';
+    /** Vault-relative path of the shared file. */
     path: string;
     /** The public link made for it. */
     url: string;
@@ -133,8 +135,14 @@ export function shareExpiration(days: number, now: number = Date.now()): Date | 
  * `createNoteShareLink`, whose SDK updates an existing URL access in place,
  * so the returned access is the live link by construction.
  */
-export function buildExportedShare(path: string, link: ShareLink, nodeUid: string): ExportedShare {
+export function buildExportedShare(
+    path: string,
+    link: ShareLink,
+    nodeUid: string,
+    kind: 'export' | 'attachment' = 'export',
+): ExportedShare {
     return {
+        kind,
         path,
         url: link.url,
         expiresAt: link.expiration?.getTime() ?? null,
@@ -227,7 +235,9 @@ export function selectJanitorDeletions(
     now: number,
     exportFolder: string,
 ): ExportedShare[] {
-    return selectExpiredShares(shares, now).filter((share) => isExportPath(exportFolder, share.path));
+    return selectExpiredShares(shares, now).filter(
+        (share) => (share.kind ?? 'export') === 'export' && isExportPath(exportFolder, share.path),
+    );
 }
 
 /**
