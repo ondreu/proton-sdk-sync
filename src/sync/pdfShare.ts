@@ -373,15 +373,10 @@ export function buildPdfPrintScript(title: string, html: string): string {
         `document.body.innerHTML=${JSON.stringify(html)};` +
         `const style=document.createElement('style');style.textContent=${JSON.stringify(css)};` +
         `document.head.appendChild(style);` +
-        // Printing straight after the assignment captures an unpainted page
-        // (a blank PDF on a cold webview). Wait for fonts, images and two
-        // frames, then report how much text the page actually has so the
-        // caller can refuse to print an empty document.
-        `(async () => {` +
-        `  if (document.fonts && document.fonts.ready) { await document.fonts.ready; }` +
-        `  await Promise.all(Array.from(document.images).map((img) => img.complete ? Promise.resolve() : new Promise((resolve) => { img.addEventListener('load', resolve, { once: true }); img.addEventListener('error', resolve, { once: true }); })));` +
-        `  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));` +
-        `  return (document.body.innerText || '').trim().length;` +
-        `})()`
+        // Synchronous on purpose: this page is offscreen, where
+        // requestAnimationFrame never fires, so a promise waiting on a frame
+        // would hang until the caller's timeout. Readiness is polled from the
+        // caller instead.
+        `(document.body.innerText || '').trim().length`
     );
 }

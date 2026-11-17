@@ -173,6 +173,31 @@ function pdfWebviewReady(webview: PdfWebview): Promise<void> {
 
 
 
+/**
+ * Poll until the injected page has text and its images have settled. A fixed
+ * delay would be guesswork, and requestAnimationFrame never fires offscreen.
+ */
+async function waitForPdfPaint(webview: PdfWebview): Promise<void> {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+        const state = await withTimeout(
+            webview.executeJavaScript(
+                '({text: (document.body.innerText || "").length, images: Array.from(document.images).every((img) => img.complete)})',
+            ),
+            3000,
+            'the PDF page stopped responding',
+        );
+        const painted = state as { text?: unknown; images?: unknown } | null;
+        if (typeof painted?.text === 'number' && painted.text > 0 && painted.images === true) {
+            return;
+        }
+        if (Date.now() > deadline) {
+            throw new Error('the PDF page did not finish rendering');
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+    }
+}
+
 /** Reject instead of waiting forever on an Electron/SDK call that never settles. */
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -1859,6 +1884,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             if (typeof textLength !== 'number' || textLength === 0) {
                 throw new Error('the note rendered as an empty page');
             }
+            await waitForPdfPaint(webview);
             return new Uint8Array(
                 await withTimeout(
                     webview.printToPDF({ printBackground: true, pageSize: 'A4' }),
