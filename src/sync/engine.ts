@@ -3740,6 +3740,23 @@ export class SyncEngine {
     }
 
     /**
+     * The Drive node uid of a synced path, or null when it is not on Drive
+     * yet. The export flow polls this until the engine has uploaded the PDF.
+     */
+    nodeUidFor(path: string): string | null {
+        const record = this.state.get(path);
+        return record?.type === 'file' ? record.nodeUid : null;
+    }
+
+    /**
+     * Remove a public link by node uid. Used for exports whose vault path may
+     * already be gone, where resolving through the path no longer works.
+     */
+    async removeShareLinkByNodeUid(nodeUid: string): Promise<void> {
+        await this.connectedDrive().removeShareLink(nodeUid);
+    }
+
+    /**
      * Files of this vault in Drive's trash, most recently deleted first, at
      * most {@link MAX_DELETED_LISTED}. The trash covers the whole account, so
      * an item is listed only when its folder can be placed in the vault: the

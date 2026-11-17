@@ -76,6 +76,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             this.devicesGroup(),
             this.conflictsGroup(),
             this.scopeGroup(),
+            this.exportGroup(),
             this.mobileGroup(),
             this.advancedGroup(),
             this.logGroup(),
@@ -484,6 +485,39 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     }
 
     // -- mobile ------------------------------------------------------------
+
+    private exportGroup(): SettingDefinitionItem {
+        return {
+            type: 'group',
+            heading: 'PDF export',
+            items: [
+                {
+                    name: 'Export folder',
+                    desc: 'Exported PDFs are written here. Changing it leaves earlier exports where they are.',
+                    aliases: ['pdf'],
+                    control: { type: 'text', key: 'exportFolder' },
+                },
+                {
+                    name: 'Share links expire after',
+                    desc: 'In days. 0 means an export’s link never expires, and then the cleanup below has nothing to do.',
+                    aliases: ['expiry', 'pdf'],
+                    control: {
+                        type: 'number',
+                        key: 'shareExpiryDays',
+                        min: 0,
+                        validate: (value) =>
+                            Number.isFinite(value) && value >= 0 ? undefined : 'Enter zero or more days.',
+                    },
+                },
+                {
+                    name: 'Delete expired exports',
+                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched.',
+                    aliases: ['cleanup', 'pdf'],
+                    control: { type: 'toggle', key: 'autoDeleteExpiredExports' },
+                },
+            ],
+        };
+    }
 
     private mobileGroup(): SettingDefinitionItem {
         const note = Platform.isMobileApp ? '' : ' Has no effect on this device, which is not a phone or tablet.';

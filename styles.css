@@ -660,3 +660,14 @@ button.proton-sdk-sync-version:hover {
     font-size: var(--font-ui-small);
     overflow-wrap: anywhere;
 }
+
+/* The hidden Electron webview the PDF export renders through. */
+.proton-sdk-sync-pdf-webview {
+    position: fixed;
+    left: -10000px;
+    top: 0;
+    width: 800px;
+    height: 600px;
+    border: 0;
+    visibility: hidden;
+}
