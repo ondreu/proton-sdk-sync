@@ -49,6 +49,7 @@ import {
     exportPrecheckRefusal,
     isExportPath,
     janitorEntryPlan,
+    normalizeExportFolder,
     resolveExportPath,
     sanitizeExportedShares,
     sanitizeExportHtml,
@@ -69,6 +70,7 @@ import { openVaultFile } from './ui/openFile';
 import { PinFormModal, UnlockModal } from './ui/pinModals';
 import { ReloadModal } from './ui/reloadModal';
 import { CONFLICT_POLICIES, ProtonDriveSyncSettingsTab } from './ui/settingsTab';
+import { ExportPdfModal, ShareLinkModal } from './ui/exportModal';
 import { SetupModal } from './ui/setupModal';
 import { ShareModal } from './ui/shareModal';
 import { StatusBar } from './ui/statusBar';
@@ -1363,7 +1365,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     return false;
                 }
                 if (!checking) {
-                    void this.exportNoteToPdfAndShare(file.path);
+                    this.openExportModal(file);
                 }
                 return true;
             },
@@ -1384,7 +1386,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                         item
                             .setTitle('Export note to PDF and share')
                             .setIcon('link')
-                            .onClick(() => void this.exportNoteToPdfAndShare(file.path)),
+                            .onClick(() => this.openExportModal(file)),
                     );
                 }
             }),
@@ -1438,7 +1440,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * link; there is deliberately no way to share a note itself from here. An
      * existing link for the export is reused rather than making a second one.
      */
-    async exportNoteToPdfAndShare(sourcePath?: string): Promise<void> {
+    /** Ask for the link lifetime first; nothing is rendered before the answer. */
+    openExportModal(file: TFile): void {
+        new ExportPdfModal(this.app, {
+            noteName: file.basename,
+            defaultDays: this.settings.shareExpiryDays,
+            onConfirm: (days) => void this.exportNoteToPdfAndShare(file.path, days),
+        }).open();
+    }
+
+    async exportNoteToPdfAndShare(sourcePath?: string, expiryDays: number | null | undefined = undefined): Promise<void> {
         if (!Platform.isDesktop || !Platform.isDesktopApp) {
             new Notice('Exporting a note to PDF needs the desktop app.');
             return;
@@ -1462,6 +1473,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 exportPdfName(file.basename),
                 (path) => this.app.vault.getAbstractFileByPath(path) !== null,
             );
+            await this.ensureExportFolder(this.settings.exportFolder);
             const refusal = exportPrecheckRefusal({
                 paused: runtime.engine.isPaused(),
                 excluded: runtime.engine.isExcluded(exportPath),
@@ -1501,7 +1513,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 }
                 throw error;
             }
-            const expiration = shareExpiration(this.settings.shareExpiryDays);
+            const expiration = shareExpiration(expiryDays === null ? 0 : (expiryDays ?? this.settings.shareExpiryDays));
             // Always create: shareNode updates an existing URL access in place
             // (re-encrypting without a custom password and resetting the
             // expiry), so this converges the live link to the requested
@@ -1558,19 +1570,28 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     `the share link was created but could not be recorded, so it was removed: ${errorMessage(error)}`,
                 );
             }
-            try {
-                await navigator.clipboard.writeText(link.url);
-                new Notice(
-                    link.expiration !== undefined
-                        ? `Share link copied; it expires ${link.expiration.toLocaleString()}.`
-                        : 'Share link copied; it never expires.',
-                    15000,
-                );
-            } catch {
-                new Notice(`Share link: ${link.url}`, 15000);
-            }
+            new ShareLinkModal(this.app, {
+                url: link.url,
+                filePath: exportPath,
+                expiresAt: link.expiration?.getTime() ?? null,
+            }).open();
         } catch (error) {
             new Notice(`Could not export this note: ${errorMessage(error)}`);
+        }
+    }
+
+    /** Create the export folder (and its parents) when it does not exist yet. */
+    private async ensureExportFolder(folder: string): Promise<void> {
+        const clean = normalizeExportFolder(folder);
+        if (clean === '') {
+            return;
+        }
+        let path = '';
+        for (const segment of clean.split('/')) {
+            path = path === '' ? segment : `${path}/${segment}`;
+            if (this.app.vault.getAbstractFileByPath(path) === null) {
+                await this.app.vault.createFolder(path);
+            }
         }
     }
 
@@ -1608,7 +1629,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             activeDocument.body.appendChild(webview);
             await pdfWebviewReady(webview);
             const safeHtml = sanitizeExportHtml(rendered.innerHTML);
-            await webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml));
+            const textLength = await webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml));
+            if (typeof textLength !== 'number' || textLength === 0) {
+                throw new Error('the note rendered as an empty page');
+            }
             return new Uint8Array(await webview.printToPDF({ printBackground: true, pageSize: 'A4' }));
         } finally {
             component.unload();
