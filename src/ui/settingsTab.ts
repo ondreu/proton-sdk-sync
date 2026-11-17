@@ -511,7 +511,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                 },
                 {
                     name: 'Delete expired exports',
-                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched.',
+                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched. Use the command “Manage shared PDFs” to stop sharing one early.',
                     aliases: ['cleanup', 'pdf'],
                     control: { type: 'toggle', key: 'autoDeleteExpiredExports' },
                 },

@@ -70,7 +70,7 @@ import { openVaultFile } from './ui/openFile';
 import { PinFormModal, UnlockModal } from './ui/pinModals';
 import { ReloadModal } from './ui/reloadModal';
 import { CONFLICT_POLICIES, ProtonDriveSyncSettingsTab } from './ui/settingsTab';
-import { ExportPdfModal, ShareLinkModal } from './ui/exportModal';
+import { ExportPdfModal, SharedPdfsModal, ShareLinkModal } from './ui/exportModal';
 import { SetupModal } from './ui/setupModal';
 import { ShareModal } from './ui/shareModal';
 import { StatusBar } from './ui/statusBar';
@@ -1371,6 +1371,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             },
         });
 
+        this.addCommand({
+            id: 'manage-shared-pdfs',
+            icon: 'links',
+            name: 'Manage shared PDFs',
+            callback: () => this.openSharedPdfsModal(),
+        });
+
         // The same export from a note's context menu.
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
@@ -1446,6 +1453,43 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             noteName: file.basename,
             defaultDays: this.settings.shareExpiryDays,
             onConfirm: (days) => void this.exportNoteToPdfAndShare(file.path, days),
+        }).open();
+    }
+
+    /** List the exported PDFs that are still shared; stop sharing or delete. */
+    openSharedPdfsModal(): void {
+        const entries = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
+            runtime.logger.warn('Dropping a malformed exported-share entry.', entry);
+        });
+        const drop = (entry: { path: string; nodeUid: string }): void => {
+            this.settings.exportedShares = this.settings.exportedShares.filter(
+                (item) => !(item.path === entry.path && item.nodeUid === entry.nodeUid),
+            );
+        };
+        new SharedPdfsModal(this.app, {
+            entries,
+            onStopSharing: async (entry) => {
+                await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                drop(entry);
+                await this.saveSettings();
+            },
+            onDelete: async (entry) => {
+                if (!isExportPath(this.settings.exportFolder, entry.path)) {
+                    throw new Error('that path is outside the export folder, so it was left alone');
+                }
+                const file = this.app.vault.getAbstractFileByPath(entry.path);
+                if (file instanceof TFile) {
+                    await this.app.fileManager.trashFile(file);
+                }
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                } catch {
+                    // The link dies with the file on Drive; the registry entry
+                    // still has to go, or it would be retried forever.
+                }
+                drop(entry);
+                await this.saveSettings();
+            },
         }).open();
     }
 

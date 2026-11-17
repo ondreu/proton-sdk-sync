@@ -1,4 +1,5 @@
 import { App, Modal, Notice, Setting, TextComponent } from 'obsidian';
+import type { ExportedShare } from '../sync/pdfShare';
 
 const PRESETS = [7, 30, 90];
 
@@ -9,7 +10,7 @@ const PRESETS = [7, 30, 90];
  */
 export class ExportPdfModal extends Modal {
     private days: number | null;
-    private never = false;
+    private mode: 'preset' | 'custom' | 'never' = 'preset';
     private customRow: HTMLElement | null = null;
     private customInput: TextComponent | null = null;
 
@@ -43,19 +44,20 @@ export class ExportPdfModal extends Modal {
 
             const initial = this.days === null ? 'never' : PRESETS.includes(this.days) ? String(this.days) : 'custom';
             dropdown.setValue(initial);
+            this.mode = initial === 'never' ? 'never' : initial === 'custom' ? 'custom' : 'preset';
             this.setCustomVisible(initial === 'custom');
 
             dropdown.onChange((value) => {
                 if (value === 'never') {
-                    this.never = true;
+                    this.mode = 'never';
                     this.days = null;
                     this.setCustomVisible(false);
                 } else if (value === 'custom') {
-                    this.never = false;
+                    this.mode = 'custom';
                     this.setCustomVisible(true);
                     this.readCustom();
                 } else {
-                    this.never = false;
+                    this.mode = 'preset';
                     this.days = Number(value);
                     this.setCustomVisible(false);
                 }
@@ -81,13 +83,15 @@ export class ExportPdfModal extends Modal {
                     .setButtonText('Export and share')
                     .setCta()
                     .onClick(() => {
-                        this.readCustom();
-                        if (!this.never && (this.days === null || !Number.isFinite(this.days) || this.days <= 0)) {
+                        if (this.mode === 'custom') {
+                            this.readCustom();
+                        }
+                        if (this.mode !== 'never' && (this.days === null || !Number.isFinite(this.days) || this.days <= 0)) {
                             new Notice('Enter a positive number of days, or choose never.');
                             return;
                         }
                         this.close();
-                        this.options.onConfirm(this.never ? null : this.days);
+                        this.options.onConfirm(this.mode === 'never' ? null : this.days);
                     }),
             );
     }
@@ -160,5 +164,88 @@ export class ShareLinkModal extends Modal {
 
     override onClose(): void {
         this.contentEl.empty();
+    }
+}
+
+/**
+ * The registry the user can actually see: which PDFs are shared, until when,
+ * with Copy / stop-sharing / delete. The janitor handles expiry; this is for
+ * the "I changed my mind" case.
+ */
+export class SharedPdfsModal extends Modal {
+    private entries: ExportedShare[];
+
+    constructor(
+        app: App,
+        private readonly options: {
+            entries: ExportedShare[];
+            onStopSharing: (entry: ExportedShare) => Promise<void>;
+            onDelete: (entry: ExportedShare) => Promise<void>;
+        },
+    ) {
+        super(app);
+        this.entries = [...options.entries];
+    }
+
+    override onOpen(): void {
+        this.render();
+    }
+
+    override onClose(): void {
+        this.contentEl.empty();
+    }
+
+    private render(): void {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h3', { text: 'Shared PDFs' });
+        if (this.entries.length === 0) {
+            contentEl.createEl('p', { text: 'Nothing is shared right now.' });
+            new Setting(contentEl).addButton((button) =>
+                button.setButtonText('Close').onClick(() => this.close()),
+            );
+            return;
+        }
+        for (const entry of this.entries) {
+            const setting = new Setting(contentEl).setName(entry.path).setDesc(
+                entry.expiresAt === null
+                    ? 'Never expires'
+                    : `Expires ${new Date(entry.expiresAt).toLocaleString()}`,
+            );
+            setting.addButton((button) =>
+                button.setButtonText('Copy link').onClick(() => {
+                    void navigator.clipboard.writeText(entry.url).then(
+                        () => new Notice('Link copied.'),
+                        () => new Notice('Could not copy the link.'),
+                    );
+                }),
+            );
+            setting.addButton((button) =>
+                button.setButtonText('Stop sharing').onClick(() => {
+                    void this.act(entry, this.options.onStopSharing);
+                }),
+            );
+            setting.addButton((button) =>
+                button
+                    .setButtonText('Delete')
+                    .setDestructive()
+                    .onClick(() => {
+                        void this.act(entry, this.options.onDelete);
+                    }),
+            );
+        }
+        new Setting(contentEl).addButton((button) =>
+            button.setButtonText('Close').onClick(() => this.close()),
+        );
+    }
+
+    private async act(entry: ExportedShare, action: (entry: ExportedShare) => Promise<void>): Promise<void> {
+        try {
+            await action(entry);
+            this.entries = this.entries.filter((item) => item !== entry);
+        } catch (error) {
+            new Notice(`Could not update the share: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        this.render();
     }
 }
