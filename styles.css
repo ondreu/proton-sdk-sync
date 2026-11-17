@@ -661,15 +661,22 @@ button.proton-sdk-sync-version:hover {
     overflow-wrap: anywhere;
 }
 
-/* The hidden Electron webview the PDF export renders through. */
+/*
+ * The Electron webview the PDF export renders through. It must be painted:
+ * `visibility: hidden` (or a far-offscreen position) makes printToPDF capture
+ * a blank page, because the guest never composites. So it sits in the corner,
+ * fully transparent to the eye and to the pointer, but on screen.
+ */
 .proton-sdk-sync-pdf-webview {
     position: fixed;
-    left: -10000px;
+    left: 0;
     top: 0;
     width: 800px;
     height: 600px;
     border: 0;
-    visibility: hidden;
+    opacity: 0.01;
+    pointer-events: none;
+    z-index: -1;
 }
 
 /* A conflict-policy explanation needs the row's full width; the dropdown sits under it. */
