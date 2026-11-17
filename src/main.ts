@@ -1835,6 +1835,16 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 `<base href="app://obsidian.md/"><style>${css}</style></head><body>` +
                 sanitizeExportHtml(rendered.innerHTML) +
                 `</body></html>`;
+            // A data: URL hits Chromium's length limit as soon as images are
+            // inlined; a temp file has no such ceiling.
+            const os = nodeRequire('node:os') as { tmpdir(): string };
+            const fs = nodeRequire('node:fs/promises') as {
+                writeFile(path: string, data: string): Promise<void>;
+                unlink(path: string): Promise<void>;
+            };
+            const path = nodeRequire('node:path') as { join(...parts: string[]): string };
+            const target = path.join(os.tmpdir(), `pss-print-${Date.now()}-${Math.random().toString(36).slice(2)}.html`);
+            await fs.writeFile(target, html);
             const win = new BrowserWindow({
                 show: false,
                 width: 800,
@@ -1842,12 +1852,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 webPreferences: { nodeIntegration: false, contextIsolation: true, webSecurity: false },
             });
             try {
-                await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+                await win.loadURL(`file://${target}`);
                 await new Promise((resolve) => window.setTimeout(resolve, 300));
                 const pdf = await win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' });
                 return new Uint8Array(pdf);
             } finally {
                 win.destroy();
+                await fs.unlink(target).catch(() => undefined);
             }
         } finally {
             component.unload();
