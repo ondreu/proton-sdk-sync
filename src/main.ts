@@ -1747,12 +1747,30 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     private async inlineEmbeds(root: HTMLElement, sourcePath: string, component: Component, depth: number): Promise<void> {
         const images = Array.from(root.querySelectorAll('img'));
         let budget = 25 * 1024 * 1024;
+        // MarkdownRenderer already turned vault images into app:// resource
+        // URLs, which getFirstLinkpathDest cannot resolve; map them back.
+        const byResource = new Map<string, TFile>();
+        for (const file of this.app.vault.getFiles()) {
+            try {
+                byResource.set(this.app.vault.getResourcePath(file), file);
+            } catch {
+                // Not a file the platform can address.
+            }
+        }
         for (const img of images) {
             const src = img.getAttribute('src');
             if (!src || /^(https?:|data:|blob:)/i.test(src)) {
                 continue;
             }
-            const target = this.app.metadataCache.getFirstLinkpathDest(src, sourcePath);
+            let target: TFile | null = byResource.get(src) ?? null;
+            if (target === null) {
+                target = this.app.metadataCache.getFirstLinkpathDest(src, sourcePath);
+            }
+            if (target === null && src.startsWith('app://')) {
+                // Last resort: a resource URL that differs by encoding only.
+                const decoded = decodeURIComponent(src);
+                target = this.app.vault.getFiles().find((file) => decoded.endsWith(`/${file.path}`)) ?? null;
+            }
             if (!(target instanceof TFile) || budget <= 0) {
                 continue;
             }
