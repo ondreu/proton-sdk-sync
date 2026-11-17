@@ -268,6 +268,12 @@ describe('PDF export HTML sanitizer', () => {
             '&#106;avascript:alert(1)',
             '&#x6a;avascript:alert(1)',
             'javascript&colon;alert(1)',
+            // Named whitespace references survive JSON and are decoded by the
+            // browser after this check; the delta review broke the old test.
+            'java&Tab;script:alert(1)',
+            'java&NewLine;script:alert(1)',
+            'jav&#x09;ascript:alert(1)',
+            'java&#9;script:alert(1)',
         ]) {
             const out = sanitizeExportHtml(`<a href="${href}">x</a>`);
             assert.ok(!/javascript/i.test(out), href);

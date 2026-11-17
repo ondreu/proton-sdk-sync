@@ -1508,13 +1508,32 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             // settings instead of reusing a stale one. The returned access is
             // the link's actual state — the registry, the notice and the
             // clipboard all use it, never a computed date.
-            const link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+            let link: Awaited<ReturnType<typeof runtime.engine.createNoteShareLink>>;
+            try {
+                link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+            } catch (error) {
+                // A link created by the old Proton sharing model cannot be
+                // updated in place. Remove it and make one from scratch, once;
+                // if that fails too, report it rather than leaving a half state.
+                try {
+                    await runtime.engine.removeNoteShareLink(exportPath);
+                    link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+                } catch {
+                    new Notice(`Could not share the PDF: ${error instanceof Error ? error.message : String(error)}`);
+                    return;
+                }
+            }
             if (link.hasPassword) {
                 // Unreachable through this flow (the creation above clears a
                 // password), but one set elsewhere would leave the recipient
-                // blocked: fail loudly rather than announce a broken link.
-                // Nothing is registered, so the janitor never touches it.
-                new Notice('This PDF has a password-protected link; remove the password on Drive and export again.');
+                // blocked: fail loudly, and remove the link so it cannot sit
+                // live and unregistered.
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(runtime.engine.nodeUidFor(exportPath) ?? nodeUid);
+                } catch {
+                    // Reported below either way.
+                }
+                new Notice('This PDF had a password-protected link; it was removed. Export again to make a clean link.');
                 return;
             }
             // Re-read after the share: the path's record may have been remapped

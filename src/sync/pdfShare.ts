@@ -324,9 +324,19 @@ export function sanitizeExportHtml(html: string): string {
         /\b(href|src|xlink:href|formaction|action)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
         (whole, name: string, value: string): string => {
             const raw = value.replace(/^['"]|['"]$/g, '');
-            // What the URL parser sees through: entities decoded, all ASCII
-            // whitespace (tabs and newlines are stripped from URLs) removed.
-            const compact = decodeSchemeEntities(raw).replace(/\s+/g, '');
+            // What the URL parser sees through: entities decoded, every
+            // whitespace and control character removed. Any entity left in a
+            // URL scheme is an obfuscation attempt (&Tab;, &NewLine; and
+            // unknown references are decoded by the browser after this test),
+            // so the test drops all of them instead of enumerating names.
+            const compact = decodeSchemeEntities(raw)
+                .replace(/&[a-z#0-9]+;?/gi, '')
+                // Control characters and spaces are stripped by URL parsers;
+                // do it without a control-character regex (the review lint
+                // bans those).
+                .split('')
+                .filter((ch) => ch !== ' ' && ch.charCodeAt(0) > 0x1f && ch.charCodeAt(0) !== 0x7f)
+                .join('');
             if (/^(javascript|vbscript):/i.test(compact)) {
                 return `${name}="#"`;
             }
