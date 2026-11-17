@@ -4,6 +4,18 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
+## [1.1.3] — 2026-11-17
+
+### Added
+
+- `fullSyncOnStartup`: compare the whole tree when the vault loads instead of
+  replaying Drive's events. Off in the app (event replay is cheap and usually
+  right); on in the headless daemon, which starts rarely and where a saved
+  event cursor that predates a change which then failed to apply would leave a
+  settings file stale until the next walk. That is what happened with
+  `.obsidian/community-plugins.json`: a pass read the event, the file did not
+  change, and no later poll mentioned it — a restart with a full sync fixed it.
+
 ## [1.1.2] — 2026-11-17
 
 ### Changed

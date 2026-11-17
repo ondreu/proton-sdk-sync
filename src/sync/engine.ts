@@ -1073,6 +1073,7 @@ export class SyncEngine {
             this.state.paths().length === 0 ||
             !this.settings.autoSync ||
             this.networkHeld() ||
+            this.settings.fullSyncOnStartup ||
             lastFull === null ||
             Date.now() - lastFull > STARTUP_WALK_AFTER_MS
         ) {

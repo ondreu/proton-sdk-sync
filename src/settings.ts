@@ -32,6 +32,15 @@ export type PluginSettings = {
     autoSync: boolean;
     /** Run a full reconciliation when the plugin loads. */
     syncOnStartup: boolean;
+    /**
+     * On load, compare the whole tree instead of replaying Drive's events.
+     *
+     * Event replay is cheap and right for a desktop app that was closed for a
+     * few minutes, but a cursor saved before a change that then failed to
+     * apply will not mention that change again. A long-lived headless daemon
+     * restarts rarely, so it can pay for a tree walk and know it is converged.
+     */
+    fullSyncOnStartup: boolean;
     /** Quiet period after the last edit to a file before it is uploaded. */
     uploadDebounceMs: number;
     /**
@@ -190,6 +199,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     paused: false,
     autoSync: true,
     syncOnStartup: true,
+    fullSyncOnStartup: false,
     uploadDebounceMs: 2000,
     remotePollSeconds: 30,
     transferConcurrency: 3,
