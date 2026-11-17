@@ -9,12 +9,15 @@
 #                     (rebuildable encrypted cache), *.lock files and
 #                     *.tmp debris (meaningless across a restore).
 #
-# Safety rule: refuses to run while status.json says a pass is in flight
-# (state "syncing"), because a tar taken mid-pass can mix a half-written
-# vault tree with a half-flushed state file. Pass --allow-active to
-# override (e.g. the daemon wedged mid-pass and you want a copy before
-# killing it). A stale "syncing" after a crash also blocks — same flag
-# overrides, after you have read the logs.
+# Safety rule: refuses while a pass may be in flight. `status.json` carries
+# `{state, updatedAt}`; `starting` (boot, `once` before `engine.start`,
+# `watch` before its first beat) and `syncing` (a pass is running) both mean
+# "do not tar now": a tar mid-pass can mix a half-written vault tree with a
+# half-flushed state file. A missing `status.json` (the daemon never
+# reported) or one with no readable state refuses too — idleness must be
+# proven, not assumed. Pass --allow-active to override (e.g. the daemon wedged
+# mid-pass and you want a copy before killing it). A stale `starting` after a
+# crash also blocks — same flag overrides, after you have read the logs.
 #
 # Usage:
 #   PSS_VAULT=/vault PSS_DATA_DIR=/data/pss-daemon \
@@ -67,20 +70,33 @@ done
 mkdir -p "$OUT_DIR"
 
 # --- refuse mid-pass -------------------------------------------------------
-# status.json carries {"state": "syncing"|"idle"|..., "updatedAt": ...}.
-# grep-only on purpose: no jq/python on a minimal NAS image.
+# status.json carries {"state": ...}. sed-only on purpose: no jq/python on a
+# minimal NAS image. Anything that cannot prove idleness refuses: a pass in
+# flight (starting/syncing), a missing file, or a state that cannot be read.
 STATUS_FILE="${DATA_DIR}/status.json"
+ACTIVE_STATE=""
 if [ -f "$STATUS_FILE" ]; then
-    if grep -q '"state"[[:space:]]*:[[:space:]]*"syncing"' "$STATUS_FILE"; then
-        if [ "$ALLOW_ACTIVE" -ne 1 ]; then
-            echo "backup-daemon-state.sh: REFUSING — status.json reports a pass in flight (state \"syncing\")." >&2
-            echo "  Wait for idle, or re-run with --allow-active if you mean it (a torn pair self-heals via .bak, but a mixed vault/state pair is exactly what this guard avoids)." >&2
-            exit 2
-        fi
-        echo "backup-daemon-state.sh: WARNING — proceeding mid-pass (--allow-active)." >&2
-    fi
+    ACTIVE_STATE="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([a-z-]*\)".*/\1/p' "$STATUS_FILE" 2>/dev/null)"
+fi
+REASON=""
+if [ ! -f "$STATUS_FILE" ]; then
+    REASON="no status.json yet (the daemon never reported; idleness is unprovable)"
+elif [ -z "$ACTIVE_STATE" ]; then
+    REASON="status.json carries no readable state (corrupt or foreign; idleness is unprovable)"
 else
-    echo "backup-daemon-state.sh: no status.json yet (daemon never reported); backing up anyway." >&2
+    case "$ACTIVE_STATE" in
+        starting|syncing)
+            REASON="status.json reports a pass in flight (state \"$ACTIVE_STATE\")"
+            ;;
+    esac
+fi
+if [ -n "$REASON" ]; then
+    if [ "$ALLOW_ACTIVE" -ne 1 ]; then
+        echo "backup-daemon-state.sh: REFUSING — $REASON." >&2
+        echo "  Wait for idle, or re-run with --allow-active if you mean it (a torn pair self-heals via .bak, but a mixed vault/state pair is exactly what this guard avoids)." >&2
+        exit 2
+    fi
+    echo "backup-daemon-state.sh: WARNING — proceeding despite \"$REASON\" (--allow-active)." >&2
 fi
 
 # --- archive ---------------------------------------------------------------
