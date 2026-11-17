@@ -40,7 +40,6 @@ import { SyncEngine, type ConflictEvent, type OpenEditor, type SyncPlan, type Sy
 import { errorMessage } from './sync/engine/helpers';
 import {
     buildExportedShare,
-    buildPdfPrintScript,
     EXPORT_JANITOR_INTERVAL_MS,
     EXPORT_NODE_POLL_MS,
     EXPORT_NODE_WAIT_MS,
@@ -145,57 +144,10 @@ type PdfWebview = HTMLElement & {
 };
 
 /** Resolve once the webview's page has loaded, so the note can be injected. */
-function pdfWebviewReady(webview: PdfWebview): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (typeof webview.printToPDF !== 'function') {
-            reject(new Error('Electron PDF printing is not available in this build'));
-            return;
-        }
-        const timer = window.setTimeout(() => reject(new Error('the PDF preview never loaded')), 30_000);
-        const fail = (): void => {
-            window.clearTimeout(timer);
-            reject(new Error('the PDF preview failed to load'));
-        };
-        webview.addEventListener('dom-ready', () => {
-            window.clearTimeout(timer);
-            resolve();
-        });
-        webview.addEventListener('did-fail-load', fail);
-        webview.addEventListener('did-finish-load', () => {
-            window.clearTimeout(timer);
-            resolve();
-        });
-    });
-}
-
-
-
-
 /**
  * Poll until the injected page has text and its images have settled. A fixed
  * delay would be guesswork, and requestAnimationFrame never fires offscreen.
  */
-async function waitForPdfPaint(webview: PdfWebview): Promise<void> {
-    const deadline = Date.now() + 5000;
-    for (;;) {
-        const state = await withTimeout(
-            webview.executeJavaScript(
-                '({text: (document.body.innerText || "").length, images: Array.from(document.images).every((img) => img.complete)})',
-            ),
-            3000,
-            'the PDF page stopped responding',
-        );
-        const painted = state as { text?: unknown; images?: unknown } | null;
-        if (typeof painted?.text === 'number' && painted.text > 0 && painted.images === true) {
-            return;
-        }
-        if (Date.now() > deadline) {
-            throw new Error('the PDF page did not finish rendering');
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 150));
-    }
-}
-
 /** Reject instead of waiting forever on an Electron/SDK call that never settles. */
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -1730,41 +1682,100 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             new Notice('Open the note first, then export it.');
             return;
         }
-        const adapter = this.app.vault.adapter as unknown as { getBasePath?: () => string };
-        const basePath = adapter.getBasePath?.();
-        if (basePath === undefined) {
-            new Notice('Exporting a note to PDF needs the desktop app.');
-            return;
-        }
-        // Obsidian's exporter renders with the active theme; its dialog is only
-        // a wrapper around `printToPdf({ filepath })`, which writes straight to
-        // the folder we choose.
         await this.ensureExportFolder(this.settings.exportFolder);
         const exportPath = resolveExportPath(
             this.settings.exportFolder,
             exportPdfName(file.basename),
             (path) => this.app.vault.getAbstractFileByPath(path) !== null,
         );
-        new Notice('Rendering the PDF…');
-        await (view as unknown as { printToPdf(options: { filepath: string }): Promise<void> }).printToPdf({
-            filepath: `${basePath}/${exportPath}`,
-        });
-        const deadline = Date.now() + 30000;
-        for (;;) {
+        try {
+            new Notice('Rendering the PDF…');
+            const pdf = await withTimeout(this.renderNoteToPdf(file), 60000, 'rendering the PDF timed out');
+            const buffer = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength) as ArrayBuffer;
+            const previous = this.app.vault.getAbstractFileByPath(exportPath);
+            if (previous instanceof TFile) {
+                await this.app.vault.modifyBinary(previous, buffer);
+            } else {
+                await this.app.vault.createBinary(exportPath, buffer);
+            }
             const written = this.app.vault.getAbstractFileByPath(exportPath);
-            if (written instanceof TFile) {
-                await this.shareExportedPdf(written, expiry);
-                return;
+            if (!(written instanceof TFile)) {
+                throw new Error('the PDF was not written to the vault');
             }
-            if (Date.now() > deadline) {
-                new Notice('The PDF was not written inside the vault, so there is nothing to share.');
-                return;
-            }
-            await new Promise((resolve) => window.setTimeout(resolve, 200));
+            await this.shareExportedPdf(written, expiry);
+        } catch (error) {
+            new Notice(`Could not export this note: ${errorMessage(error)}`);
         }
-
     }
 
+    /**
+     * Render a note to PDF in a throwaway BrowserWindow.
+     *
+     * `<webview>` printing returned blank pages and its guest cannot reach
+     * `ipcRenderer`; `MarkdownView.printToPdf()` always opens a save dialog.
+     * The Electron remote module is available in Obsidian, so the rendered
+     * HTML goes into a hidden window and its `webContents.printToPDF` writes
+     * the bytes — no dialog, no webview.
+     */
+    private async renderNoteToPdf(note: TFile): Promise<Uint8Array> {
+        const nodeRequire = (window as unknown as { require: (module: string) => unknown }).require;
+        const electron = nodeRequire('electron') as {
+            remote?: {
+                BrowserWindow?: new (options: Record<string, unknown>) => {
+                    loadURL(url: string): Promise<void>;
+                    webContents: { printToPDF(options: Record<string, unknown>): Promise<Uint8Array> };
+                    destroy(): void;
+                };
+            };
+        };
+        const BrowserWindow = electron.remote?.BrowserWindow;
+        if (BrowserWindow === undefined) {
+            throw new Error('Electron remote is not available in this build');
+        }
+        const markdown = await this.app.vault.read(note);
+        const component = new Component();
+        const rendered = createDiv();
+        try {
+            await MarkdownRenderer.render(this.app, markdown, rendered, note.path, component);
+            for (const img of Array.from(rendered.querySelectorAll('img'))) {
+                const src = img.getAttribute('src');
+                if (!src || /^(https?:|data:|app:|blob:)/i.test(src)) {
+                    continue;
+                }
+                const target = this.app.metadataCache.getFirstLinkpathDest(src, note.path);
+                if (target instanceof TFile) {
+                    img.setAttribute('src', this.app.vault.getResourcePath(target));
+                }
+            }
+            const css =
+                'html,body{margin:0;padding:24px;background:#fff;color:#000;font-family:var(--font-text, sans-serif);}' +
+                'img{max-width:100%;}pre,code{white-space:pre-wrap;word-break:break-word;}' +
+                'table{border-collapse:collapse;}th,td{border:1px solid #ccc;padding:4px 8px;}';
+            const html =
+                `<!doctype html><html><head><meta charset="utf-8">` +
+                `<base href="app://obsidian.md/"><style>${css}</style></head><body>` +
+                sanitizeExportHtml(rendered.innerHTML) +
+                `</body></html>`;
+            const win = new BrowserWindow({
+                show: false,
+                width: 800,
+                height: 600,
+                webPreferences: { nodeIntegration: false, contextIsolation: true, webSecurity: false },
+            });
+            try {
+                await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+                await new Promise((resolve) => window.setTimeout(resolve, 300));
+                const pdf = await win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' });
+                return new Uint8Array(pdf);
+            } finally {
+                win.destroy();
+            }
+        } finally {
+            component.unload();
+        }
+    }
+
+    /** Create the export folder (and its parents) when it does not exist yet. */
     /** Create the export folder (and its parents) when it does not exist yet. */
     private async ensureExportFolder(folder: string): Promise<void> {
         const clean = normalizeExportFolder(folder);
@@ -1832,57 +1843,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * their local resource URLs first; anything the renderer already resolved
      * rides on its own output.
      */
-    private async renderNoteToPdf(note: TFile, markdown: string): Promise<Uint8Array> {
-        const component = new Component();
-        const rendered = createDiv();
-        const webview = activeDocument.createElement('webview') as unknown as PdfWebview;
-        try {
-            await MarkdownRenderer.render(this.app, markdown, rendered, note.path, component);
-            for (const img of Array.from(rendered.querySelectorAll('img'))) {
-                const src = img.getAttribute('src');
-                if (!src || /^(https?:|data:|app:|blob:)/i.test(src)) {
-                    continue;
-                }
-                const target = this.app.metadataCache.getFirstLinkpathDest(src, note.path);
-                if (target instanceof TFile) {
-                    img.setAttribute('src', this.app.vault.getResourcePath(target));
-                }
-            }
-            // Listen before the navigation starts: a cached app:// page can
-            // fire dom-ready while appendChild is still running, and a
-            // listener added afterwards would wait for the next load forever.
-            const ready = pdfWebviewReady(webview);
-            // Property plus webpreferences: the boolean attribute alone leaves
-            // `require` undefined in the guest (GUEST_VIEW_MANAGER_CALL).
-            (webview as unknown as { nodeintegration: boolean }).nodeintegration = true;
-            webview.setAttribute('webpreferences', 'contextIsolation=no,nodeIntegration=yes');
-            webview.setAttribute('src', 'app://obsidian.md/help.html');
-            // The guest prints itself through Obsidian's own `print-to-pdf`
-            // IPC channel (the one the built-in export uses). `ipcRenderer`
-            // needs Node in the guest; the HTML is sanitized first. The
-            // alternative, webview.printToPDF from the host, produced a blank
-            // page on a real vault.
-            webview.setAttribute('nodeintegration', '');
-            webview.addClass('proton-sdk-sync-pdf-webview');
-            activeDocument.body.appendChild(webview);
-            await ready;
-            const safeHtml = sanitizeExportHtml(rendered.innerHTML);
-            const textLength = await withTimeout(
-                webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml)),
-                15000,
-                'the PDF page did not accept the note',
-            );
-            if (typeof textLength !== 'number' || textLength === 0) {
-                throw new Error('the note rendered as an empty page');
-            }
-            await waitForPdfPaint(webview);
-            return await this.printWebviewToPdf(webview);
-        } finally {
-            component.unload();
-            webview.remove();
-        }
-    }
-
     /** Wait until the engine has uploaded a path and its record names the Drive node. */
     private async waitForExportNodeUid(path: string): Promise<string> {
         const deadline = Date.now() + EXPORT_NODE_WAIT_MS;
