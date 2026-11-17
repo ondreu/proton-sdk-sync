@@ -1,6 +1,6 @@
 {
     "name": "proton-sdk-sync",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Two-way, end-to-end encrypted sync between an Obsidian vault and Proton Drive, built on the official Proton Drive SDK.",
     "main": "main.js",
     "private": true,
