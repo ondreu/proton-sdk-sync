@@ -1,4 +1,6 @@
 import type { LogLevel } from './util/logger';
+import type { ExportedShare } from './sync/pdfShare';
+import { DEFAULT_EXPORT_FOLDER, DEFAULT_SHARE_EXPIRY_DAYS } from './sync/pdfShare';
 import type { ConflictPolicy } from './sync/types';
 
 export type PluginSettings = {
@@ -97,6 +99,32 @@ export type PluginSettings = {
 
     /** Set once the first-run setup has been shown, so it never reappears. */
     onboardingComplete: boolean;
+
+    /**
+     * Vault-relative folder exported PDFs are written to. Blank falls back to
+     * {@link DEFAULT_EXPORT_FOLDER} where it is used, so an empty text field
+     * cannot scatter PDFs at the vault root.
+     */
+    exportFolder: string;
+    /**
+     * How long a new export's share link lasts, in days. 0 means the link
+     * never expires, and then the janitor has nothing to clean up.
+     */
+    shareExpiryDays: number;
+    /**
+     * Preselection for the per-share “Delete the file when the link expires”
+     * toggle. Off by default: only the link expires and the file stays. The
+     * old `autoDeleteExpiredExports` never shipped in a release, so there is
+     * no one to migrate; a stored key is simply dropped.
+     */
+    defaultDeleteOnExpiry: boolean;
+    /**
+     * Every shared file and the link made for it. Only entries that pass the
+     * janitor's confinement checks can ever trash their file: the path must
+     * be a canonical vault path whose current sync record names the same
+     * node the share was made for.
+     */
+    exportedShares: ExportedShare[];
 
     /**
      * With a PIN: minutes without using Obsidian before the PIN is asked for
@@ -216,6 +244,11 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     logShowsNames: false,
 
     onboardingComplete: false,
+
+    exportFolder: DEFAULT_EXPORT_FOLDER,
+    shareExpiryDays: DEFAULT_SHARE_EXPIRY_DAYS,
+    defaultDeleteOnExpiry: false,
+    exportedShares: [],
 
     pinLockAfterMinutes: 0,
     pinProtected: false,

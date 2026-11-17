@@ -4,6 +4,30 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
+## [Unreleased] — 2026-11-17
+
+### Added
+
+- **Share any vault file with a view-only Proton link.** Right-click a file
+  (or a note) and choose “Share file with a Proton link”, pick how long the
+  link should live — 7, 30, 90 days, a custom number, or never — and copy the
+  link from the dialog. “Manage shared files” (settings and the command
+  palette) lists every link with copy, stop sharing and delete.
+- **Optional delete on expiry.** Off by default: when a link expires only the
+  link is removed and the file stays. Tick “Delete the file when the link
+  expires” in the share dialog to have the janitor move that file to the trash
+  at expiry instead. It never deletes a folder, and only a file whose current
+  sync record still matches the share can be deleted, so a hand-edited config
+  cannot target an unrelated note.
+
+### Fixed
+
+- Sharing a file whose node was remapped between the sync and the link
+  creation can no longer register a link against the wrong file; the
+  registry, the dialog and the clipboard all use the access the server
+  returned.
+- A deleted file removes its link instead of leaving it live until expiry.
+
 ## [1.1.3] — 2026-11-17
 
 ### Added

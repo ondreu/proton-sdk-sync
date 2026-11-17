@@ -2,6 +2,7 @@ import { App, debounce, Notice, Platform, PluginSettingTab, type Setting, type S
 
 import type ProtonDriveSyncPlugin from '../main';
 import { MIN_POLL_SECONDS } from '../settings';
+import { MAX_SHARE_EXPIRY_DAYS } from '../sync/pdfShare';
 import { checkExcludePatterns } from '../sync/paths';
 import type { ConflictPolicy } from '../sync/types';
 import { setLogShowsNames, type LogLevel } from '../util/logger';
@@ -12,8 +13,8 @@ import { SignInModal } from './signInModal';
 import { getRuntime } from '../runtime';
 
 export const CONFLICT_POLICIES: Record<ConflictPolicy, string> = {
-    'keep-both': 'Keep both versions (recommended)',
-    merge: 'Merge the changes, keep both if they overlap',
+    'keep-both': 'Keep both versions',
+    merge: 'Merge the changes, keep both if they overlap (recommended)',
     'prefer-newest': 'Keep whichever was edited last',
     'prefer-local': 'Keep this device’s version',
     'prefer-remote': 'Keep the Drive version',
@@ -76,6 +77,7 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             this.devicesGroup(),
             this.conflictsGroup(),
             this.scopeGroup(),
+            this.exportGroup(),
             this.mobileGroup(),
             this.advancedGroup(),
             this.logGroup(),
@@ -403,9 +405,21 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             items: [
                 {
                     name: 'When a file changes in two places',
-                    desc: CONFLICT_POLICY_HELP[policy],
                     aliases: ['conflict policy', 'merge'],
-                    control: { type: 'dropdown', key: 'conflictPolicy', options: CONFLICT_POLICIES },
+                    render: (setting) => {
+                        // Stacked on purpose: the explanation is several lines
+                        // and a side-by-side dropdown squeezes it into a
+                        // narrow column.
+                        setting.setClass('pss-stacked-setting');
+                        setting.setDesc(CONFLICT_POLICY_HELP[policy]);
+                        setting.addDropdown((dropdown) => {
+                            for (const [value, label] of Object.entries(CONFLICT_POLICIES)) {
+                                dropdown.addOption(value, label);
+                            }
+                            dropdown.setValue(this.plugin.settings.conflictPolicy);
+                            dropdown.onChange((value) => void this.setControlValue('conflictPolicy', value));
+                        });
+                    },
                 },
                 {
                     name: `${conflicts} file${conflicts === 1 ? '' : 's'} waiting on a decision`,
@@ -484,6 +498,39 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     }
 
     // -- mobile ------------------------------------------------------------
+
+    private exportGroup(): SettingDefinitionItem {
+        return {
+            type: 'group',
+            heading: 'Sharing',
+            items: [
+                {
+                    name: 'How sharing works',
+                    desc: 'Any file in the vault can get a view-only Proton link: notes (shared as the file itself), images, PDFs and other attachments. You pick the link lifetime in the dialog; when it expires the link is removed. The file stays unless you tick “Delete the file when the link expires” there (off by default). Deleting a file yourself removes its link too. “Manage shared files” lists every link, with copy, stop sharing and delete.',
+                },
+                {
+                    name: 'Default link lifetime',
+                    desc: 'In days, offered as the preselection when you share. The dialog lets you change it per file, including never. 0 means never.',
+                    aliases: ['expiry', 'sharing'],
+                    control: {
+                        type: 'number',
+                        key: 'shareExpiryDays',
+                        min: 0,
+                        validate: (value) =>
+                            Number.isSafeInteger(value) && value >= 0 && value <= MAX_SHARE_EXPIRY_DAYS
+                                ? undefined
+                                : `Enter a whole number of days from 0 to ${MAX_SHARE_EXPIRY_DAYS} (0 means never).`,
+                    },
+                },
+                {
+                    name: 'Manage shared files',
+                    desc: 'See every shared file with its link and expiry; copy a link, stop sharing, or delete the file and its link.',
+                    aliases: ['links', 'sharing'],
+                    action: () => this.plugin.openSharedPdfsModal(),
+                },
+            ],
+        };
+    }
 
     private mobileGroup(): SettingDefinitionItem {
         const note = Platform.isMobileApp ? '' : ' Has no effect on this device, which is not a phone or tablet.';

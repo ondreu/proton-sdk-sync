@@ -36,6 +36,18 @@ import { DeviceList, DeviceRegistry, nextRequestAt, type DeviceRequest, type Fol
 import { DriveIO, sharedWithOthers } from './sync/drive';
 import { SyncEngine, type ConflictEvent, type OpenEditor, type SyncPlan, type SyncSummary } from './sync/engine';
 import { errorMessage } from './sync/engine/helpers';
+import {
+    buildExportedShare,
+    EXPORT_JANITOR_INTERVAL_MS,
+    EXPORT_NODE_POLL_MS,
+    EXPORT_NODE_WAIT_MS,
+    mayDeleteOnExpiry,
+    normalizeVaultPath,
+    sanitizeExportedShares,
+    selectExpiredShares,
+    shareExpiration,
+    upsertExportedShare,
+} from './sync/pdfShare';
 import { SyncState } from './sync/state';
 import { formatLogEntries, Logger, setLogShowsNames } from './util/logger';
 import { ActivityWatch } from './ui/activity';
@@ -49,6 +61,7 @@ import { openVaultFile } from './ui/openFile';
 import { PinFormModal, UnlockModal } from './ui/pinModals';
 import { ReloadModal } from './ui/reloadModal';
 import { CONFLICT_POLICIES, ProtonDriveSyncSettingsTab } from './ui/settingsTab';
+import { ExportPdfModal, SharedPdfsModal, ShareLinkModal } from './ui/exportModal';
 import { SetupModal } from './ui/setupModal';
 import { ShareModal } from './ui/shareModal';
 import { StatusBar } from './ui/statusBar';
@@ -117,8 +130,22 @@ function networkConnection(): NetworkConnection | undefined {
     return (navigator as Navigator & { connection?: NetworkConnection }).connection;
 }
 
-
-
+/** Reject instead of waiting forever on an Electron/SDK call that never settles. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error(message)), ms);
+        promise.then(
+            (value) => {
+                window.clearTimeout(timer);
+                resolve(value);
+            },
+            (error: unknown) => {
+                window.clearTimeout(timer);
+                reject(error instanceof Error ? error : new Error(String(error)));
+            },
+        );
+    });
+}
 
 export default class ProtonDriveSyncPlugin extends Plugin {
     // Obsidian declares `settings?: unknown` on Plugin; this narrows it.
@@ -169,11 +196,19 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     /** What the status bar, ribbon icon and panel currently show. */
     private summary!: SyncSummary;
     private conflictNoticeTimer: number | null = null;
+    /** Malformed exported-share entries dropped while loading the settings. */
+    private droppedExportedShares = 0;
 
     override async onload(): Promise<void> {
         await this.loadSettings();
 
         runtime.logger = new Logger(this.settings.logLevel);
+        if (this.droppedExportedShares > 0) {
+            runtime.logger.warn(
+                `Dropped ${this.droppedExportedShares} malformed exported-share registry entries; ` +
+                    'they are never unshared or trashed.',
+            );
+        }
         // After the workspace is ready, so the first start of the day does not
         // delay anything the user is waiting for.
         setLogShowsNames(this.settings.logShowsNames ?? false);
@@ -228,6 +263,8 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 }
             }, PAUSED_REQUEST_CHECK_MS),
         );
+        // Expired share links are cleaned up once a day; see runShareJanitor.
+        this.registerInterval(window.setInterval(() => void this.runShareJanitor(), EXPORT_JANITOR_INTERVAL_MS));
 
         const clientUid = this.installationId();
         runtime.clientUid = clientUid;
@@ -380,6 +417,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 if (!this.settings.onboardingComplete) {
                     this.openSetup();
                 }
+                void this.runShareJanitor();
             });
         });
     }
@@ -1147,6 +1185,26 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? adopted);
 
         let changed = false;
+        // The old export setting never shipped in a release; drop it rather
+        // than let it preselect a destructive per-share toggle.
+        const legacyKeys = this.settings as unknown as Record<string, unknown>;
+        if ('autoDeleteExpiredExports' in legacyKeys) {
+            delete legacyKeys.autoDeleteExpiredExports;
+            changed = true;
+        }
+        // The registry is plain JSON: validate it, or a hand-edited or
+        // corrupt entry (a non-array, an entry without a path) throws inside
+        // the janitor and silently stops the cleanup. Malformed entries are
+        // dropped without touching Drive or the vault; the count is warned
+        // about once the logger exists in onload.
+        const droppedBefore = this.droppedExportedShares;
+        const registry = sanitizeExportedShares(this.settings.exportedShares, () => {
+            this.droppedExportedShares += 1;
+        });
+        if (this.droppedExportedShares !== droppedBefore) {
+            changed = true;
+        }
+        this.settings.exportedShares = registry;
         // Installations configured before the setup assistant existed have
         // no use for it.
         if (stored?.onboardingComplete === undefined && stored?.remoteFolderUid) {
@@ -1285,6 +1343,50 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'manage-shared-files',
+            icon: 'links',
+            name: 'Manage shared files',
+            callback: () => this.openSharedPdfsModal(),
+        });
+
+        // A file deleted by hand takes its link with it; do not wait for expiry.
+        this.registerEvent(
+            this.app.vault.on('delete', (file) => {
+                void this.forgetDeletedShare(file.path);
+            }),
+        );
+
+        this.addCommand({
+            id: 'share-file',
+            icon: 'share',
+            name: 'Share file with a Proton link',
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !this.isConfigured() || this.locked) {
+                    return false;
+                }
+                if (!checking) {
+                    this.openShareFileModal(file);
+                }
+                return true;
+            },
+        });
+
+        // Sharing from a note's context menu.
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu, file) => {
+                if (file instanceof TFile && this.isConfigured() && !this.locked) {
+                    menu.addItem((item) =>
+                        item
+                            .setTitle('Share file with a Proton link')
+                            .setIcon('share')
+                            .onClick(() => this.openShareFileModal(file)),
+                    );
+                }
+            }),
+        );
+
+        this.addCommand({
             id: 'unlock',
             icon: 'lock-open',
             name: 'Unlock with PIN',
@@ -1321,6 +1423,240 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             create: (options) => runtime.engine.createNoteShareLink(path, options),
             remove: () => runtime.engine.removeNoteShareLink(path),
         }).open();
+    }
+
+    /** List the shared files; stop sharing or delete. Delete only ever trashes a verified file. */
+    openSharedPdfsModal(): void {
+        const entries = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
+            runtime.logger.warn('Dropping a malformed shared-file entry; it is never unshared or trashed.', entry);
+        });
+        const drop = (entry: { path: string; nodeUid: string }): void => {
+            this.settings.exportedShares = this.settings.exportedShares.filter(
+                (item) => !(item.path === entry.path && item.nodeUid === entry.nodeUid),
+            );
+        };
+        new SharedPdfsModal(this.app, {
+            entries,
+            onStopSharing: async (entry) => {
+                await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                drop(entry);
+                await this.saveSettings();
+            },
+            onDelete: async (entry) => {
+                const pathValid = normalizeVaultPath(entry.path) !== null;
+                const currentUid = pathValid ? runtime.engine.nodeUidFor(entry.path) : null;
+                const file = pathValid ? this.app.vault.getAbstractFileByPath(entry.path) : null;
+                if (file instanceof TFolder) {
+                    throw new Error('that path is a folder, so it was left alone');
+                }
+                if (file instanceof TFile) {
+                    if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                        throw new Error('that file cannot be verified, so it was left alone');
+                    }
+                    await this.app.fileManager.trashFile(file);
+                } else if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                    throw new Error('that file is not in the vault any more and cannot be verified, so it was left alone');
+                }
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                } catch {
+                    // The link dies with the file on Drive; the registry entry
+                    // still has to go, or it would be retried forever.
+                }
+                drop(entry);
+                await this.saveSettings();
+            },
+        }).open();
+    }
+
+    /** Share any vault file with a view-only link. */
+    openShareFileModal(file: TFile): void {
+        new ExportPdfModal(this.app, {
+            noteName: file.name,
+            defaultDays: this.settings.shareExpiryDays,
+            defaultDeleteOnExpiry: this.settings.defaultDeleteOnExpiry,
+            title: 'Share file with a link',
+            intro: `“${file.name}” will get a view-only public link. The file stays in the vault and on Drive; only the link expires.`,
+            confirmText: 'Create link',
+            onConfirm: (days, deleteOnExpiry) => void this.shareFileWithLink(file.path, days, deleteOnExpiry),
+        }).open();
+    }
+
+    async shareFileWithLink(sourcePath: string, expiryDays: number | null, deleteOnExpiry = false): Promise<void> {
+        const file = this.app.vault.getAbstractFileByPath(sourcePath);
+        if (!(file instanceof TFile)) {
+            new Notice('That file is not in the vault any more.');
+            return;
+        }
+        if (!this.isConfigured() || this.locked || !runtime.engine.isConnected()) {
+            new Notice('Sign in and wait for the sync to connect before sharing.');
+            return;
+        }
+        try {
+            new Notice('Waiting for the file to reach Drive…');
+            const nodeUid = await this.waitForExportNodeUid(sourcePath);
+            const expiration = shareExpiration(expiryDays === null ? 0 : expiryDays);
+            new Notice('Creating the share link…');
+            const link = await withTimeout(
+                runtime.engine.createNoteShareLink(sourcePath, expiration ? { expiration } : {}),
+                30000,
+                'creating the share link timed out',
+            );
+            if (link.hasPassword) {
+                new Notice('That file already has a password-protected link; remove the password on Drive first.');
+                return;
+            }
+            this.settings.exportedShares = upsertExportedShare(
+                this.settings.exportedShares,
+                { ...buildExportedShare(sourcePath, link, runtime.engine.nodeUidFor(sourcePath) ?? nodeUid, 'attachment'), deleteOnExpiry },
+            );
+            await this.saveSettings();
+            new ShareLinkModal(this.app, {
+                url: link.url,
+                filePath: sourcePath,
+                expiresAt: link.expiration?.getTime() ?? null,
+            }).open();
+        } catch (error) {
+            new Notice(`Could not share this file: ${errorMessage(error)}`);
+        }
+    }
+
+    /**
+     * Expire share links once a day (and on load). Only the link goes by
+     * default; a file is trashed only when the share asked for it, the path
+     * is a canonical vault path, and the sync record still names the node the
+     * share was made for — a forged registry entry can never trash an
+     * arbitrary file. Folders are never trashed, and a file that is gone is
+     * never trashed either; its link is unshared only with a verified uid.
+     * Offline runs keep every entry for the next run instead of dropping
+     * links un-unshared.
+     */
+    async runShareJanitor(): Promise<void> {
+        const registry = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
+            runtime.logger.warn('Dropping a malformed shared-file entry; it is never unshared or trashed.', entry);
+        });
+        const due = selectExpiredShares(registry, Date.now());
+        if (due.length === 0) {
+            if (registry.length !== this.settings.exportedShares.length) {
+                this.settings.exportedShares = registry;
+                try {
+                    await this.saveSettings();
+                } catch (error) {
+                    runtime.logger.warn('Could not save the cleaned share registry.', error);
+                }
+            }
+            return;
+        }
+        if (!this.isConfigured() || this.locked || !runtime.engine.isConnected()) {
+            // Unsharing is impossible offline, and trashing now would strand
+            // a live link until the next sync carries the delete — keep every
+            // entry so the next connected run retries it.
+            runtime.logger.info('Share links expired while offline; they are kept for the next run.');
+            return;
+        }
+        let changed = false;
+        for (const entry of due) {
+            try {
+                const pathValid = normalizeVaultPath(entry.path) !== null;
+                const file = pathValid ? this.app.vault.getAbstractFileByPath(entry.path) : null;
+                const currentUid = pathValid ? runtime.engine.nodeUidFor(entry.path) : null;
+                const drop = (): void => {
+                    this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+                    changed = true;
+                };
+                if (file instanceof TFolder) {
+                    // Never trash a folder; its link is still removed.
+                    try {
+                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                    } catch (error) {
+                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+                        continue;
+                    }
+                    drop();
+                    continue;
+                }
+                if (entry.deleteOnExpiry === true) {
+                    if (!(file instanceof TFile)) {
+                        // Gone, or never a usable path: nothing to trash.
+                        // Unshare only with a verified uid; otherwise the
+                        // server-side expiry kills the link, so just drop.
+                        if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                            runtime.logger.warn(
+                                `Dropping the expired share for "${entry.path}": the file is gone and its link cannot be verified.`,
+                            );
+                            drop();
+                            continue;
+                        }
+                    } else if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                        runtime.logger.warn(
+                            `Refusing to trash the expired share for "${entry.path}": the file cannot be verified.`,
+                        );
+                        drop();
+                        continue;
+                    } else {
+                        try {
+                            await this.app.fileManager.trashFile(file);
+                        } catch (error) {
+                            runtime.logger.warn(`Could not trash expired file "${entry.path}"; it is kept for the next run.`, error);
+                            continue;
+                        }
+                    }
+                }
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                } catch (error) {
+                    runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+                    continue;
+                }
+                drop();
+            } catch (error) {
+                runtime.logger.warn('Could not clean up an expired share; it is kept for the next run.', error);
+            }
+        }
+        if (changed) {
+            try {
+                await this.saveSettings();
+            } catch (error) {
+                runtime.logger.warn('Could not save the registry after expiring shares.', error);
+            }
+        }
+    }
+
+    /** Drop the registry entry (and best-effort link) when its file is deleted. */
+    private async forgetDeletedShare(path: string): Promise<void> {
+        const entry = this.settings.exportedShares.find((item) => item.path === path);
+        if (entry === undefined) {
+            return;
+        }
+        try {
+            await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+        } catch {
+            // The node is gone on Drive too, so the link is dead either way.
+        }
+        this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+        try {
+            await this.saveSettings();
+        } catch (error) {
+            runtime.logger.warn('Could not save the registry after a file was deleted.', error);
+        }
+    }
+
+    /** Wait until the engine has uploaded a path and its record names the Drive node. */
+    private async waitForExportNodeUid(path: string): Promise<string> {
+        const deadline = Date.now() + EXPORT_NODE_WAIT_MS;
+        for (;;) {
+            const nodeUid = runtime.engine.nodeUidFor(path);
+            if (nodeUid !== null) {
+                return nodeUid;
+            }
+            if (Date.now() >= deadline) {
+                throw new Error(
+                    'the file has not synced to Proton Drive yet; ' +
+                        'share it from the sync panel once it has',
+                );
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, EXPORT_NODE_POLL_MS));
+        }
     }
 
     private registerVaultEvents(): void {

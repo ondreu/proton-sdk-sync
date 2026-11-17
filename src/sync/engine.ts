@@ -551,6 +551,15 @@ export class SyncEngine {
         return this.paused;
     }
 
+    /**
+     * Whether the path never syncs: excluded itself or below an excluded
+     * folder. The export flow refuses up front when the export path matches,
+     * instead of writing a PDF the sync would never upload.
+     */
+    isExcluded(path: string): boolean {
+        return this.filter.isExcludedWithAncestors(path);
+    }
+
     /** Whether Drive can be asked for a note's versions, the trash and share links: started, and not stopped since. */
     isConnected(): boolean {
         return this.running && this.drive !== null;
@@ -3737,6 +3746,23 @@ export class SyncEngine {
     /** Remove a note's public link. */
     async removeNoteShareLink(path: string): Promise<void> {
         await this.connectedDrive().removeShareLink(this.nodeUidOf(path));
+    }
+
+    /**
+     * The Drive node uid of a synced path, or null when it is not on Drive
+     * yet. The export flow polls this until the engine has uploaded the PDF.
+     */
+    nodeUidFor(path: string): string | null {
+        const record = this.state.get(path);
+        return record?.type === 'file' ? record.nodeUid : null;
+    }
+
+    /**
+     * Remove a public link by node uid. Used for exports whose vault path may
+     * already be gone, where resolving through the path no longer works.
+     */
+    async removeShareLinkByNodeUid(nodeUid: string): Promise<void> {
+        await this.connectedDrive().removeShareLink(nodeUid);
     }
 
     /**
