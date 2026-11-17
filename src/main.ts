@@ -149,6 +149,10 @@ type PdfWebview = HTMLElement & {
 /** Resolve once the webview's page has loaded, so the note can be injected. */
 function pdfWebviewReady(webview: PdfWebview): Promise<void> {
     return new Promise((resolve, reject) => {
+        if (typeof webview.printToPDF !== 'function') {
+            reject(new Error('Electron PDF printing is not available in this build'));
+            return;
+        }
         const timer = window.setTimeout(() => reject(new Error('the PDF preview never loaded')), 30_000);
         const fail = (): void => {
             window.clearTimeout(timer);
@@ -159,6 +163,10 @@ function pdfWebviewReady(webview: PdfWebview): Promise<void> {
             resolve();
         });
         webview.addEventListener('did-fail-load', fail);
+        webview.addEventListener('did-finish-load', () => {
+            window.clearTimeout(timer);
+            resolve();
+        });
     });
 }
 
@@ -1830,6 +1838,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                     img.setAttribute('src', this.app.vault.getResourcePath(target));
                 }
             }
+            // Listen before the navigation starts: a cached app:// page can
+            // fire dom-ready while appendChild is still running, and a
+            // listener added afterwards would wait for the next load forever.
+            const ready = pdfWebviewReady(webview);
             webview.setAttribute('src', 'app://obsidian.md/help.html');
             // No `nodeintegration`: nothing printed needs Node in the guest,
             // and it would promote any markup the renderer passed through
@@ -1837,13 +1849,23 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             // URLs, which need no Node APIs.
             webview.addClass('proton-sdk-sync-pdf-webview');
             activeDocument.body.appendChild(webview);
-            await pdfWebviewReady(webview);
+            await ready;
             const safeHtml = sanitizeExportHtml(rendered.innerHTML);
-            const textLength = await webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml));
+            const textLength = await withTimeout(
+                webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml)),
+                15000,
+                'the PDF page did not accept the note',
+            );
             if (typeof textLength !== 'number' || textLength === 0) {
                 throw new Error('the note rendered as an empty page');
             }
-            return new Uint8Array(await webview.printToPDF({ printBackground: true, pageSize: 'A4' }));
+            return new Uint8Array(
+                await withTimeout(
+                    webview.printToPDF({ printBackground: true, pageSize: 'A4' }),
+                    30000,
+                    'printing the PDF timed out',
+                ),
+            );
         } finally {
             component.unload();
             webview.remove();

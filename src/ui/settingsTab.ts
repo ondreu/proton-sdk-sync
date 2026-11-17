@@ -404,9 +404,21 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
             items: [
                 {
                     name: 'When a file changes in two places',
-                    desc: CONFLICT_POLICY_HELP[policy],
                     aliases: ['conflict policy', 'merge'],
-                    control: { type: 'dropdown', key: 'conflictPolicy', options: CONFLICT_POLICIES },
+                    render: (setting) => {
+                        // Stacked on purpose: the explanation is several lines
+                        // and a side-by-side dropdown squeezes it into a
+                        // narrow column.
+                        setting.setClass('pss-stacked-setting');
+                        setting.setDesc(CONFLICT_POLICY_HELP[policy]);
+                        setting.addDropdown((dropdown) => {
+                            for (const [value, label] of Object.entries(CONFLICT_POLICIES)) {
+                                dropdown.addOption(value, label);
+                            }
+                            dropdown.setValue(this.plugin.settings.conflictPolicy);
+                            dropdown.onChange((value) => void this.setControlValue('conflictPolicy', value));
+                        });
+                    },
                 },
                 {
                     name: `${conflicts} file${conflicts === 1 ? '' : 's'} waiting on a decision`,

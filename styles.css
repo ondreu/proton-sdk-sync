@@ -671,3 +671,21 @@ button.proton-sdk-sync-version:hover {
     border: 0;
     visibility: hidden;
 }
+
+/* A conflict-policy explanation needs the row's full width; the dropdown sits under it. */
+.pss-stacked-setting {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+}
+.pss-stacked-setting .setting-item-info {
+    width: 100%;
+}
+.pss-stacked-setting .setting-item-control {
+    width: 100%;
+    margin-top: 8px;
+    justify-content: flex-start;
+}
+.pss-stacked-setting .setting-item-control select {
+    flex: 1 1 auto;
+}
