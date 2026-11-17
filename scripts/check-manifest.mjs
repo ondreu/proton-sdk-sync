@@ -46,6 +46,9 @@ if (!description.endsWith('.')) {
 if (description.toLowerCase().startsWith((manifest.name ?? '').toLowerCase())) {
     problems.push('description should not repeat the plugin name');
 }
+if (description.toLowerCase().includes('obsidian')) {
+    problems.push('description must not contain "Obsidian"; the directory treats it as redundant');
+}
 if (typeof manifest.isDesktopOnly !== 'boolean') {
     problems.push('isDesktopOnly must be true or false');
 }

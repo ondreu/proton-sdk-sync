@@ -4,6 +4,20 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
+## [1.1.1] — 2026-11-17
+
+### Fixed
+
+- The community directory rejects a description that contains the word
+  "Obsidian" ("implied by the context"), and 1.1.0 was rejected for it. The
+  About text now says "your vault and Proton Drive" and still names the
+  three-way conflict detection and the headless daemon.
+
+### Added
+
+- `npm run check:manifest` now enforces that rule, so a release cannot repeat
+  this. It was the one directory rule the check did not cover.
+
 ## [1.1.0] — 2026-11-17
 
 ### Added

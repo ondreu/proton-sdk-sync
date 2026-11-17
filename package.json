@@ -1,7 +1,7 @@
 {
     "name": "proton-sdk-sync",
-    "version": "1.1.0",
-    "description": "End-to-end encrypted two-way sync between an Obsidian vault and Proton Drive, with three-way conflict detection. Includes a headless daemon for Linux servers.",
+    "version": "1.1.1",
+    "description": "End-to-end encrypted two-way sync between your vault and Proton Drive, with three-way conflict detection. Includes a headless daemon for Linux servers.",
     "main": "main.js",
     "private": true,
     "workspaces": [
