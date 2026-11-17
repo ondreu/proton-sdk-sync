@@ -59,7 +59,8 @@ metrics are discarded.
 
 ## Headless daemon
 
-The NAS daemon (`headless/`) reuses the same session format and the same
+The NAS daemon ([ondreu/pss-daemon](https://github.com/ondreu/pss-daemon))
+reuses the same session format and the same
 network endpoints as the plugin; only the custody differs.
 
 **Key custody and rotation.** The session file is encrypted with AES-256-GCM;
@@ -81,7 +82,7 @@ reporting "not signed in".
 vault): `session.bin` and `drive-cache.bin` mode `0600` in dirs mode `0700`
 (healed on every write); `sync-state.json`, `status.json`, `device-id` and
 both lock dirs are equally owner-only — `0600`/`0700`, written with explicit
-modes and healed on every open (see `headless/src/secureFs.ts`). Verify
+modes and healed on every open (see `src/secureFs.ts` there). Verify
 after first start:
 `find /data/pss-daemon -perm /077` must print nothing. Nothing secret ever
 lands in the vault.

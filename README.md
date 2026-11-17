@@ -24,7 +24,7 @@ It exists for three reasons:
   after the engine suite, the daemon suite and the fake-Drive integration
   harness are green.
 - **It goes further than a plugin.** The same engine also runs as a headless
-  daemon on a Linux server (`headless/`), so a vault can stay in sync on a NAS
+  daemon on a Linux server ([ondreu/pss-daemon](https://github.com/ondreu/pss-daemon)), so a vault can stay in sync on a NAS
   without Obsidian Sync and without a desktop running. Upstream has no such
   mode.
 
