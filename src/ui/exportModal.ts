@@ -28,6 +28,7 @@ export function copyText(text: string): Promise<void> {
 export class ExportPdfModal extends Modal {
     private days: number | null;
     private mode: 'preset' | 'custom' | 'never' = 'preset';
+    private deleteOnExpiry = false;
     private customRow: HTMLElement | null = null;
     private customInput: TextComponent | null = null;
 
@@ -36,7 +37,7 @@ export class ExportPdfModal extends Modal {
         private readonly options: {
             noteName: string;
             defaultDays: number;
-            onConfirm: (days: number | null) => void;
+            onConfirm: (days: number | null, deleteOnExpiry: boolean) => void;
             title?: string;
             intro?: string;
             confirmText?: string;
@@ -95,6 +96,15 @@ export class ExportPdfModal extends Modal {
         });
 
         new Setting(contentEl)
+            .setName('Delete the file when the link expires')
+            .setDesc('Off by default: only the link expires and the file stays. On: the file is moved to the trash at expiry.')
+            .addToggle((toggle) =>
+                toggle.setValue(false).onChange((value) => {
+                    this.deleteOnExpiry = value;
+                }),
+            );
+
+        new Setting(contentEl)
             .addButton((button) =>
                 button.setButtonText('Cancel').onClick(() => {
                     this.close();
@@ -113,7 +123,7 @@ export class ExportPdfModal extends Modal {
                             return;
                         }
                         this.close();
-                        this.options.onConfirm(this.mode === 'never' ? null : this.days);
+                        this.options.onConfirm(this.mode === 'never' ? null : this.days, this.deleteOnExpiry);
                     }),
             );
     }

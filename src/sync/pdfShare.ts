@@ -17,8 +17,10 @@ export type ExportedShare = {
     url: string;
     /** Epoch ms when the link expires; null when it never does. */
     expiresAt: number | null;
-    /** Drive node uid of the exported PDF, for best-effort unsharing. */
+    /** Drive node uid of the shared file, for best-effort unsharing. */
     nodeUid: string;
+    /** Off by default: at expiry only the link goes; on, the file is trashed too. */
+    deleteOnExpiry?: boolean;
 };
 
 /** Where exported PDFs go unless configured otherwise. */

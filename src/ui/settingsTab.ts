@@ -501,22 +501,16 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
     private exportGroup(): SettingDefinitionItem {
         return {
             type: 'group',
-            heading: 'PDF export and sharing',
+            heading: 'Sharing',
             items: [
                 {
                     name: 'How sharing works',
-                    desc: 'Exporting a note renders it to PDF in the export folder below and gives that PDF a public, view-only link with the expiry you pick in the dialog. The link can be copied from the result dialog or later under “Manage shared files”. When the link expires, the PDF is moved to the trash and the link is removed. Files you share directly (images, PDFs and other attachments) keep their bytes: only the link expires, and deleting the file removes its link.',
+                    desc: 'Any file in the vault can get a view-only Proton link: notes (shared as the file itself), images, PDFs and other attachments. You pick the link lifetime in the dialog; when it expires the link is removed. The file stays unless you tick “Delete the file when the link expires” there (off by default). Deleting a file yourself removes its link too. “Manage shared files” lists every link, with copy, stop sharing and delete.',
                 },
                 {
-                    name: 'Export folder',
-                    desc: 'Exported PDFs are written here. Changing it leaves earlier exports where they are.',
-                    aliases: ['pdf'],
-                    control: { type: 'text', key: 'exportFolder' },
-                },
-                {
-                    name: 'Share links expire after',
-                    desc: 'In days. 0 means an export’s link never expires, and then the cleanup below has nothing to do.',
-                    aliases: ['expiry', 'pdf'],
+                    name: 'Default link lifetime',
+                    desc: 'In days, offered as the preselection when you share. The dialog lets you change it per file, including never. 0 means never.',
+                    aliases: ['expiry', 'sharing'],
                     control: {
                         type: 'number',
                         key: 'shareExpiryDays',
@@ -526,15 +520,9 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                     },
                 },
                 {
-                    name: 'Delete expired exports',
-                    desc: 'Once an export’s link has expired, remove its link and move the PDF to Obsidian’s trash. Only files listed as exports, inside the export folder, are ever touched.',
-                    aliases: ['cleanup', 'pdf'],
-                    control: { type: 'toggle', key: 'autoDeleteExpiredExports' },
-                },
-                {
                     name: 'Manage shared files',
-                    desc: 'See every PDF export and shared attachment with its link and expiry; copy a link, stop sharing, or delete an export early.',
-                    aliases: ['links', 'sharing', 'pdf'],
+                    desc: 'See every shared file with its link and expiry; copy a link, stop sharing, or delete the file and its link.',
+                    aliases: ['links', 'sharing'],
                     action: () => this.plugin.openSharedPdfsModal(),
                 },
             ],

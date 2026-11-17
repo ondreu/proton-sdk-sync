@@ -7,8 +7,6 @@ import { getRuntime } from './runtime';
 import {
     apiVersion,
     type App,
-    Component,
-    MarkdownRenderer,
     MarkdownView,
     Notice,
     Platform,
@@ -44,14 +42,8 @@ import {
     EXPORT_NODE_POLL_MS,
     EXPORT_NODE_WAIT_MS,
     isExportPath,
-    janitorEntryPlan,
-    normalizeExportFolder,
-    resolveExportPath,
     sanitizeExportedShares,
-    exportPdfName,
-    sanitizeExportHtml,
     selectExpiredShares,
-    selectJanitorDeletions,
     shareExpiration,
     upsertExportedShare,
 } from './sync/pdfShare';
@@ -148,28 +140,6 @@ type PdfWebview = HTMLElement & {
  * Poll until the injected page has text and its images have settled. A fixed
  * delay would be guesswork, and requestAnimationFrame never fires offscreen.
  */
-function mimeForExtension(extension: string): string {
-    switch (extension.toLowerCase()) {
-        case 'png':
-            return 'image/png';
-        case 'jpg':
-        case 'jpeg':
-            return 'image/jpeg';
-        case 'gif':
-            return 'image/gif';
-        case 'webp':
-            return 'image/webp';
-        case 'svg':
-            return 'image/svg+xml';
-        case 'bmp':
-            return 'image/bmp';
-        case 'avif':
-            return 'image/avif';
-        default:
-            return 'application/octet-stream';
-    }
-}
-
 /** Reject instead of waiting forever on an Electron/SDK call that never settles. */
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -304,7 +274,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }, PAUSED_REQUEST_CHECK_MS),
         );
         // Expired exports are cleaned up once a day; see runExportJanitor.
-        this.registerInterval(window.setInterval(() => void this.runExportJanitor(), EXPORT_JANITOR_INTERVAL_MS));
+        this.registerInterval(window.setInterval(() => void this.runShareJanitor(), EXPORT_JANITOR_INTERVAL_MS));
 
         const clientUid = this.installationId();
         runtime.clientUid = clientUid;
@@ -457,7 +427,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 if (!this.settings.onboardingComplete) {
                     this.openSetup();
                 }
-                void this.runExportJanitor();
+                void this.runShareJanitor();
             });
         });
     }
@@ -1376,25 +1346,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'export-pdf-share',
-            icon: 'link',
-            name: 'Export note to PDF and share',
-            checkCallback: (checking) => {
-                if (!Platform.isDesktop || !Platform.isDesktopApp) {
-                    return false;
-                }
-                const file = this.app.workspace.getActiveFile();
-                if (!file || file.extension !== 'md' || !this.isConfigured() || this.locked) {
-                    return false;
-                }
-                if (!checking) {
-                    this.openExportModal(file);
-                }
-                return true;
-            },
-        });
-
-        this.addCommand({
             id: 'manage-shared-pdfs',
             icon: 'links',
             name: 'Manage shared PDFs',
@@ -1427,26 +1378,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // The same export from a note's context menu.
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
-                if (
-                    file instanceof TFile &&
-                    file.extension === 'md' &&
-                    Platform.isDesktop &&
-                    Platform.isDesktopApp &&
-                    this.isConfigured() &&
-                    !this.locked
-                ) {
-                    menu.addItem((item) =>
-                        item
-                            .setTitle('Export note to PDF and share')
-                            .setIcon('link')
-                            .onClick(() => this.openExportModal(file)),
-                    );
-                } else if (
-                    file instanceof TFile &&
-                    file.extension !== 'md' &&
-                    this.isConfigured() &&
-                    !this.locked
-                ) {
+                if (file instanceof TFile && this.isConfigured() && !this.locked) {
                     menu.addItem((item) =>
                         item
                             .setTitle('Share file with a Proton link')
@@ -1506,14 +1438,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * existing link for the export is reused rather than making a second one.
      */
     /** Ask for the link lifetime first; nothing is rendered before the answer. */
-    openExportModal(file: TFile): void {
-        new ExportPdfModal(this.app, {
-            noteName: file.basename,
-            defaultDays: this.settings.shareExpiryDays,
-            onConfirm: (days) => void this.exportNoteToPdfAndShare(file.path, days),
-        }).open();
-    }
-
     /** List the exported PDFs that are still shared; stop sharing or delete. */
     openSharedPdfsModal(): void {
         const entries = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
@@ -1553,32 +1477,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
 
 
     /** A PDF just appeared from Obsidian's exporter: share it as an export. */
-    private async shareExportedPdf(file: TFile, expiryDays: number): Promise<void> {
-        try {
-            new Notice('Uploading the PDF…');
-            const nodeUid = await this.waitForExportNodeUid(file.path);
-            new Notice('Creating the share link…');
-            const expiration = shareExpiration(expiryDays);
-            const link = await withTimeout(
-                runtime.engine.createNoteShareLink(file.path, expiration ? { expiration } : {}),
-                30000,
-                'creating the share link timed out',
-            );
-            this.settings.exportedShares = upsertExportedShare(
-                this.settings.exportedShares,
-                buildExportedShare(file.path, link, runtime.engine.nodeUidFor(file.path) ?? nodeUid, 'export'),
-            );
-            await this.saveSettings();
-            new ShareLinkModal(this.app, {
-                url: link.url,
-                filePath: file.path,
-                expiresAt: link.expiration?.getTime() ?? null,
-            }).open();
-        } catch (error) {
-            new Notice(`Could not share the PDF: ${errorMessage(error)}`);
-        }
-    }
-
     /** Share any vault file (an image, a PDF, a zip) with a view-only link. */
     openShareFileModal(file: TFile): void {
         new ExportPdfModal(this.app, {
@@ -1587,11 +1485,11 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             title: 'Share file with a link',
             intro: `“${file.name}” will get a view-only public link. The file stays in the vault and on Drive; only the link expires.`,
             confirmText: 'Create link',
-            onConfirm: (days) => void this.shareFileWithLink(file.path, days),
+            onConfirm: (days, deleteOnExpiry) => void this.shareFileWithLink(file.path, days, deleteOnExpiry),
         }).open();
     }
 
-    async shareFileWithLink(sourcePath: string, expiryDays: number | null): Promise<void> {
+    async shareFileWithLink(sourcePath: string, expiryDays: number | null, deleteOnExpiry = false): Promise<void> {
         const file = this.app.vault.getAbstractFileByPath(sourcePath);
         if (!(file instanceof TFile)) {
             new Notice('That file is not in the vault any more.');
@@ -1617,7 +1515,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }
             this.settings.exportedShares = upsertExportedShare(
                 this.settings.exportedShares,
-                buildExportedShare(sourcePath, link, runtime.engine.nodeUidFor(sourcePath) ?? nodeUid, 'attachment'),
+                { ...buildExportedShare(sourcePath, link, runtime.engine.nodeUidFor(sourcePath) ?? nodeUid, 'attachment'), deleteOnExpiry },
             );
             await this.saveSettings();
             new ShareLinkModal(this.app, {
@@ -1627,6 +1525,68 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }).open();
         } catch (error) {
             new Notice(`Could not share this file: ${errorMessage(error)}`);
+        }
+    }
+
+    /**
+     * Expire share links once a day (and on load). Only the link goes by
+     * default; a file is deleted only when the share asked for it, and never
+     * a folder.
+     */
+    async runShareJanitor(): Promise<void> {
+        const registry = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
+            runtime.logger.warn('Dropping a malformed shared-file entry; it is never unshared or trashed.', entry);
+        });
+        const due = selectExpiredShares(registry, Date.now());
+        if (due.length === 0) {
+            if (registry.length !== this.settings.exportedShares.length) {
+                this.settings.exportedShares = registry;
+                try {
+                    await this.saveSettings();
+                } catch (error) {
+                    runtime.logger.warn('Could not save the cleaned share registry.', error);
+                }
+            }
+            return;
+        }
+        const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
+        let changed = false;
+        for (const entry of due) {
+            try {
+                if (entry.deleteOnExpiry === true) {
+                    const file = this.app.vault.getAbstractFileByPath(entry.path);
+                    if (file instanceof TFolder) {
+                        continue;
+                    }
+                    if (file instanceof TFile) {
+                        try {
+                            await this.app.fileManager.trashFile(file);
+                        } catch (error) {
+                            runtime.logger.warn(`Could not trash expired file "${entry.path}"; it is kept for the next run.`, error);
+                            continue;
+                        }
+                    }
+                }
+                if (connected) {
+                    try {
+                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                    } catch (error) {
+                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+                        continue;
+                    }
+                }
+                this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+                changed = true;
+            } catch (error) {
+                runtime.logger.warn('Could not clean up an expired share; it is kept for the next run.', error);
+            }
+        }
+        if (changed) {
+            try {
+                await this.saveSettings();
+            } catch (error) {
+                runtime.logger.warn('Could not save the registry after expiring shares.', error);
+            }
         }
     }
 
@@ -1650,86 +1610,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /** At expiry an attachment keeps its bytes: only the link goes. */
-    private async expireAttachmentShares(): Promise<void> {
-        const now = Date.now();
-        const due = selectExpiredShares(sanitizeExportedShares(this.settings.exportedShares, () => undefined), now).filter(
-            (entry) => (entry.kind ?? 'export') === 'attachment',
-        );
-        if (due.length === 0) {
-            return;
-        }
-        const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
-        let changed = false;
-        for (const entry of due) {
-            if (connected) {
-                try {
-                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
-                } catch (error) {
-                    runtime.logger.warn('Could not remove an expired attachment link; it is kept for the next run.', error);
-                    continue;
-                }
-            }
-            this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
-            changed = true;
-        }
-        if (changed) {
-            try {
-                await this.saveSettings();
-            } catch (error) {
-                runtime.logger.warn('Could not save the registry after expiring attachment links.', error);
-            }
-        }
-    }
-
-    async exportNoteToPdfAndShare(sourcePath?: string, expiryDays: number | null | undefined = undefined): Promise<void> {
-        if (!Platform.isDesktop || !Platform.isDesktopApp) {
-            new Notice('Exporting a note to PDF needs the desktop app.');
-            return;
-        }
-        const file =
-            sourcePath !== undefined
-                ? this.app.vault.getAbstractFileByPath(sourcePath)
-                : this.app.workspace.getActiveFile();
-        if (!(file instanceof TFile) || file.extension !== 'md') {
-            new Notice('Open a note first, then export it.');
-            return;
-        }
-        if (!this.isConfigured() || this.locked || !runtime.engine.isConnected()) {
-            new Notice('Sign in and wait for the sync to connect before exporting.');
-            return;
-        }
-        const expiry = expiryDays === null ? 0 : (expiryDays ?? this.settings.shareExpiryDays);
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view === null || view.file?.path !== file.path) {
-            new Notice('Open the note first, then export it.');
-            return;
-        }
-        await this.ensureExportFolder(this.settings.exportFolder);
-        const exportPath = resolveExportPath(
-            this.settings.exportFolder,
-            exportPdfName(file.basename),
-            (path) => this.app.vault.getAbstractFileByPath(path) !== null,
-        );
-        try {
-            new Notice('Rendering the PDF…');
-            const pdf = await withTimeout(this.renderNoteToPdf(file), 60000, 'rendering the PDF timed out');
-            const buffer = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength) as ArrayBuffer;
-            const previous = this.app.vault.getAbstractFileByPath(exportPath);
-            if (previous instanceof TFile) {
-                await this.app.vault.modifyBinary(previous, buffer);
-            } else {
-                await this.app.vault.createBinary(exportPath, buffer);
-            }
-            const written = this.app.vault.getAbstractFileByPath(exportPath);
-            if (!(written instanceof TFile)) {
-                throw new Error('the PDF was not written to the vault');
-            }
-            await this.shareExportedPdf(written, expiry);
-        } catch (error) {
-            new Notice(`Could not export this note: ${errorMessage(error)}`);
-        }
-    }
-
     /**
      * Render a note to PDF in a throwaway BrowserWindow.
      *
@@ -1744,143 +1624,8 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * data URLs (an `app://` URL does not resolve from a data-URL page), and
      * embedded notes are rendered recursively, up to a small depth.
      */
-    private async inlineEmbeds(root: HTMLElement, sourcePath: string, component: Component, depth: number): Promise<void> {
-        const images = Array.from(root.querySelectorAll('img'));
-        let budget = 25 * 1024 * 1024;
-        // MarkdownRenderer already turned vault images into app:// resource
-        // URLs, which getFirstLinkpathDest cannot resolve; map them back.
-        const byResource = new Map<string, TFile>();
-        for (const file of this.app.vault.getFiles()) {
-            try {
-                byResource.set(this.app.vault.getResourcePath(file), file);
-            } catch {
-                // Not a file the platform can address.
-            }
-        }
-        for (const img of images) {
-            const src = img.getAttribute('src');
-            if (!src || /^(https?:|data:|blob:)/i.test(src)) {
-                continue;
-            }
-            let target: TFile | null = byResource.get(src) ?? null;
-            if (target === null) {
-                target = this.app.metadataCache.getFirstLinkpathDest(src, sourcePath);
-            }
-            if (target === null && src.startsWith('app://')) {
-                // Last resort: a resource URL that differs by encoding only.
-                const decoded = decodeURIComponent(src);
-                target = this.app.vault.getFiles().find((file) => decoded.endsWith(`/${file.path}`)) ?? null;
-            }
-            if (!(target instanceof TFile) || budget <= 0) {
-                continue;
-            }
-            const data = await this.app.vault.readBinary(target);
-            if (data.byteLength > budget) {
-                continue;
-            }
-            budget -= data.byteLength;
-            const mime = mimeForExtension(target.extension);
-            img.setAttribute('src', `data:${mime};base64,${Buffer.from(data).toString('base64')}`);
-        }
-        if (depth >= 3) {
-            return;
-        }
-        for (const embed of Array.from(root.querySelectorAll('.internal-embed[src], .markdown-embed[src]'))) {
-            const link = embed.getAttribute('src');
-            if (!link) {
-                continue;
-            }
-            const target = this.app.metadataCache.getFirstLinkpathDest(link, sourcePath);
-            if (!(target instanceof TFile) || target.extension !== 'md') {
-                continue;
-            }
-            const markdown = await this.app.vault.read(target);
-            const inner = createDiv();
-            await MarkdownRenderer.render(this.app, markdown, inner, target.path, component);
-            await this.inlineEmbeds(inner, target.path, component, depth + 1);
-            embed.empty();
-            embed.appendChild(inner);
-        }
-    }
-
-    private async renderNoteToPdf(note: TFile): Promise<Uint8Array> {
-        const nodeRequire = (window as unknown as { require: (module: string) => unknown }).require;
-        const electron = nodeRequire('electron') as {
-            remote?: {
-                BrowserWindow?: new (options: Record<string, unknown>) => {
-                    loadURL(url: string): Promise<void>;
-                    webContents: { printToPDF(options: Record<string, unknown>): Promise<Uint8Array> };
-                    destroy(): void;
-                };
-            };
-        };
-        const BrowserWindow = electron.remote?.BrowserWindow;
-        if (BrowserWindow === undefined) {
-            throw new Error('Electron remote is not available in this build');
-        }
-        const markdown = await this.app.vault.read(note);
-        const component = new Component();
-        const rendered = createDiv();
-        try {
-            await MarkdownRenderer.render(this.app, markdown, rendered, note.path, component);
-            await this.inlineEmbeds(rendered, note.path, component, 0);
-            const css =
-                'html,body{margin:0;padding:24px;background:#fff;color:#000;font-family:var(--font-text, sans-serif);}' +
-                'img{max-width:100%;}pre,code{white-space:pre-wrap;word-break:break-word;}' +
-                'table{border-collapse:collapse;}th,td{border:1px solid #ccc;padding:4px 8px;}' +
-                '.internal-embed,.markdown-embed{display:block;border-left:2px solid #ddd;padding-left:10px;margin:8px 0;}' +
-                '.markdown-embed-title{font-weight:600;margin-bottom:4px;}';
-            const html =
-                `<!doctype html><html><head><meta charset="utf-8">` +
-                `<base href="app://obsidian.md/"><style>${css}</style></head><body>` +
-                sanitizeExportHtml(rendered.innerHTML) +
-                `</body></html>`;
-            // A data: URL hits Chromium's length limit as soon as images are
-            // inlined; a temp file has no such ceiling.
-            const os = nodeRequire('node:os') as { tmpdir(): string };
-            const fs = nodeRequire('node:fs/promises') as {
-                writeFile(path: string, data: string): Promise<void>;
-                unlink(path: string): Promise<void>;
-            };
-            const path = nodeRequire('node:path') as { join(...parts: string[]): string };
-            const target = path.join(os.tmpdir(), `pss-print-${Date.now()}-${Math.random().toString(36).slice(2)}.html`);
-            await fs.writeFile(target, html);
-            const win = new BrowserWindow({
-                show: false,
-                width: 800,
-                height: 600,
-                webPreferences: { nodeIntegration: false, contextIsolation: true, webSecurity: false },
-            });
-            try {
-                await win.loadURL(`file://${target}`);
-                await new Promise((resolve) => window.setTimeout(resolve, 300));
-                const pdf = await win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' });
-                return new Uint8Array(pdf);
-            } finally {
-                win.destroy();
-                await fs.unlink(target).catch(() => undefined);
-            }
-        } finally {
-            component.unload();
-        }
-    }
-
     /** Create the export folder (and its parents) when it does not exist yet. */
     /** Create the export folder (and its parents) when it does not exist yet. */
-    private async ensureExportFolder(folder: string): Promise<void> {
-        const clean = normalizeExportFolder(folder);
-        if (clean === '') {
-            return;
-        }
-        let path = '';
-        for (const segment of clean.split('/')) {
-            path = path === '' ? segment : `${path}/${segment}`;
-            if (this.app.vault.getAbstractFileByPath(path) === null) {
-                await this.app.vault.createFolder(path);
-            }
-        }
-    }
-
     /**
      * Print the webview through Obsidian's `print-to-pdf` IPC: the main
      * process prints the sender's webContents and writes it to `filepath`,
@@ -1967,87 +1712,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * lint forbids enforcing here. Either way the sync carries the deletion
      * to Drive, where the link dies with the file.
      */
-    async runExportJanitor(): Promise<void> {
-        await this.expireAttachmentShares();
-        if (!this.settings.autoDeleteExpiredExports) {
-            return;
-        }
-        const folder = this.settings.exportFolder;
-        const registry = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
-            runtime.logger.warn('Dropping a malformed exported-share entry; it is never unshared or trashed.', entry);
-        });
-        const now = Date.now();
-        const due = selectJanitorDeletions(registry, now, folder);
-        if (due.length === 0) {
-            if (registry.length !== this.settings.exportedShares.length) {
-                this.settings.exportedShares = registry;
-                try {
-                    await this.saveSettings();
-                } catch (error) {
-                    runtime.logger.warn('Could not save the cleaned export registry.', error);
-                }
-            }
-            return;
-        }
-        const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
-        const removed = new Set<string>();
-        let trashFailures = 0;
-        for (const entry of due) {
-            // One bad entry must never stop the run.
-            try {
-                const file = this.app.vault.getAbstractFileByPath(entry.path);
-                const plan = janitorEntryPlan(
-                    isExportPath(folder, entry.path),
-                    file instanceof TFile ? 'file' : file === null || file === undefined ? 'gone' : 'other',
-                );
-                if (plan === 'leave') {
-                    continue;
-                }
-                if (plan === 'trash-then-unshare') {
-                    // The plan says `file` above; re-checked so the trash
-                    // call narrows instead of casting.
-                    if (!(file instanceof TFile)) {
-                        continue;
-                    }
-                    try {
-                        // The user's trash preference (Obsidian or system): the review lint forbids forcing one.
-                        await this.app.fileManager.trashFile(file);
-                    } catch {
-                        // Kept, retried next run; counted for one summary
-                        // warning below instead of one line per entry.
-                        trashFailures += 1;
-                        continue;
-                    }
-                }
-                if (connected) {
-                    try {
-                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
-                    } catch (error) {
-                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
-                        continue;
-                    }
-                }
-                removed.add(entry.path);
-            } catch (error) {
-                runtime.logger.warn('Could not clean up an expired export; it is kept for the next run.', error);
-            }
-        }
-        if (trashFailures > 0) {
-            runtime.logger.warn(
-                `Kept ${trashFailures} expired export(s): trashing failed; will retry on the next run.`,
-            );
-        }
-        const next = registry.filter((share) => !removed.has(share.path));
-        if (next.length !== this.settings.exportedShares.length) {
-            this.settings.exportedShares = next;
-            try {
-                await this.saveSettings();
-            } catch (error) {
-                runtime.logger.warn('Could not save the cleaned export registry.', error);
-            }
-        }
-    }
-
     private registerVaultEvents(): void {
         const { vault } = this.app;
 
