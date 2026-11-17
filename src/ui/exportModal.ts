@@ -1,34 +1,43 @@
 import { App, Modal, Notice, Platform, Setting, TextComponent } from 'obsidian';
 import type { ExportedShare } from '../sync/pdfShare';
+import { MAX_SHARE_EXPIRY_DAYS, isValidShareExpiryDays, parseCustomExpiryDays } from '../sync/pdfShare';
 
 const PRESETS = [7, 30, 90];
 
-/** Electron's clipboard works without a permission prompt; the web API does not always. */
-export function copyText(text: string): Promise<void> {
+/**
+ * Electron's clipboard works without a permission prompt; the web API does
+ * not always. Async so a missing clipboard rejects instead of throwing
+ * synchronously past the caller's `.then()` handlers.
+ */
+export async function copyText(text: string): Promise<void> {
     if (Platform.isDesktopApp) {
         try {
             const electron = (window as unknown as { require?: (module: string) => { clipboard?: { writeText: (value: string) => void } } })
                 .require?.('electron');
             if (electron?.clipboard) {
                 electron.clipboard.writeText(text);
-                return Promise.resolve();
+                return;
             }
         } catch {
             // Fall through to the web API.
         }
     }
-    return navigator.clipboard.writeText(text);
+    const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
+    if (clipboard === undefined) {
+        throw new Error('no clipboard available');
+    }
+    await clipboard.writeText(text);
 }
 
 /**
- * Ask for the link lifetime before doing any work, so the export cannot
+ * Ask for the link lifetime before doing any work, so the share cannot
  * surprise the user with a link that lives longer (or shorter) than expected.
- * The settings' value is only the preselection.
+ * The settings' value is only the preselection; 0 preselects Never.
  */
 export class ExportPdfModal extends Modal {
     private days: number | null;
     private mode: 'preset' | 'custom' | 'never' = 'preset';
-    private deleteOnExpiry = false;
+    private deleteOnExpiry: boolean;
     private customRow: HTMLElement | null = null;
     private customInput: TextComponent | null = null;
 
@@ -37,6 +46,7 @@ export class ExportPdfModal extends Modal {
         private readonly options: {
             noteName: string;
             defaultDays: number;
+            defaultDeleteOnExpiry: boolean;
             onConfirm: (days: number | null, deleteOnExpiry: boolean) => void;
             title?: string;
             intro?: string;
@@ -44,16 +54,22 @@ export class ExportPdfModal extends Modal {
         },
     ) {
         super(app);
-        this.days = options.defaultDays > 0 ? options.defaultDays : 30;
+        if (options.defaultDays === 0) {
+            this.days = null;
+        } else {
+            const fallback = Math.floor(options.defaultDays);
+            this.days = isValidShareExpiryDays(fallback) ? fallback : 30;
+        }
+        this.deleteOnExpiry = options.defaultDeleteOnExpiry;
     }
 
     override onOpen(): void {
         const { contentEl } = this;
-        contentEl.createEl('h3', { text: this.options.title ?? 'Export to PDF and share' });
+        contentEl.createEl('h3', { text: this.options.title ?? 'Share file with a link' });
         contentEl.createEl('p', {
             text:
                 this.options.intro ??
-                `“${this.options.noteName}” will be exported to the export folder and shared with a view-only link. The PDF is deleted when the link expires.`,
+                `“${this.options.noteName}” will get a view-only public link. The file stays in the vault and on Drive; only the link expires.`,
         });
 
         this.customRow = contentEl.createDiv();
@@ -92,6 +108,9 @@ export class ExportPdfModal extends Modal {
             text.inputEl.type = 'number';
             text.inputEl.min = '1';
             text.setPlaceholder('60');
+            if (this.mode === 'custom' && this.days !== null) {
+                text.setValue(String(this.days));
+            }
             text.onChange(() => this.readCustom());
         });
 
@@ -99,7 +118,7 @@ export class ExportPdfModal extends Modal {
             .setName('Delete the file when the link expires')
             .setDesc('Off by default: only the link expires and the file stays. On: the file is moved to the trash at expiry.')
             .addToggle((toggle) =>
-                toggle.setValue(false).onChange((value) => {
+                toggle.setValue(this.deleteOnExpiry).onChange((value) => {
                     this.deleteOnExpiry = value;
                 }),
             );
@@ -112,14 +131,14 @@ export class ExportPdfModal extends Modal {
             )
             .addButton((button) =>
                 button
-                    .setButtonText(this.options.confirmText ?? 'Export and share')
+                    .setButtonText(this.options.confirmText ?? 'Create link')
                     .setCta()
                     .onClick(() => {
                         if (this.mode === 'custom') {
                             this.readCustom();
                         }
-                        if (this.mode !== 'never' && (this.days === null || !Number.isFinite(this.days) || this.days <= 0)) {
-                            new Notice('Enter a positive number of days, or choose never.');
+                        if (this.mode !== 'never' && !isValidShareExpiryDays(this.days)) {
+                            new Notice(`Enter a whole number of days from 1 to ${MAX_SHARE_EXPIRY_DAYS}, or choose never.`);
                             return;
                         }
                         this.close();
@@ -139,15 +158,8 @@ export class ExportPdfModal extends Modal {
     }
 
     private readCustom(): void {
-        const raw = this.customInput?.getValue().trim() ?? '';
-        const parsed = Number(raw);
-        if (raw === '' || !Number.isFinite(parsed) || parsed <= 0) {
-            // NaN, not null: null means Never and must not be inferred from a
-            // blank custom field.
-            this.days = Number.NaN;
-            return;
-        }
-        this.days = Math.floor(parsed);
+        const parsed = parseCustomExpiryDays(this.customInput?.getValue() ?? '');
+        this.days = parsed ?? Number.NaN;
     }
 }
 
@@ -162,7 +174,7 @@ export class ShareLinkModal extends Modal {
 
     override onOpen(): void {
         const { contentEl } = this;
-        contentEl.createEl('h3', { text: 'PDF shared' });
+        contentEl.createEl('h3', { text: 'Link created' });
         contentEl.createEl('p', { text: this.options.filePath });
 
         const field = new TextComponent(contentEl);
@@ -173,7 +185,7 @@ export class ShareLinkModal extends Modal {
         field.inputEl.addEventListener('click', () => {
             void copyText(this.options.url).then(
                 () => new Notice('Link copied.'),
-                () => new Notice('Could not copy; select the link and copy it manually.'),
+                () => this.reportCopyFailure(field),
             );
         });
 
@@ -181,7 +193,7 @@ export class ShareLinkModal extends Modal {
             text:
                 this.options.expiresAt === null
                     ? 'The link never expires.'
-                    : `The link and the PDF expire ${new Date(this.options.expiresAt).toLocaleString()}.`,
+                    : `The link expires ${new Date(this.options.expiresAt).toLocaleString()}.`,
         });
 
         new Setting(contentEl)
@@ -189,7 +201,7 @@ export class ShareLinkModal extends Modal {
                 button.setButtonText('Copy link').setCta().onClick(() => {
                     void copyText(this.options.url).then(
                         () => new Notice('Link copied.'),
-                        () => new Notice('Could not copy; select the link and copy it manually.'),
+                        () => this.reportCopyFailure(field),
                     );
                 }),
             )
@@ -203,15 +215,28 @@ export class ShareLinkModal extends Modal {
     override onClose(): void {
         this.contentEl.empty();
     }
+
+    /** Select the link for a manual copy: the clipboard may be unavailable. */
+    private reportCopyFailure(field: TextComponent): void {
+        try {
+            field.inputEl.focus();
+            field.inputEl.select();
+        } catch {
+            // Selection is best-effort; the notice below carries the fallback.
+        }
+        new Notice('Could not copy; select the link and copy it manually.');
+    }
 }
 
 /**
- * The registry the user can actually see: which PDFs are shared, until when,
+ * The registry the user can actually see: which files are shared, until when,
  * with Copy / stop-sharing / delete. The janitor handles expiry; this is for
- * the "I changed my mind" case.
+ * the "I changed my mind" case. Delete is offered for every entry but only
+ * trashes a file the sync record still verifies; anything else is left alone.
  */
 export class SharedPdfsModal extends Modal {
     private entries: ExportedShare[];
+    private armedDelete: ExportedShare | null = null;
 
     constructor(
         app: App,
@@ -236,7 +261,7 @@ export class SharedPdfsModal extends Modal {
     private render(): void {
         const { contentEl } = this;
         contentEl.empty();
-        contentEl.createEl('h3', { text: 'Shared PDFs' });
+        contentEl.createEl('h3', { text: 'Shared files' });
         if (this.entries.length === 0) {
             contentEl.createEl('p', { text: 'Nothing is shared right now.' });
             new Setting(contentEl).addButton((button) =>
@@ -250,12 +275,12 @@ export class SharedPdfsModal extends Modal {
                 entry.expiresAt === null ? 'Never expires' : `Expires ${new Date(entry.expiresAt).toLocaleString()}`;
             const setting = new Setting(contentEl)
                 .setName(entry.path)
-                .setDesc(kind === 'attachment' ? `Attachment · ${expiry}` : `PDF export · ${expiry}`);
+                .setDesc(kind === 'attachment' ? `Shared file · ${expiry}` : `PDF export · ${expiry}`);
             setting.addButton((button) =>
                 button.setButtonText('Copy link').onClick(() => {
                     void copyText(entry.url).then(
                         () => new Notice('Link copied.'),
-                        () => new Notice('Could not copy the link.'),
+                        () => new Notice('Could not copy the link; select it where it was shown and copy it manually.'),
                     );
                 }),
             );
@@ -264,16 +289,21 @@ export class SharedPdfsModal extends Modal {
                     void this.act(entry, this.options.onStopSharing);
                 }),
             );
-            if (kind === 'export') {
-                setting.addButton((button) =>
-                    button
-                        .setButtonText('Delete')
-                        .setDestructive()
-                        .onClick(() => {
-                            void this.act(entry, this.options.onDelete);
-                        }),
-                );
-            }
+            const armed = this.armedDelete === entry;
+            setting.addButton((button) =>
+                button
+                    .setButtonText(armed ? `Confirm delete “${entry.path}”?` : 'Delete')
+                    .setDestructive()
+                    .onClick(() => {
+                        if (this.armedDelete !== entry) {
+                            this.armedDelete = entry;
+                            this.render();
+                            return;
+                        }
+                        this.armedDelete = null;
+                        void this.act(entry, this.options.onDelete);
+                    }),
+            );
         }
         new Setting(contentEl).addButton((button) =>
             button.setButtonText('Close').onClick(() => this.close()),
@@ -281,6 +311,7 @@ export class SharedPdfsModal extends Modal {
     }
 
     private async act(entry: ExportedShare, action: (entry: ExportedShare) => Promise<void>): Promise<void> {
+        this.armedDelete = null;
         try {
             await action(entry);
             this.entries = this.entries.filter((item) => item !== entry);

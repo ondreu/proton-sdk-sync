@@ -2,6 +2,7 @@ import { App, debounce, Notice, Platform, PluginSettingTab, type Setting, type S
 
 import type ProtonDriveSyncPlugin from '../main';
 import { MIN_POLL_SECONDS } from '../settings';
+import { MAX_SHARE_EXPIRY_DAYS } from '../sync/pdfShare';
 import { checkExcludePatterns } from '../sync/paths';
 import type { ConflictPolicy } from '../sync/types';
 import { setLogShowsNames, type LogLevel } from '../util/logger';
@@ -516,7 +517,9 @@ export class ProtonDriveSyncSettingsTab extends PluginSettingTab {
                         key: 'shareExpiryDays',
                         min: 0,
                         validate: (value) =>
-                            Number.isFinite(value) && value >= 0 ? undefined : 'Enter zero or more days.',
+                            Number.isSafeInteger(value) && value >= 0 && value <= MAX_SHARE_EXPIRY_DAYS
+                                ? undefined
+                                : `Enter a whole number of days from 0 to ${MAX_SHARE_EXPIRY_DAYS} (0 means never).`,
                     },
                 },
                 {

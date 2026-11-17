@@ -30,7 +30,7 @@ import {
     type SecretSlot,
 } from './proton/secretStore';
 import { ProtonSession } from './proton/session';
-import { DEFAULT_SETTINGS, type PluginSettings } from './settings';
+import { DEFAULT_SETTINGS, legacyAutoDeleteOptIn, type PluginSettings } from './settings';
 import { FolderPickerModal, type ChosenFolder } from './ui/folderPickerModal';
 import { DeviceList, DeviceRegistry, nextRequestAt, type DeviceRequest, type FolderMemory } from './sync/devices';
 import { DriveIO, sharedWithOthers } from './sync/drive';
@@ -41,7 +41,8 @@ import {
     EXPORT_JANITOR_INTERVAL_MS,
     EXPORT_NODE_POLL_MS,
     EXPORT_NODE_WAIT_MS,
-    isExportPath,
+    mayDeleteOnExpiry,
+    normalizeVaultPath,
     sanitizeExportedShares,
     selectExpiredShares,
     shareExpiration,
@@ -129,17 +130,6 @@ function networkConnection(): NetworkConnection | undefined {
     return (navigator as Navigator & { connection?: NetworkConnection }).connection;
 }
 
-/** The sliver of Electron's `<webview>` the PDF export uses. */
-type PdfWebview = HTMLElement & {
-    executeJavaScript(code: string): Promise<unknown>;
-    printToPDF(options: { printBackground?: boolean; pageSize?: string }): Promise<Uint8Array>;
-};
-
-/** Resolve once the webview's page has loaded, so the note can be injected. */
-/**
- * Poll until the injected page has text and its images have settled. A fixed
- * delay would be guesswork, and requestAnimationFrame never fires offscreen.
- */
 /** Reject instead of waiting forever on an Electron/SDK call that never settles. */
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -273,7 +263,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 }
             }, PAUSED_REQUEST_CHECK_MS),
         );
-        // Expired exports are cleaned up once a day; see runExportJanitor.
+        // Expired share links are cleaned up once a day; see runShareJanitor.
         this.registerInterval(window.setInterval(() => void this.runShareJanitor(), EXPORT_JANITOR_INTERVAL_MS));
 
         const clientUid = this.installationId();
@@ -1195,6 +1185,17 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? adopted);
 
         let changed = false;
+        // One-time migration from the pre-dialog setting: a stored opt-in
+        // becomes the new toggle's preselection, then the old key goes away.
+        if (legacyAutoDeleteOptIn(stored ?? adopted)) {
+            this.settings.defaultDeleteOnExpiry = true;
+            changed = true;
+        }
+        const legacyKeys = this.settings as unknown as Record<string, unknown>;
+        if ('autoDeleteExpiredExports' in legacyKeys) {
+            delete legacyKeys.autoDeleteExpiredExports;
+            changed = true;
+        }
         // The registry is plain JSON: validate it, or a hand-edited or
         // corrupt entry (a non-array, an entry without a path) throws inside
         // the janitor and silently stops the cleanup. Malformed entries are
@@ -1346,9 +1347,9 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'manage-shared-pdfs',
+            id: 'manage-shared-files',
             icon: 'links',
-            name: 'Manage shared PDFs',
+            name: 'Manage shared files',
             callback: () => this.openSharedPdfsModal(),
         });
 
@@ -1365,7 +1366,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             name: 'Share file with a Proton link',
             checkCallback: (checking) => {
                 const file = this.app.workspace.getActiveFile();
-                if (!file || file.extension === 'md' || !this.isConfigured() || this.locked) {
+                if (!file || !this.isConfigured() || this.locked) {
                     return false;
                 }
                 if (!checking) {
@@ -1375,7 +1376,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             },
         });
 
-        // The same export from a note's context menu.
+        // Sharing from a note's context menu.
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
                 if (file instanceof TFile && this.isConfigured() && !this.locked) {
@@ -1428,20 +1429,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
-    /**
-     * Render a note to PDF, save it into the export folder, and share it with
-     * a view-only public link, which is copied to the clipboard.
-     *
-     * Desktop only: the PDF is rendered through Electron's webview, which the
-     * mobile app does not have. Only the exported PDF ever gets a public
-     * link; there is deliberately no way to share a note itself from here. An
-     * existing link for the export is reused rather than making a second one.
-     */
-    /** Ask for the link lifetime first; nothing is rendered before the answer. */
-    /** List the exported PDFs that are still shared; stop sharing or delete. */
+    /** List the shared files; stop sharing or delete. Delete only ever trashes a verified file. */
     openSharedPdfsModal(): void {
         const entries = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
-            runtime.logger.warn('Dropping a malformed exported-share entry.', entry);
+            runtime.logger.warn('Dropping a malformed shared-file entry; it is never unshared or trashed.', entry);
         });
         const drop = (entry: { path: string; nodeUid: string }): void => {
             this.settings.exportedShares = this.settings.exportedShares.filter(
@@ -1456,12 +1447,19 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 await this.saveSettings();
             },
             onDelete: async (entry) => {
-                if (!isExportPath(this.settings.exportFolder, entry.path)) {
-                    throw new Error('that path is outside the export folder, so it was left alone');
+                const pathValid = normalizeVaultPath(entry.path) !== null;
+                const currentUid = pathValid ? runtime.engine.nodeUidFor(entry.path) : null;
+                const file = pathValid ? this.app.vault.getAbstractFileByPath(entry.path) : null;
+                if (file instanceof TFolder) {
+                    throw new Error('that path is a folder, so it was left alone');
                 }
-                const file = this.app.vault.getAbstractFileByPath(entry.path);
                 if (file instanceof TFile) {
+                    if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                        throw new Error('that file cannot be verified, so it was left alone');
+                    }
                     await this.app.fileManager.trashFile(file);
+                } else if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                    throw new Error('that file is not in the vault any more and cannot be verified, so it was left alone');
                 }
                 try {
                     await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
@@ -1475,13 +1473,12 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
-
-    /** A PDF just appeared from Obsidian's exporter: share it as an export. */
-    /** Share any vault file (an image, a PDF, a zip) with a view-only link. */
+    /** Share any vault file with a view-only link. */
     openShareFileModal(file: TFile): void {
         new ExportPdfModal(this.app, {
             noteName: file.name,
             defaultDays: this.settings.shareExpiryDays,
+            defaultDeleteOnExpiry: this.settings.defaultDeleteOnExpiry,
             title: 'Share file with a link',
             intro: `“${file.name}” will get a view-only public link. The file stays in the vault and on Drive; only the link expires.`,
             confirmText: 'Create link',
@@ -1530,8 +1527,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
 
     /**
      * Expire share links once a day (and on load). Only the link goes by
-     * default; a file is deleted only when the share asked for it, and never
-     * a folder.
+     * default; a file is trashed only when the share asked for it, the path
+     * is a canonical vault path, and the sync record still names the node the
+     * share was made for — a forged registry entry can never trash an
+     * arbitrary file. Folders are never trashed, and a file that is gone is
+     * never trashed either; its link is unshared only with a verified uid.
+     * Offline runs keep every entry for the next run instead of dropping
+     * links un-unshared.
      */
     async runShareJanitor(): Promise<void> {
         const registry = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
@@ -1549,16 +1551,53 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }
             return;
         }
-        const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
+        if (!this.isConfigured() || this.locked || !runtime.engine.isConnected()) {
+            // Unsharing is impossible offline, and trashing now would strand
+            // a live link until the next sync carries the delete — keep every
+            // entry so the next connected run retries it.
+            runtime.logger.info('Share links expired while offline; they are kept for the next run.');
+            return;
+        }
         let changed = false;
         for (const entry of due) {
             try {
-                if (entry.deleteOnExpiry === true) {
-                    const file = this.app.vault.getAbstractFileByPath(entry.path);
-                    if (file instanceof TFolder) {
+                const pathValid = normalizeVaultPath(entry.path) !== null;
+                const file = pathValid ? this.app.vault.getAbstractFileByPath(entry.path) : null;
+                const currentUid = pathValid ? runtime.engine.nodeUidFor(entry.path) : null;
+                const drop = (): void => {
+                    this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
+                    changed = true;
+                };
+                if (file instanceof TFolder) {
+                    // Never trash a folder; its link is still removed.
+                    try {
+                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                    } catch (error) {
+                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
                         continue;
                     }
-                    if (file instanceof TFile) {
+                    drop();
+                    continue;
+                }
+                if (entry.deleteOnExpiry === true) {
+                    if (!(file instanceof TFile)) {
+                        // Gone, or never a usable path: nothing to trash.
+                        // Unshare only with a verified uid; otherwise the
+                        // server-side expiry kills the link, so just drop.
+                        if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                            runtime.logger.warn(
+                                `Dropping the expired share for "${entry.path}": the file is gone and its link cannot be verified.`,
+                            );
+                            drop();
+                            continue;
+                        }
+                    } else if (!mayDeleteOnExpiry(pathValid, currentUid, entry.nodeUid)) {
+                        runtime.logger.warn(
+                            `Refusing to trash the expired share for "${entry.path}": the file cannot be verified.`,
+                        );
+                        drop();
+                        continue;
+                    } else {
                         try {
                             await this.app.fileManager.trashFile(file);
                         } catch (error) {
@@ -1567,16 +1606,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                         }
                     }
                 }
-                if (connected) {
-                    try {
-                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
-                    } catch (error) {
-                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
-                        continue;
-                    }
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                } catch (error) {
+                    runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+                    continue;
                 }
-                this.settings.exportedShares = this.settings.exportedShares.filter((item) => item !== entry);
-                changed = true;
+                drop();
             } catch (error) {
                 runtime.logger.warn('Could not clean up an expired share; it is kept for the next run.', error);
             }
@@ -1609,75 +1645,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
     }
 
-    /** At expiry an attachment keeps its bytes: only the link goes. */
-    /**
-     * Render a note to PDF in a throwaway BrowserWindow.
-     *
-     * `<webview>` printing returned blank pages and its guest cannot reach
-     * `ipcRenderer`; `MarkdownView.printToPdf()` always opens a save dialog.
-     * The Electron remote module is available in Obsidian, so the rendered
-     * HTML goes into a hidden window and its `webContents.printToPDF` writes
-     * the bytes — no dialog, no webview.
-     */
-    /**
-     * Turn embedded files into bytes the hidden window can show: images become
-     * data URLs (an `app://` URL does not resolve from a data-URL page), and
-     * embedded notes are rendered recursively, up to a small depth.
-     */
-    /** Create the export folder (and its parents) when it does not exist yet. */
-    /** Create the export folder (and its parents) when it does not exist yet. */
-    /**
-     * Print the webview through Obsidian's `print-to-pdf` IPC: the main
-     * process prints the sender's webContents and writes it to `filepath`,
-     * then signals back. The host-side `webview.printToPDF` returned blank
-     * pages; this is the path the built-in export takes.
-     */
-    private async printWebviewToPdf(webview: PdfWebview): Promise<Uint8Array> {
-        const nodeRequire = (window as unknown as { require: (module: string) => unknown }).require;
-        const os = nodeRequire('node:os') as { tmpdir(): string };
-        const fs = nodeRequire('node:fs/promises') as {
-            stat(path: string): Promise<{ size: number }>;
-            readFile(path: string): Promise<Uint8Array>;
-            unlink(path: string): Promise<void>;
-        };
-        const path = nodeRequire('node:path') as { join(...parts: string[]): string };
-        const target = path.join(os.tmpdir(), `pss-export-${Date.now()}-${Math.random().toString(36).slice(2)}.pdf`);
-        await webview.executeJavaScript(
-            `(() => {` +
-                `  const { ipcRenderer } = require('electron');` +
-                `  ipcRenderer.send('print-to-pdf', { filepath: ${JSON.stringify(target)}, printBackground: true, pageSize: 'A4' });` +
-                `  return true;` +
-                `})()`,
-        );
-        const deadline = Date.now() + 30000;
-        for (;;) {
-            try {
-                const stat = await fs.stat(target);
-                if (stat.size > 0) {
-                    break;
-                }
-            } catch {
-                // Not written yet.
-            }
-            if (Date.now() > deadline) {
-                throw new Error('printing the PDF timed out');
-            }
-            await new Promise((resolve) => window.setTimeout(resolve, 200));
-        }
-        const bytes = await fs.readFile(target);
-        await fs.unlink(target).catch(() => undefined);
-        return new Uint8Array(bytes);
-    }
-
-    /**
-     * Render a note's Markdown to PDF bytes through a hidden Electron webview.
-     *
-     * The page starts at `app://obsidian.md/help.html` — its origin is what
-     * lets the webview reach the vault's local resources — then the rendered
-     * note replaces the body for `printToPDF`. Embedded images are pointed at
-     * their local resource URLs first; anything the renderer already resolved
-     * rides on its own output.
-     */
     /** Wait until the engine has uploaded a path and its record names the Drive node. */
     private async waitForExportNodeUid(path: string): Promise<string> {
         const deadline = Date.now() + EXPORT_NODE_WAIT_MS;
@@ -1688,7 +1655,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }
             if (Date.now() >= deadline) {
                 throw new Error(
-                    'the exported PDF has not synced to Proton Drive yet; ' +
+                    'the file has not synced to Proton Drive yet; ' +
                         'share it from the sync panel once it has',
                 );
             }
@@ -1696,22 +1663,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
     }
 
-    /**
-     * Trash expired exported PDFs, and drop their links. Runs on load and
-     * once a day.
-     *
-     * Only registry entries strictly inside the export folder are ever
-     * touched, so a misconfigured folder cannot delete notes — not even the
-     * folder itself counts. A link is only removed once its file is gone one
-     * way or the other: trashed just now, or already gone. If trashing fails
-     * the entry is kept for the next run, never dropped, so a transient
-     * failure cannot strand a live link the janitor will never revisit.
-     * Trashing goes through the file manager, so the user's deletion
-     * preference (Obsidian trash, system trash) is honoured — a deliberate
-     * deviation from the "Obsidian trash only" spec, which the plugin-review
-     * lint forbids enforcing here. Either way the sync carries the deletion
-     * to Drive, where the link dies with the file.
-     */
     private registerVaultEvents(): void {
         const { vault } = this.app;
 

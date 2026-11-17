@@ -111,12 +111,18 @@ export type PluginSettings = {
      * never expires, and then the janitor has nothing to clean up.
      */
     shareExpiryDays: number;
-    /** Trash exported PDFs (and drop their links) once the link has expired. */
-    autoDeleteExpiredExports: boolean;
     /**
-     * Every exported PDF and the link made for it. The janitor deletes from
-     * this list only, and only inside the export folder, so it can never
-     * reach a note.
+     * Preselection for the per-share “Delete the file when the link expires”
+     * toggle. Off by default: only the link expires and the file stays.
+     * Migrated once from the old always-on `autoDeleteExpiredExports`, so
+     * anyone who had that on keeps the behaviour per share.
+     */
+    defaultDeleteOnExpiry: boolean;
+    /**
+     * Every shared file and the link made for it. Only entries that pass the
+     * janitor's confinement checks can ever trash their file: the path must
+     * be a canonical vault path whose current sync record names the same
+     * node the share was made for.
      */
     exportedShares: ExportedShare[];
 
@@ -241,12 +247,29 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 
     exportFolder: DEFAULT_EXPORT_FOLDER,
     shareExpiryDays: DEFAULT_SHARE_EXPIRY_DAYS,
-    autoDeleteExpiredExports: true,
+    defaultDeleteOnExpiry: false,
     exportedShares: [],
 
     pinLockAfterMinutes: 0,
     pinProtected: false,
 };
+
+/**
+ * Whether a stored config opted into auto-delete before the per-share toggle
+ * existed. The old setting defaulted to true without any UI, so a stored
+ * `true` counts as opted in and migrates; a stored `false`, a missing key, or
+ * an already-migrated config stays off. Pure so it is unit-tested.
+ */
+export function legacyAutoDeleteOptIn(stored: unknown): boolean {
+    if (typeof stored !== 'object' || stored === null) {
+        return false;
+    }
+    const record = stored as Record<string, unknown>;
+    if (record.defaultDeleteOnExpiry !== undefined) {
+        return false;
+    }
+    return record.autoDeleteExpiredExports === true;
+}
 
 /**
  * Lower bound on the poll interval: the rate Proton's own SDK polls a user's
