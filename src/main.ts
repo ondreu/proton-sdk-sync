@@ -1839,6 +1839,49 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /**
+     * Print the webview through Obsidian's `print-to-pdf` IPC: the main
+     * process prints the sender's webContents and writes it to `filepath`,
+     * then signals back. The host-side `webview.printToPDF` returned blank
+     * pages; this is the path the built-in export takes.
+     */
+    private async printWebviewToPdf(webview: PdfWebview): Promise<Uint8Array> {
+        const nodeRequire = (window as unknown as { require: (module: string) => unknown }).require;
+        const os = nodeRequire('node:os') as { tmpdir(): string };
+        const fs = nodeRequire('node:fs/promises') as {
+            stat(path: string): Promise<{ size: number }>;
+            readFile(path: string): Promise<Uint8Array>;
+            unlink(path: string): Promise<void>;
+        };
+        const path = nodeRequire('node:path') as { join(...parts: string[]): string };
+        const target = path.join(os.tmpdir(), `pss-export-${Date.now()}-${Math.random().toString(36).slice(2)}.pdf`);
+        await webview.executeJavaScript(
+            `(() => {` +
+                `  const { ipcRenderer } = require('electron');` +
+                `  ipcRenderer.send('print-to-pdf', { filepath: ${JSON.stringify(target)}, printBackground: true, pageSize: 'A4' });` +
+                `  return true;` +
+                `})()`,
+        );
+        const deadline = Date.now() + 30000;
+        for (;;) {
+            try {
+                const stat = await fs.stat(target);
+                if (stat.size > 0) {
+                    break;
+                }
+            } catch {
+                // Not written yet.
+            }
+            if (Date.now() > deadline) {
+                throw new Error('printing the PDF timed out');
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 200));
+        }
+        const bytes = await fs.readFile(target);
+        await fs.unlink(target).catch(() => undefined);
+        return new Uint8Array(bytes);
+    }
+
+    /**
      * Render a note's Markdown to PDF bytes through a hidden Electron webview.
      *
      * The page starts at `app://obsidian.md/help.html` — its origin is what
@@ -1868,10 +1911,12 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             // listener added afterwards would wait for the next load forever.
             const ready = pdfWebviewReady(webview);
             webview.setAttribute('src', 'app://obsidian.md/help.html');
-            // No `nodeintegration`: nothing printed needs Node in the guest,
-            // and it would promote any markup the renderer passed through
-            // into code execution. Local images load through getResourcePath
-            // URLs, which need no Node APIs.
+            // The guest prints itself through Obsidian's own `print-to-pdf`
+            // IPC channel (the one the built-in export uses). `ipcRenderer`
+            // needs Node in the guest; the HTML is sanitized first. The
+            // alternative, webview.printToPDF from the host, produced a blank
+            // page on a real vault.
+            webview.setAttribute('nodeintegration', '');
             webview.addClass('proton-sdk-sync-pdf-webview');
             activeDocument.body.appendChild(webview);
             await ready;
@@ -1885,13 +1930,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 throw new Error('the note rendered as an empty page');
             }
             await waitForPdfPaint(webview);
-            return new Uint8Array(
-                await withTimeout(
-                    webview.printToPDF({ printBackground: true, pageSize: 'A4' }),
-                    30000,
-                    'printing the PDF timed out',
-                ),
-            );
+            return await this.printWebviewToPdf(webview);
         } finally {
             component.unload();
             webview.remove();
