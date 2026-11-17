@@ -4,7 +4,7 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
-## [Unreleased] — 2026-11-17
+## [1.2.0] — 2026-11-17
 
 ### Added
 
