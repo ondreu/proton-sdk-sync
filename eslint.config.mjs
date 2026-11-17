@@ -57,6 +57,12 @@ export default defineConfig([
          * throws at load time — but not the plugin-review rules, which assume
          * a renderer, `requestUrl` and an Obsidian UI.
          */
+        // The scanner runs its own config, which does not see these overrides:
+        // the same rules are also switched off by an inline directive at the
+        // top of each file, so it must not be reported as unused.
+        linterOptions: {
+            reportUnusedDisableDirectives: 'off',
+        },
         files: ['headless/**/*.ts'],
         languageOptions: {
             parserOptions: {

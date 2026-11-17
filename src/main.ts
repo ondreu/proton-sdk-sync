@@ -321,7 +321,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 // `templates` are the same folder.
                 caseInsensitive: Platform.isWin || Platform.isMacOS || Platform.isIosApp,
                 isMetered: () => networkConnection()?.type === 'cellular',
-                isHidden: () => document.visibilityState === 'hidden',
+                isHidden: () => activeDocument.visibilityState === 'hidden',
                 openEditor: (path) => this.openEditor(path),
             },
         );
@@ -361,7 +361,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.settingsTab.containerEl.addEventListener('focusout', () => {
             // After the focus has landed somewhere else, not before.
             window.setTimeout(() => {
-                if (!this.settingsTabDirty || this.settingsTab?.containerEl.contains(document.activeElement)) {
+                if (!this.settingsTabDirty || this.settingsTab?.containerEl.contains(activeDocument.activeElement)) {
                     return;
                 }
                 this.settingsTabDirty = false;
@@ -1420,7 +1420,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         // A rebuild replaces the fields, so doing it while someone is typing in
         // one of them (the exclude patterns, a size limit) drops the caret. Wait
         // until the tab loses focus, then show what changed.
-        if (this.settingsTab.containerEl.contains(document.activeElement)) {
+        if (this.settingsTab.containerEl.contains(activeDocument.activeElement)) {
             this.settingsTabDirty = true;
             return;
         }
@@ -1639,7 +1639,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.registerEvent(this.app.workspace.on('file-open', update));
         this.registerEvent(this.app.vault.on('modify', update));
 
-        this.registerDomEvent(document, 'visibilitychange', () => {
+        this.registerDomEvent(activeDocument, 'visibilitychange', () => {
             if (document.visibilityState === 'hidden') {
                 runtime.engine.flushPendingEdits();
                 // The OS may close the app from the background; save the
