@@ -113,9 +113,9 @@ export type PluginSettings = {
     shareExpiryDays: number;
     /**
      * Preselection for the per-share “Delete the file when the link expires”
-     * toggle. Off by default: only the link expires and the file stays.
-     * Migrated once from the old always-on `autoDeleteExpiredExports`, so
-     * anyone who had that on keeps the behaviour per share.
+     * toggle. Off by default: only the link expires and the file stays. The
+     * old `autoDeleteExpiredExports` never shipped in a release, so there is
+     * no one to migrate; a stored key is simply dropped.
      */
     defaultDeleteOnExpiry: boolean;
     /**
@@ -253,23 +253,6 @@ export const DEFAULT_SETTINGS: PluginSettings = {
     pinLockAfterMinutes: 0,
     pinProtected: false,
 };
-
-/**
- * Whether a stored config opted into auto-delete before the per-share toggle
- * existed. The old setting defaulted to true without any UI, so a stored
- * `true` counts as opted in and migrates; a stored `false`, a missing key, or
- * an already-migrated config stays off. Pure so it is unit-tested.
- */
-export function legacyAutoDeleteOptIn(stored: unknown): boolean {
-    if (typeof stored !== 'object' || stored === null) {
-        return false;
-    }
-    const record = stored as Record<string, unknown>;
-    if (record.defaultDeleteOnExpiry !== undefined) {
-        return false;
-    }
-    return record.autoDeleteExpiredExports === true;
-}
 
 /**
  * Lower bound on the poll interval: the rate Proton's own SDK polls a user's

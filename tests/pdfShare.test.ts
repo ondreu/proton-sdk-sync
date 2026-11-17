@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { DEFAULT_SETTINGS, legacyAutoDeleteOptIn } from '../src/settings';
+import { DEFAULT_SETTINGS } from '../src/settings';
 import {
     buildExportedShare,
     DEFAULT_SHARE_EXPIRY_DAYS,
@@ -129,17 +129,6 @@ describe('share settings', () => {
         assert.equal(DEFAULT_SHARE_EXPIRY_DAYS, 30);
     });
 
-    it('migrates a stored auto-delete opt-in once, and nothing else', () => {
-        assert.equal(legacyAutoDeleteOptIn({ autoDeleteExpiredExports: true }), true);
-        assert.equal(legacyAutoDeleteOptIn({ autoDeleteExpiredExports: false }), false);
-        assert.equal(legacyAutoDeleteOptIn({}), false);
-        assert.equal(legacyAutoDeleteOptIn(null), false);
-        assert.equal(legacyAutoDeleteOptIn(undefined), false);
-        assert.equal(legacyAutoDeleteOptIn('yes'), false);
-        // Already migrated (or explicitly set): the old key must not override.
-        assert.equal(legacyAutoDeleteOptIn({ autoDeleteExpiredExports: true, defaultDeleteOnExpiry: false }), false);
-        assert.equal(legacyAutoDeleteOptIn({ defaultDeleteOnExpiry: true }), false);
-    });
 });
 
 describe('share registry', () => {

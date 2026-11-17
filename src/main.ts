@@ -30,7 +30,7 @@ import {
     type SecretSlot,
 } from './proton/secretStore';
 import { ProtonSession } from './proton/session';
-import { DEFAULT_SETTINGS, legacyAutoDeleteOptIn, type PluginSettings } from './settings';
+import { DEFAULT_SETTINGS, type PluginSettings } from './settings';
 import { FolderPickerModal, type ChosenFolder } from './ui/folderPickerModal';
 import { DeviceList, DeviceRegistry, nextRequestAt, type DeviceRequest, type FolderMemory } from './sync/devices';
 import { DriveIO, sharedWithOthers } from './sync/drive';
@@ -1185,12 +1185,8 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? adopted);
 
         let changed = false;
-        // One-time migration from the pre-dialog setting: a stored opt-in
-        // becomes the new toggle's preselection, then the old key goes away.
-        if (legacyAutoDeleteOptIn(stored ?? adopted)) {
-            this.settings.defaultDeleteOnExpiry = true;
-            changed = true;
-        }
+        // The old export setting never shipped in a release; drop it rather
+        // than let it preselect a destructive per-share toggle.
         const legacyKeys = this.settings as unknown as Record<string, unknown>;
         if ('autoDeleteExpiredExports' in legacyKeys) {
             delete legacyKeys.autoDeleteExpiredExports;
