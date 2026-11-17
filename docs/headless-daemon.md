@@ -147,13 +147,14 @@ daemon: the state is a per-device merge base, and two writers corrupt the
 `<vault>/.proton-sync/daemon.lock`. Two containers can bind-mount different
 data dirs over the same vault, and only the vault-side file collides then.
 A second start for the same vault path exits 5 naming the lock holder's PID.
-Takeover of a stale lock is always logged with the reason (dead pid, or boot
-id from before this boot). Pid-namespace caveat: liveness is `kill(pid, 0)`
-plus the Linux boot id, so across containers a live-but-foreign holder reads
-as ESRCH on the same boot id — treat that as HELD (fail closed), heartbeat
-the lock file, or run with `--pid=host`; see SECURITY.md. Heartbeat-based
-takeover (take over only when the file is older than N× the interval AND the
-pid check fails) is the planned hardening.
+Takeover of a stale lock is always logged with the reason (dead pid *and* a
+heartbeat older than 30 s, or boot id from before this boot). Pid-namespace
+caveat: liveness is `kill(pid, 0)` plus the Linux boot id, so across
+containers a live-but-foreign holder reads as ESRCH on the same boot id —
+that reads as HELD (fail closed), and so does any unreadable-but-recent lock
+file. Heartbeats publish via temp-file plus `rename` (never
+truncate-in-place), so concurrent starters see whole files only, and
+`release()` only unlinks a file it still owns. See SECURITY.md.
 
 ## 5. Unattended policy
 
@@ -227,31 +228,35 @@ type DaemonConfig = {
 and validated against `state.cursorsFingerprint()` exactly as the plugin does
 — a marker mismatch clears the cache and refetches, it never serves stale
 bytes. `'memory'` skips persistence for less encrypted-at-rest surface at the
-cost of a full listing on every boot. Either way the marker plumbing must be
-wired (`setCacheMarker` once state exists) and `rememberCacheParents` ported,
-or every start silently pays a full refetch (correctness review P1-5).
+cost of a full listing on every boot. The marker plumbing is wired
+(`setCacheMarker` once state exists) and `rememberCacheParents` is ported,
+so a warm start validates the saved cache instead of refetching.
 
-Exit codes: `0` clean (for `once`: in sync — but see the known limitation on
-SIGTERM-interrupted `once` below); `1` config/usage error; `2`
+Exit codes: `0` clean (for `once`: in sync — a SIGTERM-interrupted `once`
+exits 2, never 0); `1` config/usage error; `2`
 sync finished with item failures (paths listed in `status.json`); `3`
 mass-delete held; `4` signed out / session revoked (supervisor must NOT
 restart — needs a browser re-login); `5` already running
 (lock held, no restart); `6` sync state lost — `wasLost()` gate, zero Drive
 writes, engine never starts (no restart: needs a restore from backup, §9);
 `7` config invalid (including boot-time `ConfigError`: unreadable key file,
-missing vault, read-only mount).
+missing vault, read-only mount; and a session.bin the key cannot open —
+key mismatch, naming `PSS_KEY_FILE`, never "signed out"). `login` without
+`--rotate-key` refuses the same mismatch instead of overwriting it.
 Logging is JSONL to stdout (`{ts, level, module, msg, ...}` via
-the existing `Logger`, `src/util/logger.ts`). Note-name redaction is the
-contract but not yet the behaviour: until `jsonLog`/`status.json` pass
-through `redactNames` with an explicit `--show-names` opt-in (security
-review P1-2), treat stdout and `status.json` as carrying plaintext note
-names, conflict/copy paths and error strings — Docker logs keep them
-indefinitely, so keep `max-size`/`max-file` rotation and do not forward to
-third-party aggregation. `status.json` in the data dir carries
-`SyncSummary` (`types.ts:56`) plus `updatedAt` for the watchdog; it must be
-`0600` (security review P1-3). SIGTERM/SIGINT
-calls `engine.stop()` (`engine.ts:684` — drains the queue, flushes state)
-then exits 0; a second signal within 30 s forces exit 1.
+the existing `Logger`, `src/util/logger.ts`). Structured note paths —
+conflict/copy paths, mass-delete held paths, plan and verify report paths —
+redact by default to a stable short digest (`headless/src/redaction.ts`),
+with an explicit `--show-names` opt-in (`logShowsNames` in daemon.json);
+counters stay exact. Free-text error strings may still embed a path, so keep
+`max-size`/`max-file` rotation and do not forward to third-party aggregation.
+`status.json` in the data dir carries
+`SyncSummary` (`types.ts:56`) plus `updatedAt` for the watchdog; it is
+`0600` in a `0700` dir (security review P1-3). SIGTERM/SIGINT
+calls `engine.stop()` (`engine.ts:684` — drains the queue, flushes state);
+`watch` then exits 0, while a `once` interrupted mid-pass exits 2 (an
+interrupted pass is not "in sync"); a second signal within 30 s forces
+exit 1.
 
 ## 7. Deployment
 
@@ -299,7 +304,7 @@ services:
     healthcheck:
       test: ["CMD", "pss-daemon", "status"]  # freshness, not just liveness
       interval: 60s
-      start_period: 15m  # covers the 134 MB reference first sync
+      start_period: 15m  # grace for the reference first sync; once heartbeats while it progresses
 ```
 
 Restart policy (correctness review P2-12, security review P1-5): `restart`
@@ -314,7 +319,7 @@ on exits 4/5/6).
 Volume layout: vault mounted at the configured `vaultPath`; the data dir
 persists `daemon.json`, `session.bin`, `sync-state.json`, `status.json` and
 the cache, and must be host-local — never share one data dir between hosts
-(temp names are pid-only, `device-id` is last-writer-wins). Resource limits:
+(temp names are pid-plus-random, `device-id` is last-writer-wins). Resource limits:
 1 CPU / 768 MB is ample — transfers are block-chunked and the full sync is
 stat-bound; raise `transferConcurrency` only if Proton rate-limits stay
 quiet. Verification: `pss-daemon verify` re-hashes both
@@ -365,9 +370,12 @@ seven days.
 
 Backups: `scripts/backup-daemon-state.sh` runs nightly (03:00) and archives
 the vault plus the data dir while excluding `session.bin`, `drive-cache.bin`,
-locks and tmp debris; it refuses while `status.json` reports `syncing`
+locks and tmp debris; it refuses while `status.json` reports `starting` or
+`syncing`, or is missing/unreadable (idleness must be proven, not assumed),
 unless `--allow-active`, verifies with `tar -t`, asserts no secret file is
-inside, and keeps the newest `PSS_BACKUP_KEEP` (default 7) archives.
+inside, and keeps the newest `PSS_BACKUP_KEEP` (default 7) archives. Both
+`once` and `watch` announce `syncing` before `engine.start`, so a mid-pass
+backup is refused in either mode.
 
 Restore (vault corruption, bad sync, or exit 6 state-lost):
 
@@ -413,48 +421,33 @@ outside help; record the wall-clock time, the archive name, the pre/post
 ## 11. Known limitations (from both adversarial reviews)
 
 Engine-stream fixes land in `headless/src` / `src`; ops/doc-stream fixes are
-this document's artifacts. Until each item below is closed, it is a
-documented constraint, not a silent behaviour:
+this document's artifacts. Closed by the fixes the delta review probed
+(locks, `EACCES` fail-closed, pairing gate, stall-gated heartbeats in both
+modes, SIGTERM-`once` exit 2, dir fsync, exit-7 mapping, pairing
+pass-through and warnings, excluded-tree pruning) are constraints no longer:
+they are the behaviour, pinned by tests. What is still true:
 
-- Symlinks are followed out of the vault (adapter, watcher and `VaultIO`
-  all `stat` through links; `staysInVault` is string-based). An outside
-  directory linked into the vault is uploaded under vault names, and a
-  download over a file symlink replaces the link. Rule: no symlinks in the
-  synced tree; the fix is `lstat` everywhere + refuse-or-skip with a test.
-- `EACCES`/`EPERM` currently reads as "file gone": a `chmod 000` subtree
-  silently drops from the local view and reconcile can return
-  `delete-remote` under the mass-delete threshold with no hold. The daemon
-  must rethrow non-`ENOENT` from `stat`/`exists`/`list` (or pre-pass walk
-  every tracked path) — until then, verify mount/ACL health out of band.
-- Watch-mode heartbeat rewrites `updatedAt` unconditionally, so a wedged
-  engine still passes the `status` freshness check. Fix: bump only when the
-  summary advanced, else emit `stalled` after 2× the poll interval.
-- `once` interrupted by SIGTERM exits 0 ("in sync" is then a lie); it must
-  return a distinct non-zero so wrappers can tell "synced" from "stopped
-  mid-pass". Watch-mode SIGTERM → 0 is correct.
-- No directory fsync after rename in either adapter: a crash between rename
-  and directory durability can lose a file the state calls synced (next pass
-  reads local-missing → `delete-remote`). Fix: fsync the directory fd.
+- Symlinked paths are refused or skipped, not followed: the adapter and the
+  pre-pass walk `lstat` and refuse tracked links (`SymlinkRefusedError`),
+  and the watcher skips excluded/symlink trees. Rule stands: no symlinks in
+  the synced tree.
 - `verify` hashes whole files with one `readFile` — a 300 MB skipped-large
   file is fully buffered; stream the hash.
 - Key material lives in a `Buffer` for the process lifetime, never zeroed.
-- `DataDirAdapter.write` skips fsync-before-rename; `runLogin --pairing`
-  rewrites `daemon.json` non-atomically (use tmp+rename); `logFile` is in
-  `DaemonPaths` but never written (wire it or delete it before any backup
-  script trusts it).
-- Boot-time `ConfigError` (missing key file, read-only mount) currently
-  surfaces as exit 1, not 7 — the runbook keys off 7, so name read-only
-  mounts in the message when mapping `runCommand`/`runDaemon` codes.
-- `--pairing` is silently dropped by approve/deny, and a stale `pairing` in
-  `daemon.json` auto-resolves the first-sync gate after a data-dir loss.
-  Warn when the gate is satisfied by a non-fresh config value, and pass
-  `--pairing` through to `runMassDecision`.
-- The watcher walks and `fs.watch`es excluded trees (`.git/`, `.trash/`,
-  `.obsidian/`); prune `ALWAYS_EXCLUDED` + config/plugin dirs, or one
-  inotify-exhausted directory silently degrades to warn-only.
-- Rename pairing can misfire on inode reuse inside the 1000 ms window, and
+- `runLogin --pairing` rewrites `daemon.json` non-atomically (use
+  tmp+rename); `logFile` is in `DaemonPaths` but never written (wire it or
+  delete it before any backup script trusts it).
+- A stale `starting`/`syncing` in `status.json` (crash mid-boot or mid-pass)
+  blocks every backup until `--allow-active` — fail closed by design, but an
+  operator must clear it after reading the logs.
+- A rotated `PSS_KEY_FILE` never reads as "signed out": `once`/`watch` exit
+  7 and `login` refuses without `--rotate-key`. Deciding the rotation
+  procedure (and rehearsing the §9 restore drill) is still a human job —
+  see the delta review's top-3 NAS checklist.
+- `rename` pairing can misfire on inode reuse inside the 1000 ms window, and
   rescan pairing is first-wins — self-heals via content hash, but spurious
   Drive node moves are possible.
+
 - Exit 6 (`StateLost`) and the data dir are host-local: never share one data
   dir between machines, and never restart on 6 without a human + backup.
 

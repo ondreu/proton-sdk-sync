@@ -72,25 +72,33 @@ exposes the session. There is no in-place re-key: to rotate, sign out and
 log in again with the new key file, and the old envelope is replaced only
 by that explicit fresh `login`, never silently. A
 wrong/rotated key must never read as "signed out": if `login` finds an
-unreadable `session.bin`, it refuses to overwrite it without an explicit
-flag — a key mismatch points at the key file, not at Proton.
+unreadable `session.bin`, it refuses to overwrite it without
+`--rotate-key` (alias `--force`) — exit 7 naming the key file, never
+Proton. The same mismatch in `once`/`watch`/`verify` exits 7 instead of
+reporting "not signed in".
 
 **On-disk layout.** Data dir (default `/data/pss-daemon`, never inside the
 vault): `session.bin` and `drive-cache.bin` mode `0600` in dirs mode `0700`
-(healed on every open); `sync-state.json`, `status.json`, `device-id` and
-both lock dirs must be equally owner-only — `0600`/`0700` (or
-`process.umask(0o027)` at entry). Verify after first start:
+(healed on every write); `sync-state.json`, `status.json`, `device-id` and
+both lock dirs are equally owner-only — `0600`/`0700`, written with explicit
+modes and healed on every open (see `headless/src/secureFs.ts`). Verify
+after first start:
 `find /data/pss-daemon -perm /077` must print nothing. Nothing secret ever
 lands in the vault.
 
 **What lands in logs and status.** JSONL goes to stdout, which means Docker
-logs on the NAS keep it indefinitely: pass summaries, conflict paths and
-copy paths, mass-delete held paths (up to 50), error strings, and `status.json`
-(`lastSummary` + `massDeleteHeld`). Until note-name redaction lands in the
-daemon (with an explicit `--show-names` opt-in), treat both as carrying note
-names: do not forward them to third-party log aggregation, and set log
-rotation (`logging.max-size/max-file` in compose.yml). Key bytes and key-file
-contents never appear in any error string, log line, or status field.
+logs on the NAS keep it indefinitely. Structured note paths — conflict and
+copy paths, mass-delete held paths, plan and verify report paths,
+`status.json` (`lastSummary` + `massDeleteHeld`) — redact by default to a
+stable short digest (`<redacted:a1b2c3d4>`), so lines stay correlatable
+without naming anything; counters stay exact. `--show-names` (or
+`logShowsNames: true` in daemon.json) opts back into plaintext. Not covered:
+free-text error strings from the OS or the Drive SDK may still embed a path
+no pattern can reliably find, and the sign-in account is named unless
+redaction is on — so still keep log rotation
+(`logging.max-size/max-file` in compose.yml) and do not forward the logs to
+third-party aggregation. Key bytes and key-file contents never appear in any
+error string, log line, or status field.
 
 **Backup exclusion.** `session.bin` must be excluded from every backup
 (`scripts/backup-daemon-state.sh` does this and verifies the archive
@@ -110,13 +118,12 @@ and exits 4 for a human re-login).
 id. Two containers over one vault live in different pid namespaces, so a
 live holder's pid is unverifiable from the other side — same-boot-id plus
 ESRCH would misread "live but foreign" as "stale" and take over into two
-writers. Mitigations, in order: the lock carries a heartbeat (takeover only
-when the file is older than N× the heartbeat interval AND the pid check
-fails); never take over when the boot id matches but the pid is
-unverifiable — starting twice must stay the safe direction; or run with
-`--pid=host` so pids are comparable. Until the heartbeat lands, treat a
-stale-takeover log line across containers as suspect and run one daemon per
-vault.
+writers. Defences, all landed: the lock carries a heartbeat (takeover needs
+a dead pid *and* a heartbeat older than 30 s, or a boot id from before this
+boot); an unreadable-but-recent lock reads as held, never stale; heartbeats
+publish via temp-file plus rename, so readers never see a torn half-write;
+and `release()` only unlinks a file it still owns. Still run one daemon per
+vault — or `--pid=host` so pids are comparable.
 
 ## What this plugin does not defend against
 
