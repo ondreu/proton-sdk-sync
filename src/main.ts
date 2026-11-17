@@ -1910,6 +1910,10 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             // fire dom-ready while appendChild is still running, and a
             // listener added afterwards would wait for the next load forever.
             const ready = pdfWebviewReady(webview);
+            // Property plus webpreferences: the boolean attribute alone leaves
+            // `require` undefined in the guest (GUEST_VIEW_MANAGER_CALL).
+            (webview as unknown as { nodeintegration: boolean }).nodeintegration = true;
+            webview.setAttribute('webpreferences', 'contextIsolation=no,nodeIntegration=yes');
             webview.setAttribute('src', 'app://obsidian.md/help.html');
             // The guest prints itself through Obsidian's own `print-to-pdf`
             // IPC channel (the one the built-in export uses). `ipcRenderer`
