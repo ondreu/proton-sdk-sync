@@ -47,7 +47,9 @@ import {
     isExportPath,
     janitorEntryPlan,
     normalizeExportFolder,
+    resolveExportPath,
     sanitizeExportedShares,
+    exportPdfName,
     sanitizeExportHtml,
     selectExpiredShares,
     selectJanitorDeletions,
@@ -212,8 +214,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 }
 
 export default class ProtonDriveSyncPlugin extends Plugin {
-    /** Set while the built-in PDF export dialog is open; the next PDF create is shared. */
-    private pendingExport: { expiryDays: number; timer: number } | null = null;
     // Obsidian declares `settings?: unknown` on Plugin; this narrows it.
     declare settings: PluginSettings;
     /** Where the Proton session is kept, encrypted with the user's PIN if they set one. */
@@ -1427,15 +1427,6 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             callback: () => this.openSharedPdfsModal(),
         });
 
-        // The built-in PDF dialog reports its result as a vault create.
-        this.registerEvent(
-            this.app.vault.on('create', (file) => {
-                if (this.pendingExport !== null && file instanceof TFile && file.extension === 'pdf') {
-                    void this.shareExportedPdf(file);
-                }
-            }),
-        );
-
         // A file deleted by hand takes its link with it; do not wait for expiry.
         this.registerEvent(
             this.app.vault.on('delete', (file) => {
@@ -1586,25 +1577,14 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
-    private clearPendingExport(): void {
-        if (this.pendingExport !== null) {
-            window.clearTimeout(this.pendingExport.timer);
-            this.pendingExport = null;
-        }
-    }
 
     /** A PDF just appeared from Obsidian's exporter: share it as an export. */
-    private async shareExportedPdf(file: TFile): Promise<void> {
-        const pending = this.pendingExport;
-        if (pending === null) {
-            return;
-        }
-        this.clearPendingExport();
+    private async shareExportedPdf(file: TFile, expiryDays: number): Promise<void> {
         try {
             new Notice('Uploading the PDF…');
             const nodeUid = await this.waitForExportNodeUid(file.path);
             new Notice('Creating the share link…');
-            const expiration = shareExpiration(pending.expiryDays);
+            const expiration = shareExpiration(expiryDays);
             const link = await withTimeout(
                 runtime.engine.createNoteShareLink(file.path, expiration ? { expiration } : {}),
                 30000,
@@ -1750,20 +1730,38 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             new Notice('Open the note first, then export it.');
             return;
         }
-        // Obsidian's own exporter renders the note with the active theme; our
-        // webview render produced blank pages on real vaults. The dialog asks
-        // where to save, so the vault create event tells us the result.
-        this.clearPendingExport();
-        this.pendingExport = {
-            expiryDays: expiry,
-            timer: window.setTimeout(() => {
-                this.clearPendingExport();
-                new Notice('No PDF was saved inside the vault, so there is nothing to share.');
-            }, 180000),
-        };
-        new Notice('Choose where to save the PDF — save it inside the vault.', 10000);
-        (view as unknown as { printToPdf(): void }).printToPdf();
-        return;
+        const adapter = this.app.vault.adapter as unknown as { getBasePath?: () => string };
+        const basePath = adapter.getBasePath?.();
+        if (basePath === undefined) {
+            new Notice('Exporting a note to PDF needs the desktop app.');
+            return;
+        }
+        // Obsidian's exporter renders with the active theme; its dialog is only
+        // a wrapper around `printToPdf({ filepath })`, which writes straight to
+        // the folder we choose.
+        await this.ensureExportFolder(this.settings.exportFolder);
+        const exportPath = resolveExportPath(
+            this.settings.exportFolder,
+            exportPdfName(file.basename),
+            (path) => this.app.vault.getAbstractFileByPath(path) !== null,
+        );
+        new Notice('Rendering the PDF…');
+        await (view as unknown as { printToPdf(options: { filepath: string }): Promise<void> }).printToPdf({
+            filepath: `${basePath}/${exportPath}`,
+        });
+        const deadline = Date.now() + 30000;
+        for (;;) {
+            const written = this.app.vault.getAbstractFileByPath(exportPath);
+            if (written instanceof TFile) {
+                await this.shareExportedPdf(written, expiry);
+                return;
+            }
+            if (Date.now() > deadline) {
+                new Notice('The PDF was not written inside the vault, so there is nothing to share.');
+                return;
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 200));
+        }
 
     }
 
