@@ -138,6 +138,24 @@ The plugin's own state and logs stay in
 `.obsidian/plugins/proton-sdk-sync/`, and its Drive metadata cache in
 IndexedDB; none of it syncs.
 
+## Sharing files with a link
+
+Any file in the vault — a note, an image, a PDF, a zip — can get a view-only
+Proton public link. Right-click it (or use the command palette) and choose
+“Share file with a Proton link”; pick the lifetime (7, 30, 90 days, a custom
+number, or never) and the dialog shows the link with a Copy button.
+
+- The link is created for that exact file, after it has reached Drive. Anyone
+  with the URL can view it; view-only means no one can edit or upload through
+  it, but a public link is public — treat it like any other share link.
+- By default the file stays when the link expires; only the link goes. Tick
+  “Delete the file when the link expires” to have that file moved to the trash
+  at expiry instead (never a folder, and only a file the plugin can still
+  match to the share it made).
+- Deleting a file yourself removes its link too.
+- “Manage shared files” in settings (and the command palette) lists every link
+  with copy, stop sharing, and delete.
+
 ## Sharing a vault with other people
 
 A folder shared with you on Drive can be the sync target. The device list is
