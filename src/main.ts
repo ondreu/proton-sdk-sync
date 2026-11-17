@@ -41,16 +41,12 @@ import { errorMessage } from './sync/engine/helpers';
 import {
     buildExportedShare,
     buildPdfPrintScript,
-    copyToArrayBuffer,
     EXPORT_JANITOR_INTERVAL_MS,
     EXPORT_NODE_POLL_MS,
     EXPORT_NODE_WAIT_MS,
-    exportPdfName,
-    exportPrecheckRefusal,
     isExportPath,
     janitorEntryPlan,
     normalizeExportFolder,
-    resolveExportPath,
     sanitizeExportedShares,
     sanitizeExportHtml,
     selectExpiredShares,
@@ -216,6 +212,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 }
 
 export default class ProtonDriveSyncPlugin extends Plugin {
+    /** Set while the built-in PDF export dialog is open; the next PDF create is shared. */
+    private pendingExport: { expiryDays: number; timer: number } | null = null;
     // Obsidian declares `settings?: unknown` on Plugin; this narrows it.
     declare settings: PluginSettings;
     /** Where the Proton session is kept, encrypted with the user's PIN if they set one. */
@@ -1429,6 +1427,15 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             callback: () => this.openSharedPdfsModal(),
         });
 
+        // The built-in PDF dialog reports its result as a vault create.
+        this.registerEvent(
+            this.app.vault.on('create', (file) => {
+                if (this.pendingExport !== null && file instanceof TFile && file.extension === 'pdf') {
+                    void this.shareExportedPdf(file);
+                }
+            }),
+        );
+
         // A file deleted by hand takes its link with it; do not wait for expiry.
         this.registerEvent(
             this.app.vault.on('delete', (file) => {
@@ -1579,6 +1586,45 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }).open();
     }
 
+    private clearPendingExport(): void {
+        if (this.pendingExport !== null) {
+            window.clearTimeout(this.pendingExport.timer);
+            this.pendingExport = null;
+        }
+    }
+
+    /** A PDF just appeared from Obsidian's exporter: share it as an export. */
+    private async shareExportedPdf(file: TFile): Promise<void> {
+        const pending = this.pendingExport;
+        if (pending === null) {
+            return;
+        }
+        this.clearPendingExport();
+        try {
+            new Notice('Uploading the PDF…');
+            const nodeUid = await this.waitForExportNodeUid(file.path);
+            new Notice('Creating the share link…');
+            const expiration = shareExpiration(pending.expiryDays);
+            const link = await withTimeout(
+                runtime.engine.createNoteShareLink(file.path, expiration ? { expiration } : {}),
+                30000,
+                'creating the share link timed out',
+            );
+            this.settings.exportedShares = upsertExportedShare(
+                this.settings.exportedShares,
+                buildExportedShare(file.path, link, runtime.engine.nodeUidFor(file.path) ?? nodeUid, 'export'),
+            );
+            await this.saveSettings();
+            new ShareLinkModal(this.app, {
+                url: link.url,
+                filePath: file.path,
+                expiresAt: link.expiration?.getTime() ?? null,
+            }).open();
+        } catch (error) {
+            new Notice(`Could not share the PDF: ${errorMessage(error)}`);
+        }
+    }
+
     /** Share any vault file (an image, a PDF, a zip) with a view-only link. */
     openShareFileModal(file: TFile): void {
         new ExportPdfModal(this.app, {
@@ -1698,129 +1744,27 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             new Notice('Sign in and wait for the sync to connect before exporting.');
             return;
         }
-        try {
-            new Notice('Rendering the note to PDF…');
-            const markdown = await this.app.vault.read(file);
-            const exportPath = resolveExportPath(
-                this.settings.exportFolder,
-                exportPdfName(file.basename),
-                (path) => this.app.vault.getAbstractFileByPath(path) !== null,
-            );
-            await this.ensureExportFolder(this.settings.exportFolder);
-            const refusal = exportPrecheckRefusal({
-                paused: runtime.engine.isPaused(),
-                excluded: runtime.engine.isExcluded(exportPath),
-            });
-            if (refusal !== null) {
-                new Notice(refusal);
-                return;
-            }
-            const pdf = await withTimeout(this.renderNoteToPdf(file, markdown), 45000, 'rendering the PDF timed out');
-            const data = copyToArrayBuffer(pdf);
-            const previous = this.app.vault.getAbstractFileByPath(exportPath);
-            if (previous instanceof TFile) {
-                await this.app.vault.modifyBinary(previous, data);
-            } else {
-                await this.app.vault.createBinary(exportPath, data);
-            }
-            new Notice('Uploading the PDF…');
-            // The engine uploads the new PDF on its own; wait until its sync
-            // record names the Drive node, then share exactly that node.
-            let nodeUid: string;
-            try {
-                nodeUid = await this.waitForExportNodeUid(exportPath);
-            } catch (error) {
-                // The PDF never synced, so no link exists for it: trash what
-                // was just written instead of stranding an orphan. Confined to
-                // the export folder like the janitor; a pre-existing file can
-                // never be at this path (resolveExportPath returns a free one).
-                if (isExportPath(this.settings.exportFolder, exportPath)) {
-                    const written = this.app.vault.getAbstractFileByPath(exportPath);
-                    if (written instanceof TFile) {
-                        try {
-                            // The user's trash preference: the review lint forbids forcing Obsidian trash here.
-                            await this.app.fileManager.trashFile(written);
-                        } catch {
-                            // Kept over lost: the notice below names the file.
-                        }
-                    }
-                }
-                throw error;
-            }
-            const expiration = shareExpiration(expiryDays === null ? 0 : (expiryDays ?? this.settings.shareExpiryDays));
-            // Always create: shareNode updates an existing URL access in place
-            // (re-encrypting without a custom password and resetting the
-            // expiry), so this converges the live link to the requested
-            // settings instead of reusing a stale one. The returned access is
-            // the link's actual state — the registry, the notice and the
-            // clipboard all use it, never a computed date.
-            new Notice('Creating the share link…');
-            let link: Awaited<ReturnType<typeof runtime.engine.createNoteShareLink>>;
-            try {
-                link = await withTimeout(
-                    runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {}),
-                    30000,
-                    'creating the share link timed out',
-                );
-            } catch (error) {
-                // A link created by the old Proton sharing model cannot be
-                // updated in place. Remove it and make one from scratch, once;
-                // if that fails too, report it rather than leaving a half state.
-                try {
-                    await runtime.engine.removeNoteShareLink(exportPath);
-                    link = await withTimeout(
-                        runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {}),
-                        30000,
-                        'creating the share link timed out',
-                    );
-                } catch {
-                    new Notice(`Could not share the PDF: ${error instanceof Error ? error.message : String(error)}`);
-                    return;
-                }
-            }
-            if (link.hasPassword) {
-                // Unreachable through this flow (the creation above clears a
-                // password), but one set elsewhere would leave the recipient
-                // blocked: fail loudly, and remove the link so it cannot sit
-                // live and unregistered.
-                try {
-                    await runtime.engine.removeShareLinkByNodeUid(runtime.engine.nodeUidFor(exportPath) ?? nodeUid);
-                } catch {
-                    // Reported below either way.
-                }
-                new Notice('This PDF had a password-protected link; it was removed. Export again to make a clean link.');
-                return;
-            }
-            // Re-read after the share: the path's record may have been remapped
-            // while the share was created, and the registry must pin the node
-            // the live link belongs to.
-            const sharedUid = runtime.engine.nodeUidFor(exportPath) ?? nodeUid;
-            this.settings.exportedShares = upsertExportedShare(
-                this.settings.exportedShares,
-                buildExportedShare(exportPath, link, sharedUid, 'export'),
-            );
-            try {
-                await this.saveSettings();
-            } catch (error) {
-                // The registry is lost, so the janitor could never clean up:
-                // remove the link just made and report both halves.
-                try {
-                    await runtime.engine.removeShareLinkByNodeUid(sharedUid);
-                } catch {
-                    // Reported as part of the notice below.
-                }
-                throw new Error(
-                    `the share link was created but could not be recorded, so it was removed: ${errorMessage(error)}`,
-                );
-            }
-            new ShareLinkModal(this.app, {
-                url: link.url,
-                filePath: exportPath,
-                expiresAt: link.expiration?.getTime() ?? null,
-            }).open();
-        } catch (error) {
-            new Notice(`Could not export this note: ${errorMessage(error)}`);
+        const expiry = expiryDays === null ? 0 : (expiryDays ?? this.settings.shareExpiryDays);
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view === null || view.file?.path !== file.path) {
+            new Notice('Open the note first, then export it.');
+            return;
         }
+        // Obsidian's own exporter renders the note with the active theme; our
+        // webview render produced blank pages on real vaults. The dialog asks
+        // where to save, so the vault create event tells us the result.
+        this.clearPendingExport();
+        this.pendingExport = {
+            expiryDays: expiry,
+            timer: window.setTimeout(() => {
+                this.clearPendingExport();
+                new Notice('No PDF was saved inside the vault, so there is nothing to share.');
+            }, 180000),
+        };
+        new Notice('Choose where to save the PDF — save it inside the vault.', 10000);
+        (view as unknown as { printToPdf(): void }).printToPdf();
+        return;
+
     }
 
     /** Create the export folder (and its parents) when it does not exist yet. */
