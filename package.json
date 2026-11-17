@@ -1,12 +1,9 @@
 {
     "name": "proton-sdk-sync",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "description": "End-to-end encrypted two-way sync between your vault and Proton Drive, with three-way conflict detection. Includes a headless daemon for Linux servers.",
     "main": "main.js",
     "private": true,
-    "workspaces": [
-        "headless"
-    ],
     "license": "GPL-3.0-or-later",
     "scripts": {
         "dev": "node esbuild.config.mjs",

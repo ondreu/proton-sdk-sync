@@ -4,6 +4,18 @@ This project continues [obsidian-proton-sync](https://github.com/MarckFp/obsidia
 Releases before 1.0.0 are that project's; its notes are in its own releases.
 Entries here describe this fork.
 
+## [1.1.2] — 2026-11-17
+
+### Changed
+
+- The headless daemon moved to [ondreu/pss-daemon](https://github.com/ondreu/pss-daemon).
+  The community directory's source scan reads every TypeScript file in the
+  repository and cannot be told that a Node-only daemon is not plugin code; its
+  findings are warnings that lower the listing's review score, and disabling
+  its rules is itself an error. The daemon pins this repository as a submodule,
+  so the engine is still one implementation and a conflict fix still lands once.
+  Nothing in `main.js` changes; the plugin is unaffected.
+
 ## [1.1.1] — 2026-11-17
 
 ### Fixed

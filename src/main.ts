@@ -1640,7 +1640,7 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.registerEvent(this.app.vault.on('modify', update));
 
         this.registerDomEvent(activeDocument, 'visibilitychange', () => {
-            if (document.visibilityState === 'hidden') {
+            if (activeDocument.visibilityState === 'hidden') {
                 runtime.engine.flushPendingEdits();
                 // The OS may close the app from the background; save the
                 // expiry as it stands.
