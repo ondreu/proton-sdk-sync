@@ -221,6 +221,31 @@ describe('the session is stored encrypted outside secret storage', () => {
         assert.equal(files.size, 1);
     });
 
+    it('stores a session over an existing file when the adapter refuses to rename onto it', async () => {
+        // Obsidian's adapter answers "Destination file already exists!" and a
+        // second sign-in then failed forever; the envelope must still be
+        // replaced rather than leaving the user unable to sign in.
+        const { adapter, files } = memoryAdapter();
+        const slot = new SafeStorageFileSlot(adapter as never, 'session.bin', fakeSafeStorage());
+        await slot.write('the first session');
+
+        const rename = adapter.rename;
+        adapter.rename = async (from: string, to: string) => {
+            if (await adapter.exists(to)) {
+                throw new Error('Destination file already exists!');
+            }
+            return rename.call(adapter, from, to);
+        };
+        try {
+            await slot.write('the second session');
+        } finally {
+            adapter.rename = rename;
+        }
+
+        assert.equal(await slot.read(), 'the second session');
+        assert.equal(files.has('session.bin.tmp'), false, 'no temp file is left behind');
+    });
+
     it('moves a session out of secret storage and clears the old copy', async () => {
         const { adapter } = memoryAdapter();
         const secrets = new Map<string, string>([['proton-drive-sync-session-x', '{"uid":"u1"}']]);

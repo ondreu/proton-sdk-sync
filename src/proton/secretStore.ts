@@ -236,10 +236,22 @@ export class SafeStorageFileSlot implements SecretSlot {
         try {
             await this.adapter.rename(this.tempPath, this.path);
         } catch (error) {
-            // The old envelope is still there and still opens; leave it that
-            // way rather than falling back to a direct write.
+            // Obsidian's adapter refuses to rename onto a file that is already
+            // there ("Destination file already exists!"), and on a second
+            // sign-in the previous session file is exactly that: every attempt
+            // to store a session after the first failed before this was
+            // handled. The temp file holds the only copy of the new envelope,
+            // so write it in place rather than losing the sign-in; the old
+            // envelope was about to be replaced anyway.
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/already exists/i.test(message)) {
+                // A real failure (crash, no space): the old envelope is still
+                // there and still opens; leave it that way.
+                await this.removeQuietly(this.tempPath);
+                throw error;
+            }
+            await this.adapter.write(this.path, encoded);
             await this.removeQuietly(this.tempPath);
-            throw error;
         }
         this.closeToOthers();
     }
