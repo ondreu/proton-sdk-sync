@@ -219,11 +219,16 @@ type DaemonConfig = {
     transferConcurrency: number;  // default 3
     pairing?: 'adopt-drive' | 'adopt-vault' | 'merge';
     logLevel: 'debug' | 'info' | 'warn' | 'error'; // default "info"
-    metadataCache: 'file' | 'memory'; // default "file" — honoured, not advisory
+    metadataCache: 'file' | 'memory'; // default "memory" — see the note below
 };
 ```
 
-`metadataCache: 'file'` (default) keeps the encrypted Drive node cache in
+`metadataCache: 'memory'` (default) keeps the Drive node cache in memory only,
+so every start reads the tree fresh. A persisted cache is only as fresh as the
+last event feed the process consumed, and `once` compares the tree without
+draining events first — a stale cache there silently overwrote a remote edit in
+the first real-Drive test. `'file'` is opt-in for a long-running `watch` whose
+event loop is known to stay live. The encrypted Drive node cache can live in
 `drive-cache.bin` between starts, keyed by the session's per-device cache key
 and validated against `state.cursorsFingerprint()` exactly as the plugin does
 — a marker mismatch clears the cache and refetches, it never serves stale
@@ -411,7 +416,7 @@ outside help; record the wall-clock time, the archive name, the pre/post
 1. Does Proton tolerate a long-lived third-party session polling every
    60 s (default; floor `MIN_POLL_SECONDS` = 30) from a datacenter-adjacent
    IP? Default raised 30 → 60; watch 429s in the soak before lowering.
-2. Answered: `metadataCache: 'file' | 'memory'` (default `file`) — encrypted
+2. Answered: `metadataCache: 'file' | 'memory'` (default `memory`) — encrypted
    node cache persisted between starts vs slower starts with less
    encrypted-at-rest surface. Must be honoured, not advisory (§6).
 3. Answered in SECURITY.md (headless section): key file as a Docker secret,

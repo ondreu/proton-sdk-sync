@@ -15,7 +15,7 @@ paused for the copy only).
 | Bundle | `headless/dist/pss-daemon.cjs` | `npm --workspace headless run build` |
 | Key file | `/opt/data/secrets/pss-key.bin` (32 random bytes, 0600) | `wc -c` = 32 |
 | Config | `/volume1/docker/pss-daemon/daemon.json` | see below |
-| Canary uid | `proton-drive fs info /my-files/08-Test/pss-canary-2026-11-17` | copy the `uid` value |
+| Canary uid | `pss-daemon resolve-folder 08-Test/pss-canary-2026-11-17 --create --json` | the daemon's own resolver; a uid copied from the Proton CLI is **not** usable by this SDK (it fails with `LinkIDs[0] is not a valid ID`) |
 | No second writer | `docker ps` on the NAS | `obsidian-sync` still running for the real vault, nothing else mounts the pilot copy |
 
 `daemon.json` for the pilot:
