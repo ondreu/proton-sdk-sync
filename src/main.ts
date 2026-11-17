@@ -39,15 +39,19 @@ import { DriveIO, sharedWithOthers } from './sync/drive';
 import { SyncEngine, type ConflictEvent, type OpenEditor, type SyncPlan, type SyncSummary } from './sync/engine';
 import { errorMessage } from './sync/engine/helpers';
 import {
+    buildExportedShare,
     buildPdfPrintScript,
     copyToArrayBuffer,
     EXPORT_JANITOR_INTERVAL_MS,
     EXPORT_NODE_POLL_MS,
     EXPORT_NODE_WAIT_MS,
     exportPdfName,
-    pickShareTarget,
-    removeExportedShare,
+    exportPrecheckRefusal,
+    isExportPath,
+    janitorEntryPlan,
     resolveExportPath,
+    sanitizeExportedShares,
+    sanitizeExportHtml,
     selectJanitorDeletions,
     shareExpiration,
     upsertExportedShare,
@@ -143,10 +147,15 @@ type PdfWebview = HTMLElement & {
 function pdfWebviewReady(webview: PdfWebview): Promise<void> {
     return new Promise((resolve, reject) => {
         const timer = window.setTimeout(() => reject(new Error('the PDF preview never loaded')), 30_000);
+        const fail = (): void => {
+            window.clearTimeout(timer);
+            reject(new Error('the PDF preview failed to load'));
+        };
         webview.addEventListener('dom-ready', () => {
             window.clearTimeout(timer);
             resolve();
         });
+        webview.addEventListener('did-fail-load', fail);
     });
 }
 
@@ -202,11 +211,19 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     /** What the status bar, ribbon icon and panel currently show. */
     private summary!: SyncSummary;
     private conflictNoticeTimer: number | null = null;
+    /** Malformed exported-share entries dropped while loading the settings. */
+    private droppedExportedShares = 0;
 
     override async onload(): Promise<void> {
         await this.loadSettings();
 
         runtime.logger = new Logger(this.settings.logLevel);
+        if (this.droppedExportedShares > 0) {
+            runtime.logger.warn(
+                `Dropped ${this.droppedExportedShares} malformed exported-share registry entries; ` +
+                    'they are never unshared or trashed.',
+            );
+        }
         // After the workspace is ready, so the first start of the day does not
         // delay anything the user is waiting for.
         setLogShowsNames(this.settings.logShowsNames ?? false);
@@ -1183,6 +1200,19 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? adopted);
 
         let changed = false;
+        // The registry is plain JSON: validate it, or a hand-edited or
+        // corrupt entry (a non-array, an entry without a path) throws inside
+        // the janitor and silently stops the cleanup. Malformed entries are
+        // dropped without touching Drive or the vault; the count is warned
+        // about once the logger exists in onload.
+        const droppedBefore = this.droppedExportedShares;
+        const registry = sanitizeExportedShares(this.settings.exportedShares, () => {
+            this.droppedExportedShares += 1;
+        });
+        if (this.droppedExportedShares !== droppedBefore) {
+            changed = true;
+        }
+        this.settings.exportedShares = registry;
         // Installations configured before the setup assistant existed have
         // no use for it.
         if (stored?.onboardingComplete === undefined && stored?.remoteFolderUid) {
@@ -1427,12 +1457,20 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         }
         try {
             const markdown = await this.app.vault.read(file);
-            const pdf = await this.renderNoteToPdf(file, markdown);
             const exportPath = resolveExportPath(
                 this.settings.exportFolder,
                 exportPdfName(file.basename),
                 (path) => this.app.vault.getAbstractFileByPath(path) !== null,
             );
+            const refusal = exportPrecheckRefusal({
+                paused: runtime.engine.isPaused(),
+                excluded: runtime.engine.isExcluded(exportPath),
+            });
+            if (refusal !== null) {
+                new Notice(refusal);
+                return;
+            }
+            const pdf = await this.renderNoteToPdf(file, markdown);
             const data = copyToArrayBuffer(pdf);
             const previous = this.app.vault.getAbstractFileByPath(exportPath);
             if (previous instanceof TFile) {
@@ -1442,31 +1480,76 @@ export default class ProtonDriveSyncPlugin extends Plugin {
             }
             // The engine uploads the new PDF on its own; wait until its sync
             // record names the Drive node, then share exactly that node.
-            const nodeUid = await this.waitForExportNodeUid(exportPath);
+            let nodeUid: string;
+            try {
+                nodeUid = await this.waitForExportNodeUid(exportPath);
+            } catch (error) {
+                // The PDF never synced, so no link exists for it: trash what
+                // was just written instead of stranding an orphan. Confined to
+                // the export folder like the janitor; a pre-existing file can
+                // never be at this path (resolveExportPath returns a free one).
+                if (isExportPath(this.settings.exportFolder, exportPath)) {
+                    const written = this.app.vault.getAbstractFileByPath(exportPath);
+                    if (written instanceof TFile) {
+                        try {
+                            // The user's trash preference: the review lint forbids forcing Obsidian trash here.
+                            await this.app.fileManager.trashFile(written);
+                        } catch {
+                            // Kept over lost: the notice below names the file.
+                        }
+                    }
+                }
+                throw error;
+            }
             const expiration = shareExpiration(this.settings.shareExpiryDays);
-            const existing = await runtime.engine.noteShareLink(exportPath).catch(() => null);
-            const link =
-                pickShareTarget(existing) === 'reuse' && existing
-                    ? existing
-                    : await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+            // Always create: shareNode updates an existing URL access in place
+            // (re-encrypting without a custom password and resetting the
+            // expiry), so this converges the live link to the requested
+            // settings instead of reusing a stale one. The returned access is
+            // the link's actual state — the registry, the notice and the
+            // clipboard all use it, never a computed date.
+            const link = await runtime.engine.createNoteShareLink(exportPath, expiration ? { expiration } : {});
+            if (link.hasPassword) {
+                // Unreachable through this flow (the creation above clears a
+                // password), but one set elsewhere would leave the recipient
+                // blocked: fail loudly rather than announce a broken link.
+                // Nothing is registered, so the janitor never touches it.
+                new Notice('This PDF has a password-protected link; remove the password on Drive and export again.');
+                return;
+            }
+            // Re-read after the share: the path's record may have been remapped
+            // while the share was created, and the registry must pin the node
+            // the live link belongs to.
+            const sharedUid = runtime.engine.nodeUidFor(exportPath) ?? nodeUid;
+            this.settings.exportedShares = upsertExportedShare(
+                this.settings.exportedShares,
+                buildExportedShare(exportPath, link, sharedUid),
+            );
+            try {
+                await this.saveSettings();
+            } catch (error) {
+                // The registry is lost, so the janitor could never clean up:
+                // remove the link just made and report both halves.
+                try {
+                    await runtime.engine.removeShareLinkByNodeUid(sharedUid);
+                } catch {
+                    // Reported as part of the notice below.
+                }
+                throw new Error(
+                    `the share link was created but could not be recorded, so it was removed: ${errorMessage(error)}`,
+                );
+            }
             try {
                 await navigator.clipboard.writeText(link.url);
                 new Notice(
-                    expiration !== undefined
-                        ? `Share link copied; it expires ${expiration.toLocaleString()}.`
+                    link.expiration !== undefined
+                        ? `Share link copied; it expires ${link.expiration.toLocaleString()}.`
                         : 'Share link copied; it never expires.',
                     15000,
                 );
             } catch {
                 new Notice(`Share link: ${link.url}`, 15000);
             }
-            this.settings.exportedShares = upsertExportedShare(this.settings.exportedShares, {
-                path: exportPath,
-                url: link.url,
-                expiresAt: expiration?.getTime() ?? null,
-                nodeUid,
-            });
-            await this.saveSettings();
         } catch (error) {
             new Notice(`Could not export this note: ${errorMessage(error)}`);
         }
@@ -1498,11 +1581,15 @@ export default class ProtonDriveSyncPlugin extends Plugin {
                 }
             }
             webview.setAttribute('src', 'app://obsidian.md/help.html');
-            webview.setAttribute('nodeintegration', '');
+            // No `nodeintegration`: nothing printed needs Node in the guest,
+            // and it would promote any markup the renderer passed through
+            // into code execution. Local images load through getResourcePath
+            // URLs, which need no Node APIs.
             webview.addClass('proton-sdk-sync-pdf-webview');
             activeDocument.body.appendChild(webview);
             await pdfWebviewReady(webview);
-            await webview.executeJavaScript(buildPdfPrintScript(note.basename, rendered.innerHTML));
+            const safeHtml = sanitizeExportHtml(rendered.innerHTML);
+            await webview.executeJavaScript(buildPdfPrintScript(note.basename, safeHtml));
             return new Uint8Array(await webview.printToPDF({ printBackground: true, pageSize: 'A4' }));
         } finally {
             component.unload();
@@ -1529,48 +1616,98 @@ export default class ProtonDriveSyncPlugin extends Plugin {
     }
 
     /**
-     * Trash exported PDFs whose share link has expired, and drop their links.
-     * Runs on load and once a day.
+     * Trash expired exported PDFs, and drop their links. Runs on load and
+     * once a day.
      *
-     * Only registry entries inside the export folder are ever touched, so a
-     * misconfigured folder cannot delete notes. The link is removed
-     * best-effort first; the trashing itself goes through the vault, so the
-     * sync carries it to Drive, where the link dies with the file.
+     * Only registry entries strictly inside the export folder are ever
+     * touched, so a misconfigured folder cannot delete notes — not even the
+     * folder itself counts. A link is only removed once its file is gone one
+     * way or the other: trashed just now, or already gone. If trashing fails
+     * the entry is kept for the next run, never dropped, so a transient
+     * failure cannot strand a live link the janitor will never revisit.
+     * Trashing goes through the file manager, so the user's deletion
+     * preference (Obsidian trash, system trash) is honoured — a deliberate
+     * deviation from the "Obsidian trash only" spec, which the plugin-review
+     * lint forbids enforcing here. Either way the sync carries the deletion
+     * to Drive, where the link dies with the file.
      */
     async runExportJanitor(): Promise<void> {
         if (!this.settings.autoDeleteExpiredExports) {
             return;
         }
+        const folder = this.settings.exportFolder;
+        const registry = sanitizeExportedShares(this.settings.exportedShares, (entry) => {
+            runtime.logger.warn('Dropping a malformed exported-share entry; it is never unshared or trashed.', entry);
+        });
         const now = Date.now();
-        const due = selectJanitorDeletions(this.settings.exportedShares, now, this.settings.exportFolder);
+        const due = selectJanitorDeletions(registry, now, folder);
         if (due.length === 0) {
+            if (registry.length !== this.settings.exportedShares.length) {
+                this.settings.exportedShares = registry;
+                try {
+                    await this.saveSettings();
+                } catch (error) {
+                    runtime.logger.warn('Could not save the cleaned export registry.', error);
+                }
+            }
             return;
         }
         const connected = this.isConfigured() && !this.locked && runtime.engine.isConnected();
-        let changed = false;
+        const removed = new Set<string>();
+        let trashFailures = 0;
         for (const entry of due) {
-            if (connected) {
-                try {
-                    await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
-                } catch (error) {
-                    runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+            // One bad entry must never stop the run.
+            try {
+                const file = this.app.vault.getAbstractFileByPath(entry.path);
+                const plan = janitorEntryPlan(
+                    isExportPath(folder, entry.path),
+                    file instanceof TFile ? 'file' : file === null || file === undefined ? 'gone' : 'other',
+                );
+                if (plan === 'leave') {
+                    continue;
                 }
-            }
-            const file = this.app.vault.getAbstractFileByPath(entry.path);
-            if (file instanceof TFile) {
-                try {
-                    // Through the file manager, so the user's deletion
-                    // preference (Obsidian trash, system trash) is honoured.
-                    await this.app.fileManager.trashFile(file);
-                } catch (error) {
-                    runtime.logger.warn(`Could not trash the expired export "${entry.path}"`, error);
+                if (plan === 'trash-then-unshare') {
+                    // The plan says `file` above; re-checked so the trash
+                    // call narrows instead of casting.
+                    if (!(file instanceof TFile)) {
+                        continue;
+                    }
+                    try {
+                        // The user's trash preference (Obsidian or system): the review lint forbids forcing one.
+                        await this.app.fileManager.trashFile(file);
+                    } catch {
+                        // Kept, retried next run; counted for one summary
+                        // warning below instead of one line per entry.
+                        trashFailures += 1;
+                        continue;
+                    }
                 }
+                if (connected) {
+                    try {
+                        await runtime.engine.removeShareLinkByNodeUid(entry.nodeUid);
+                    } catch (error) {
+                        runtime.logger.warn(`Could not remove the expired share link for "${entry.path}"`, error);
+                        continue;
+                    }
+                }
+                removed.add(entry.path);
+            } catch (error) {
+                runtime.logger.warn('Could not clean up an expired export; it is kept for the next run.', error);
             }
-            this.settings.exportedShares = removeExportedShare(this.settings.exportedShares, entry.path);
-            changed = true;
         }
-        if (changed) {
-            await this.saveSettings();
+        if (trashFailures > 0) {
+            runtime.logger.warn(
+                `Kept ${trashFailures} expired export(s): trashing failed; will retry on the next run.`,
+            );
+        }
+        const next = registry.filter((share) => !removed.has(share.path));
+        if (next.length !== this.settings.exportedShares.length) {
+            this.settings.exportedShares = next;
+            try {
+                await this.saveSettings();
+            } catch (error) {
+                runtime.logger.warn('Could not save the cleaned export registry.', error);
+            }
         }
     }
 

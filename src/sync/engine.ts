@@ -551,6 +551,15 @@ export class SyncEngine {
         return this.paused;
     }
 
+    /**
+     * Whether the path never syncs: excluded itself or below an excluded
+     * folder. The export flow refuses up front when the export path matches,
+     * instead of writing a PDF the sync would never upload.
+     */
+    isExcluded(path: string): boolean {
+        return this.filter.isExcludedWithAncestors(path);
+    }
+
     /** Whether Drive can be asked for a note's versions, the trash and share links: started, and not stopped since. */
     isConnected(): boolean {
         return this.running && this.drive !== null;
