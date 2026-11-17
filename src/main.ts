@@ -148,6 +148,28 @@ type PdfWebview = HTMLElement & {
  * Poll until the injected page has text and its images have settled. A fixed
  * delay would be guesswork, and requestAnimationFrame never fires offscreen.
  */
+function mimeForExtension(extension: string): string {
+    switch (extension.toLowerCase()) {
+        case 'png':
+            return 'image/png';
+        case 'jpg':
+        case 'jpeg':
+            return 'image/jpeg';
+        case 'gif':
+            return 'image/gif';
+        case 'webp':
+            return 'image/webp';
+        case 'svg':
+            return 'image/svg+xml';
+        case 'bmp':
+            return 'image/bmp';
+        case 'avif':
+            return 'image/avif';
+        default:
+            return 'application/octet-stream';
+    }
+}
+
 /** Reject instead of waiting forever on an Electron/SDK call that never settles. */
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -1717,6 +1739,52 @@ export default class ProtonDriveSyncPlugin extends Plugin {
      * HTML goes into a hidden window and its `webContents.printToPDF` writes
      * the bytes — no dialog, no webview.
      */
+    /**
+     * Turn embedded files into bytes the hidden window can show: images become
+     * data URLs (an `app://` URL does not resolve from a data-URL page), and
+     * embedded notes are rendered recursively, up to a small depth.
+     */
+    private async inlineEmbeds(root: HTMLElement, sourcePath: string, component: Component, depth: number): Promise<void> {
+        const images = Array.from(root.querySelectorAll('img'));
+        let budget = 25 * 1024 * 1024;
+        for (const img of images) {
+            const src = img.getAttribute('src');
+            if (!src || /^(https?:|data:|blob:)/i.test(src)) {
+                continue;
+            }
+            const target = this.app.metadataCache.getFirstLinkpathDest(src, sourcePath);
+            if (!(target instanceof TFile) || budget <= 0) {
+                continue;
+            }
+            const data = await this.app.vault.readBinary(target);
+            if (data.byteLength > budget) {
+                continue;
+            }
+            budget -= data.byteLength;
+            const mime = mimeForExtension(target.extension);
+            img.setAttribute('src', `data:${mime};base64,${Buffer.from(data).toString('base64')}`);
+        }
+        if (depth >= 3) {
+            return;
+        }
+        for (const embed of Array.from(root.querySelectorAll('.internal-embed[src], .markdown-embed[src]'))) {
+            const link = embed.getAttribute('src');
+            if (!link) {
+                continue;
+            }
+            const target = this.app.metadataCache.getFirstLinkpathDest(link, sourcePath);
+            if (!(target instanceof TFile) || target.extension !== 'md') {
+                continue;
+            }
+            const markdown = await this.app.vault.read(target);
+            const inner = createDiv();
+            await MarkdownRenderer.render(this.app, markdown, inner, target.path, component);
+            await this.inlineEmbeds(inner, target.path, component, depth + 1);
+            embed.empty();
+            embed.appendChild(inner);
+        }
+    }
+
     private async renderNoteToPdf(note: TFile): Promise<Uint8Array> {
         const nodeRequire = (window as unknown as { require: (module: string) => unknown }).require;
         const electron = nodeRequire('electron') as {
@@ -1737,20 +1805,13 @@ export default class ProtonDriveSyncPlugin extends Plugin {
         const rendered = createDiv();
         try {
             await MarkdownRenderer.render(this.app, markdown, rendered, note.path, component);
-            for (const img of Array.from(rendered.querySelectorAll('img'))) {
-                const src = img.getAttribute('src');
-                if (!src || /^(https?:|data:|app:|blob:)/i.test(src)) {
-                    continue;
-                }
-                const target = this.app.metadataCache.getFirstLinkpathDest(src, note.path);
-                if (target instanceof TFile) {
-                    img.setAttribute('src', this.app.vault.getResourcePath(target));
-                }
-            }
+            await this.inlineEmbeds(rendered, note.path, component, 0);
             const css =
                 'html,body{margin:0;padding:24px;background:#fff;color:#000;font-family:var(--font-text, sans-serif);}' +
                 'img{max-width:100%;}pre,code{white-space:pre-wrap;word-break:break-word;}' +
-                'table{border-collapse:collapse;}th,td{border:1px solid #ccc;padding:4px 8px;}';
+                'table{border-collapse:collapse;}th,td{border:1px solid #ccc;padding:4px 8px;}' +
+                '.internal-embed,.markdown-embed{display:block;border-left:2px solid #ddd;padding-left:10px;margin:8px 0;}' +
+                '.markdown-embed-title{font-weight:600;margin-bottom:4px;}';
             const html =
                 `<!doctype html><html><head><meta charset="utf-8">` +
                 `<base href="app://obsidian.md/"><style>${css}</style></head><body>` +
