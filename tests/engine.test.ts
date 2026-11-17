@@ -2037,6 +2037,195 @@ describe('SyncEngine — names Windows cannot store', () => {
     });
 });
 
+/**
+ * A vault that keeps Unicode spellings apart the way a Linux filesystem does:
+ * NFD and NFC are two files, and no path is ever normalised. Models what the
+ * headless daemon reads off the disk, unlike MemoryVault which spells every
+ * path as Obsidian does. Only what `VaultIO` and `SyncState` touch is
+ * implemented; anything else throws, so a test that outgrows it fails loudly.
+ */
+function rawParentOf(path: string): string {
+    const index = path.lastIndexOf('/');
+    return index === -1 ? '' : path.slice(0, index);
+}
+
+class RawVault {
+    readonly files = new Map<string, { data: Uint8Array; mtime: number }>();
+    readonly folders = new Set<string>();
+    private clock = 1_000_000;
+
+    write(path: string, text: string): void {
+        this.ensureParents(path);
+        this.files.set(path, { data: new TextEncoder().encode(text), mtime: this.tick() });
+    }
+
+    read(path: string): string | undefined {
+        const file = this.files.get(path);
+        return file ? new TextDecoder().decode(file.data) : undefined;
+    }
+
+    /** Note paths, sorted, as the vault holds them: NFD and NFC side by side. */
+    notePaths(): string[] {
+        return [...this.files.keys()].filter((path) => !path.startsWith('.obsidian/')).sort();
+    }
+
+    private tick(): number {
+        this.clock += 1000;
+        return this.clock;
+    }
+
+    /** Raw move of a file or folder subtree, with no normalisation. */
+    move(from: string, to: string): void {
+        this.ensureParents(to);
+        if (this.files.has(from)) {
+            this.files.set(to, this.files.get(from)!);
+            this.files.delete(from);
+            return;
+        }
+        for (const path of [...this.files.keys()]) {
+            if (path.startsWith(`${from}/`)) {
+                this.files.set(to + path.slice(from.length), this.files.get(path)!);
+                this.files.delete(path);
+            }
+        }
+        for (const folder of [...this.folders]) {
+            if (folder === from || folder.startsWith(`${from}/`)) {
+                this.folders.delete(folder);
+                this.folders.add(to + folder.slice(from.length));
+            }
+        }
+    }
+
+    private ensureParents(path: string): void {
+        let parent = rawParentOf(path);
+        while (parent !== '') {
+            this.folders.add(parent);
+            parent = rawParentOf(parent);
+        }
+    }
+
+    app(): App {
+        const vault = this;
+        const adapter = this.adapter();
+        return {
+            vault: {
+                adapter,
+                configDir: '.obsidian',
+                getAbstractFileByPath: () => null,
+            },
+            fileManager: {
+                async trashFile() {},
+            },
+        } as unknown as App;
+    }
+
+    adapter(): DataAdapter {
+        const vault = this;
+        const direct = (path: string) => {
+            const prefix = path === '' ? '' : `${path}/`;
+            const names = new Set<string>();
+            for (const key of vault.files.keys()) {
+                if (key.startsWith(prefix) && !key.slice(prefix.length).includes('/')) {
+                    names.add(key);
+                }
+            }
+            return [...names];
+        };
+        const directFolders = (path: string) => {
+            const prefix = path === '' ? '' : `${path}/`;
+            const names = new Set<string>();
+            const collect = (key: string) => {
+                if (key.startsWith(prefix)) {
+                    const rest = key.slice(prefix.length);
+                    const slash = rest.indexOf('/');
+                    if (slash !== -1) {
+                        names.add(prefix + rest.slice(0, slash));
+                    }
+                }
+            };
+            for (const key of vault.files.keys()) {
+                collect(key);
+            }
+            for (const key of vault.folders) {
+                if (key.startsWith(prefix) && !key.slice(prefix.length).includes('/')) {
+                    names.add(key);
+                }
+            }
+            return [...names];
+        };
+        return {
+            async exists(path: string) {
+                return path === '' || vault.files.has(path) || vault.folders.has(path);
+            },
+            async stat(path: string) {
+                const file = vault.files.get(path);
+                if (file) {
+                    return { type: 'file', size: file.data.byteLength, mtime: file.mtime, ctime: file.mtime };
+                }
+                return vault.folders.has(path) ? { type: 'folder', size: 0, mtime: 0, ctime: 0 } : null;
+            },
+            async list(folder: string) {
+                return { files: direct(folder), folders: directFolders(folder) };
+            },
+            async read(path: string) {
+                const text = vault.read(path);
+                if (text === undefined) {
+                    throw new Error(`ENOENT: ${path}`);
+                }
+                return text;
+            },
+            async readBinary(path: string) {
+                const file = vault.files.get(path);
+                if (!file) {
+                    throw new Error(`ENOENT: ${path}`);
+                }
+                return file.data.slice().buffer as ArrayBuffer;
+            },
+            async write(path: string, text: string) {
+                vault.write(path, text);
+            },
+            async writeBinary(path: string, data: ArrayBuffer, options?: { mtime?: number }) {
+                vault.ensureParents(path);
+                vault.files.set(path, { data: new Uint8Array(data.slice(0)), mtime: options?.mtime ?? vault.tick() });
+            },
+            async mkdir(path: string) {
+                vault.ensureParents(`${path}/x`);
+                vault.folders.add(path);
+            },
+            async rename(from: string, to: string) {
+                vault.move(from, to);
+            },
+            async copy(from: string, to: string) {
+                vault.ensureParents(to);
+                const file = vault.files.get(from);
+                if (!file) {
+                    throw new Error(`ENOENT: ${from}`);
+                }
+                vault.files.set(to, { data: file.data.slice(), mtime: vault.tick() });
+            },
+            async remove(path: string) {
+                vault.files.delete(path);
+                for (const other of [...vault.files.keys()]) {
+                    if (other.startsWith(`${path}/`)) {
+                        vault.files.delete(other);
+                    }
+                }
+                for (const folder of [...vault.folders]) {
+                    if (folder === path || folder.startsWith(`${path}/`)) {
+                        vault.folders.delete(folder);
+                    }
+                }
+            },
+            async trashSystem() {
+                return false;
+            },
+            async trashLocal(path: string) {
+                vault.move(path, `.trash/${path}`);
+            },
+        } as unknown as DataAdapter;
+    }
+}
+
 describe('SyncEngine — names the vault spells differently (issue #27)', () => {
     // "Café.md" as macOS and some Linux tools write it, with the accent as a
     // character of its own (NFD), and as Obsidian spells it (NFC).
@@ -2143,6 +2332,65 @@ describe('SyncEngine — names the vault spells differently (issue #27)', () => 
             [COMPOSED],
             'the file was not taken for a new one, which would have left a copy of it beside it',
         );
+    });
+
+    it('follows the spelling settlement locally where the vault keeps NFD apart from NFC', async () => {
+        // A Linux filesystem holds the decomposed and composed names as two
+        // files, which the headless daemon reads raw: unlike Obsidian, the
+        // vault distinctly holds the old spelling. Renaming only the Drive
+        // node re-uploads the local file under its old name on every pass,
+        // growing a numbered copy per pass; the local file has to follow.
+        const drive = new FakeDrive();
+        drive.put(DECOMPOSED, 'old menu');
+        drive.put(COMPOSED, 'new menu');
+        const vault = new RawVault();
+        vault.write(DECOMPOSED, 'old menu');
+        vault.write(COMPOSED, 'new menu');
+
+        const state = new SyncState(vault.adapter(), `${PLUGIN_DIR}/sync-state.json`, SILENT);
+        await state.load('me@proton.me', SYNC_ROOT);
+        const conflicts: ConflictEvent[] = [];
+        const engine = new SyncEngine(
+            vault.app(),
+            state,
+            { ...DEFAULT_SETTINGS, uploadDebounceMs: 0, deviceName: 'nas' },
+            SILENT,
+            {
+                onChange: () => undefined,
+                onConflict: (event) => conflicts.push(event),
+            },
+            { configDir: '.obsidian', pluginDir: PLUGIN_DIR, pluginId: 'proton-drive-sync' },
+            SENSITIVE,
+        );
+        running.push(engine);
+        await engine.start(drive.client() as unknown as ProtonDriveClient, SYNC_ROOT);
+        const settled = async () => {
+            for (let i = 0; i < 3; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+                await (engine as unknown as { queue: Promise<void> }).queue;
+            }
+        };
+        await settled();
+
+        const settledNames = ['Café (name conflict).md', COMPOSED];
+        assert.deepEqual(drive.notePaths(), settledNames, 'one rename on Drive, not a twin');
+        assert.deepEqual(vault.notePaths(), settledNames, 'the local twin followed the rename');
+        assert.equal(vault.read('Café (name conflict).md'), 'old menu');
+        assert.deepEqual(
+            conflicts.map((event) => [event.path, event.reason, event.outcome]),
+            [[DECOMPOSED, 'name-spelling', 'renamed']],
+        );
+
+        const uploads = drive.uploadLog.length;
+        await engine.syncNow();
+        await settled();
+        await engine.syncNow();
+        await settled();
+
+        assert.deepEqual(drive.notePaths(), settledNames, 'no numbered copies accumulate');
+        assert.deepEqual(vault.notePaths(), settledNames, 'nothing re-uploads under the old name');
+        assert.equal(conflicts.length, 1, 'one spelling notice, not one per pass');
+        assert.equal(drive.uploadLog.length, uploads, 'the quiet passes transfer nothing');
     });
 });
 
