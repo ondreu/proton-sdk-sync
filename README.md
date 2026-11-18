@@ -11,26 +11,21 @@ device, with the same SDK Proton's own clients use.
 > automated test suite, but no external audit. Keep a backup you can restore
 > from, as you would with any sync tool.
 
-## Why this fork
+## About this fork
 
 This is a fork of [obsidian-proton-sync](https://github.com/MarckFp/obsidian-proton-sync).
-It exists for three reasons:
+The sync engine, the Proton SDK usage and the plugin surface come from that
+project, and are kept shared rather than copied, so a conflict fix is made once
+for both the plugin and the daemon.
 
-- **Upstream moves slowly.** Fixes and reviews that pile up there would wait
-  indefinitely; this fork ships them as they are ready.
-- **Releases are tested before they go out.** Upstream 0.11.5 shipped a sign-in
-  bug that made every sign-in after the first fail with "Destination file
-  already exists!". This fork's 1.0.1 fixes it, and every release is cut only
-  after the engine suite, the daemon suite and the fake-Drive integration
-  harness are green.
-- **It goes further than a plugin.** The same engine also runs as a headless
-  daemon on a Linux server ([ondreu/pss-daemon](https://github.com/ondreu/pss-daemon)), so a vault can stay in sync on a NAS
-  without Obsidian Sync and without a desktop running. Upstream has no such
-  mode.
+On top of that codebase, the fork adds:
 
-The sync engine, the Proton SDK usage and the plugin surface are upstream's
-work, and this fork deliberately keeps the same engine rather than copying it:
-a conflict fix is fixed once, for both the plugin and the daemon.
+- **Releases cut from a tested tree.** A release is published only after the
+  engine suite, the daemon suite and the fake-Drive integration harness are
+  green, and it carries fixes that have not landed upstream yet.
+- **A headless mode.** The same engine runs as a daemon on a Linux server
+  ([ondreu/pss-daemon](https://github.com/ondreu/pss-daemon)), so a vault can
+  stay in sync on a NAS without Obsidian Sync and without a desktop running.
 
 ## What it does
 
