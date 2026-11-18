@@ -247,9 +247,9 @@ GPL-3.0-or-later; see [LICENSE](LICENSE).
 This is a maintained fork of
 [MarckFp/obsidian-proton-sync](https://github.com/MarckFp/obsidian-proton-sync)
 (© Marcos, GPL-3.0), which in turn builds on Proton's SDK and OpenPGP.js. The
-original author is credited as a contributor. The fork exists because the
-upstream project stopped merging fixes; the sync engine, the conflict handling
-and the UI come from that codebase, and the changes here are this fork's own.
+original author is credited as a contributor. The sync engine, the conflict
+handling and the UI come from that codebase, and the changes here are this
+fork's own.
 
 Bundled third-party code keeps its own licence; the header of `main.js` lists
 it. Proton's OpenPGP.js fork is MIT (© Proton AG); see

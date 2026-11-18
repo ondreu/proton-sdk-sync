@@ -62,9 +62,9 @@ yet. This project is submitted as a maintained fork with the original author
 credited in the README, `NOTICE` and the licence section; the submission may be
 declined on that basis.
 
-If a reviewer raises it, the answer is the same as the README: the upstream
-project stopped merging fixes, the fork keeps the plugin usable, the author is
-credited, and the divergence is documented in `CHANGELOG.md`.
+If a reviewer raises it, the answer is the same as the README: the fork keeps
+the plugin usable, the author is credited, and the divergence is documented in
+`CHANGELOG.md`.
 
 ## 6. After publishing
 
