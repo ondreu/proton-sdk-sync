@@ -25,9 +25,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The plugin runs on every desktop OS, and the tests exercise real
-        # filesystem paths, so each one gets a run.
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macOS lives in its own weekly workflow: GitHub's macOS runners
+        # sometimes queue for 15 minutes and then cancel the job, which turned
+        # every push red for infrastructure reasons. Linux and Windows stay
+        # blocking here; macOS still gets a real run, just not on every push.
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - name: Checkout repository
